@@ -30,13 +30,11 @@ pub async fn run(ctx: &ShokaContext) -> Result<()> {
 
     let pre_existed = p.config_file().exists();
 
-    let cfg = match ShokaConfig::load(p) {
-        Ok(c) => c,
-        Err(e) => {
-            println!("  {} {e:#}", "load failed:".red());
-            return Ok(());
-        }
-    };
+    // Propagate load / resolve errors via `?` so the process exits
+    // non-zero on broken config. Without this, `doctor` would print
+    // a red "load failed" line then return Ok and a healthy exit
+    // code — masking real problems from scripts / CI.
+    let cfg = ShokaConfig::load(p)?;
 
     println!(
         "{}  ({})",
@@ -56,29 +54,23 @@ pub async fn run(ctx: &ShokaContext) -> Result<()> {
         profile_name.as_deref().unwrap_or("(none)")
     );
 
-    match cfg.resolve(ctx.profile_override.as_deref()) {
-        Ok(r) => {
-            println!("  root           : {}", r.root.display());
-            println!("  layout         : {}", r.layout);
-            println!("  default vcs    : {:?}", r.default_vcs);
-            println!("  default proto  : {:?}", r.default_protocol);
-            println!("  default host   : {}", r.default_host);
-            println!("  exec concur.   : {}", r.exec_concurrency);
-            if !r.hosts.is_empty() {
-                println!("  hosts:");
-                for (host, h) in &r.hosts {
-                    println!("    {host}: {h:?}");
-                }
-            }
-            if !r.git_config.is_empty() {
-                println!("  git_config (profile):");
-                for (k, v) in &r.git_config {
-                    println!("    {k} = {v:?}");
-                }
-            }
+    let r = cfg.resolve(ctx.profile_override.as_deref())?;
+    println!("  root           : {}", r.root.display());
+    println!("  layout         : {}", r.layout);
+    println!("  default vcs    : {:?}", r.default_vcs);
+    println!("  default proto  : {:?}", r.default_protocol);
+    println!("  default host   : {}", r.default_host);
+    println!("  exec concur.   : {}", r.exec_concurrency);
+    if !r.hosts.is_empty() {
+        println!("  hosts:");
+        for (host, h) in &r.hosts {
+            println!("    {host}: {h:?}");
         }
-        Err(e) => {
-            println!("  {} {e:#}", "resolve failed:".red());
+    }
+    if !r.git_config.is_empty() {
+        println!("  git_config (profile):");
+        for (k, v) in &r.git_config {
+            println!("    {k} = {v:?}");
         }
     }
 

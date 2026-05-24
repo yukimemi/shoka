@@ -206,9 +206,19 @@ impl ShokaConfig {
         // `config.*.toml` discovery pattern. Prepend so it acts as the base
         // and any sibling `config.*.toml` overlays still win in their usual
         // alphabetical order.
+        //
+        // The canonicalize-based dedup check uses an explicit
+        // `(Some, Some)` match — comparing `Option::None` to `None`
+        // would otherwise wrongly treat two paths that *both* failed
+        // to canonicalize as equal, causing a missed prepend.
         if explicit.exists() {
             let explicit_can = explicit.canonicalize().ok();
-            let already_listed = files.iter().any(|p| p.canonicalize().ok() == explicit_can);
+            let already_listed = files.iter().any(|p| {
+                matches!(
+                    (explicit_can.as_ref(), p.canonicalize().ok().as_ref()),
+                    (Some(a), Some(b)) if a == b
+                )
+            });
             if !already_listed {
                 files.insert(0, explicit.to_path_buf());
             }
@@ -369,14 +379,27 @@ pub fn write_starter(paths: &ShokaPaths) -> Result<()> {
     Ok(())
 }
 
-/// Expand a leading `~` in a path-like string to the user's home dir.
+/// Expand a leading `~` in a path-like string to the user's home
+/// dir, then absolutise the result against the process working
+/// directory so callers always see a stable absolute path.
 ///
-/// Only `~` on its own and `~/…` / `~\…` are expanded. `~foo` (which
-/// in POSIX shells refers to user `foo`'s home dir) is left untouched
-/// rather than misread as `<home>/foo`. Tera-side users should still
-/// prefer `{{ home() }}`; this helper exists for the common literal
-/// `~/...` case.
+/// Tilde handling: only `~` on its own and `~/…` / `~\…` are
+/// expanded. `~foo` (which in POSIX shells refers to user `foo`'s
+/// home dir) is left untouched rather than misread as `<home>/foo`.
+/// Tera-side users should still prefer `{{ home() }}`; this helper
+/// exists for the common literal `~/...` case.
+///
+/// Absolutisation uses [`std::path::absolute`], which does *not*
+/// require the path to exist (so this works during first-run setup
+/// before `root` has been mkdir'd). On the rare failure case (e.g.
+/// no current directory), the tilde-expanded path is returned
+/// as-is.
 fn expand_home(s: &str) -> PathBuf {
+    let expanded = expand_tilde(s);
+    std::path::absolute(&expanded).unwrap_or(expanded)
+}
+
+fn expand_tilde(s: &str) -> PathBuf {
     let is_bare = s == "~";
     let is_rooted = s.starts_with("~/") || s.starts_with("~\\");
     if is_bare || is_rooted {
@@ -563,7 +586,19 @@ exec_concurrency = 32
         let cfg = ShokaConfig::load(&paths_at(tmp.path())).expect("load");
         let resolved = cfg.resolve(None).expect("resolve");
         assert_eq!(resolved.active_profile.as_deref(), Some("work"));
-        assert_eq!(resolved.root, PathBuf::from("/work"));
+        // expand_home absolutises the result, so on Windows `/work`
+        // becomes the equivalent of the current drive's `\work`. Just
+        // verify shape: absolute + ends with the intended segment.
+        assert!(
+            resolved.root.is_absolute(),
+            "resolved root must be absolute, got {:?}",
+            resolved.root
+        );
+        assert!(
+            resolved.root.ends_with("work"),
+            "resolved root should end with `work`, got {:?}",
+            resolved.root
+        );
         assert_eq!(resolved.exec_concurrency, 32);
     }
 
@@ -621,8 +656,30 @@ exec_concurrency = 32
     }
 
     #[test]
-    fn expand_home_passes_through_absolute_paths() {
-        assert_eq!(expand_home("/etc/shoka"), PathBuf::from("/etc/shoka"));
+    fn expand_home_keeps_already_absolute_inputs_absolute() {
+        // std::env::temp_dir is always absolute on every platform, so
+        // this is a portable stand-in for the previous /etc literal.
+        let abs = std::env::temp_dir();
+        let expanded = expand_home(abs.to_str().unwrap());
+        assert!(
+            expanded.is_absolute(),
+            "absolute input must stay absolute, got {expanded:?}"
+        );
+    }
+
+    #[test]
+    fn expand_home_makes_relative_input_absolute() {
+        // Gemini review on PR #9: resolved `root` should be absolute
+        // regardless of caller cwd. This guards the contract.
+        let expanded = expand_home("relative/repos");
+        assert!(
+            expanded.is_absolute(),
+            "relative input should be absolutised, got {expanded:?}"
+        );
+        assert!(
+            expanded.ends_with("relative/repos") || expanded.ends_with("relative\\repos"),
+            "absolutised path should still end with the original tail, got {expanded:?}"
+        );
     }
 
     #[test]
@@ -634,9 +691,21 @@ exec_concurrency = 32
     #[test]
     fn expand_home_does_not_touch_tilde_user_syntax() {
         // POSIX `~<user>` is a deliberate non-target: silently treating
-        // `~foo` as `$HOME/foo` would be wrong, so we pass it through.
-        assert_eq!(expand_home("~foo"), PathBuf::from("~foo"));
-        assert_eq!(expand_home("~bar/baz"), PathBuf::from("~bar/baz"));
+        // `~foo` as `$HOME/foo` would be wrong. The tilde is preserved
+        // in the path, though absolutisation still kicks in (anchoring
+        // to cwd) to keep the "always absolute" contract.
+        let p1 = expand_home("~foo");
+        assert!(p1.is_absolute(), "result should be absolute, got {p1:?}");
+        assert!(
+            p1.to_string_lossy().contains("~foo"),
+            "~foo literal should be preserved in the result, got {p1:?}"
+        );
+        let p2 = expand_home("~bar/baz");
+        assert!(p2.is_absolute(), "result should be absolute, got {p2:?}");
+        assert!(
+            p2.to_string_lossy().contains("~bar"),
+            "~bar literal should be preserved, got {p2:?}"
+        );
     }
 
     #[test]
