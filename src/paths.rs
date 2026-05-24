@@ -7,11 +7,11 @@
 //! [`directories::ProjectDirs::from("", "yukimemi", "shoka")`][pd] is
 //! used. On the platforms we care about that resolves to roughly:
 //!
-//! | platform | config dir                                      |
-//! | :------- | :---------------------------------------------- |
-//! | Linux    | `$XDG_CONFIG_HOME/shoka`                        |
-//! | macOS    | `~/Library/Application Support/.yukimemi.shoka` |
-//! | Windows  | `%APPDATA%\yukimemi\shoka\config`               |
+//! | platform | config dir                                     |
+//! | :------- | :--------------------------------------------- |
+//! | Linux    | `$XDG_CONFIG_HOME/shoka`                       |
+//! | macOS    | `~/Library/Application Support/yukimemi.shoka` |
+//! | Windows  | `%APPDATA%\yukimemi\shoka\config`              |
 //!
 //! See the [`directories` crate docs][pd] for the authoritative
 //! per-platform behaviour and any future changes — the table above is
