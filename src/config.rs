@@ -207,6 +207,18 @@ impl ShokaConfig {
         // and any sibling `config.*.toml` overlays still win in their usual
         // alphabetical order.
         //
+        // When the user names a non-default file via --config, also drop
+        // any `config.toml` that the auto-discovery happened to pick up
+        // in the same directory. teravars::load_merged merges in order
+        // with later files overriding earlier ones, so leaving the
+        // default behind would silently overwrite the user's named
+        // config with the un-asked-for defaults.
+        let canonical_default_name = std::ffi::OsStr::new("config.toml");
+        let is_user_override = explicit.file_name() != Some(canonical_default_name);
+        if is_user_override {
+            files.retain(|p| p.file_name() != Some(canonical_default_name));
+        }
+
         // `is_ok_and` keeps the dedup conservative: when canonicalize
         // fails for either side, treat as "not equal" so the explicit
         // path is prepended rather than silently dropped.
@@ -786,6 +798,39 @@ default_host = "gitlab.com"
         assert_eq!(cfg.global.root.as_deref(), Some("~/src"));
         assert_eq!(cfg.global.default_vcs, VcsDefault::Auto);
         assert_eq!(cfg.global.default_host, "github.com");
+    }
+
+    #[test]
+    fn user_named_override_displaces_sibling_default_config_toml() {
+        // Gemini round 4: when --config names a non-default file and
+        // a `config.toml` happens to sit alongside it, the default
+        // must NOT silently override the user's named config (which
+        // would happen because teravars::load_merged merges files in
+        // order with later entries winning).
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("config.toml"),
+            r#"
+[global]
+root = "/from/default"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("staging.toml"),
+            r#"
+[global]
+root = "/from/staging"
+"#,
+        )
+        .unwrap();
+        let paths = ShokaPaths::resolve(Some(&tmp.path().join("staging.toml")))
+            .expect("ShokaPaths::resolve");
+        let cfg = ShokaConfig::load(&paths).expect("load");
+        // Expect: the user's named file wins. The sibling
+        // `config.toml` is excluded from the discovery merge entirely
+        // when --config names a different file.
+        assert_eq!(cfg.global.root.as_deref(), Some("/from/staging"));
     }
 
     #[test]
