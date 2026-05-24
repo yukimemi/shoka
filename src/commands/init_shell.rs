@@ -10,7 +10,7 @@ pub async fn run(args: InitShellArgs) -> anyhow::Result<()> {
             "{name}() {{\n    local dest\n    dest=$(shoka cd \"$@\") && [ -n \"$dest\" ] && cd -- \"$dest\"\n}}\n"
         ),
         SupportedShell::Fish => format!(
-            "function {name}\n    set dest (shoka cd $argv)\n    if test $status -eq 0; and test -n \"$dest\"\n        cd -- $dest\n    end\nend\n"
+            "function {name}\n    set dest (shoka cd $argv)\n    if test $status -eq 0; and test -n \"$dest\"\n        cd -- \"$dest\"\n    end\nend\n"
         ),
     };
     print!("{script}");
