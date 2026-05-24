@@ -137,18 +137,18 @@ pub struct ExportArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum TagCommand {
-    /// Add tags to a repo.
+    /// Add tags to a repo (no arg ⇒ fuzzy-select repo + interactive tag prompt).
     Add {
-        /// Repository identifier (owner/name).
-        repo: String,
-        /// Tags to add (one or more).
-        #[arg(required = true)]
+        /// Repository identifier (owner/name). Omitted ⇒ fuzzy-select.
+        repo: Option<String>,
+        /// Tags to add (one or more). Omitted ⇒ interactive prompt.
         tags: Vec<String>,
     },
-    /// Remove tags from a repo.
+    /// Remove tags from a repo (no arg ⇒ fuzzy-select repo + interactive tag prompt).
     Rm {
-        repo: String,
-        #[arg(required = true)]
+        /// Repository identifier (owner/name). Omitted ⇒ fuzzy-select.
+        repo: Option<String>,
+        /// Tags to remove (one or more). Omitted ⇒ interactive prompt.
         tags: Vec<String>,
     },
     /// List tags carried by a repo (no arg ⇒ fuzzy-select repo).

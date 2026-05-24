@@ -1,8 +1,8 @@
-pub async fn add(_repo: String, _tags: Vec<String>) -> anyhow::Result<()> {
+pub async fn add(_repo: Option<String>, _tags: Vec<String>) -> anyhow::Result<()> {
     anyhow::bail!("`shoka tag add` is not implemented yet")
 }
 
-pub async fn rm(_repo: String, _tags: Vec<String>) -> anyhow::Result<()> {
+pub async fn rm(_repo: Option<String>, _tags: Vec<String>) -> anyhow::Result<()> {
     anyhow::bail!("`shoka tag rm` is not implemented yet")
 }
 
