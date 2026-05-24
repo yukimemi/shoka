@@ -177,11 +177,27 @@ impl ShokaConfig {
     /// or contains no `config*.toml` files.
     pub fn load(paths: &ShokaPaths) -> Result<Self> {
         let dir = paths.config_dir();
-        if !dir.exists() {
-            return Ok(Self::default());
+        let mut files: Vec<PathBuf> = if dir.exists() {
+            discover_config_files(dir)
+                .with_context(|| format!("discovering config files in {}", dir.display()))?
+        } else {
+            Vec::new()
+        };
+
+        // Ensure the explicit `--config` / `$SHOKA_CONFIG` target is loaded
+        // even if its filename doesn't match the canonical `config.toml` /
+        // `config.*.toml` discovery pattern. Prepend so it acts as the base
+        // and any sibling `config.*.toml` overlays still win in their usual
+        // alphabetical order.
+        let explicit = paths.config_file();
+        if explicit.exists() {
+            let explicit_can = explicit.canonicalize().ok();
+            let already_listed = files.iter().any(|p| p.canonicalize().ok() == explicit_can);
+            if !already_listed {
+                files.insert(0, explicit.to_path_buf());
+            }
         }
-        let files = discover_config_files(dir)
-            .with_context(|| format!("discovering config files in {}", dir.display()))?;
+
         if files.is_empty() {
             return Ok(Self::default());
         }
@@ -257,17 +273,21 @@ impl ShokaConfig {
 
 /// Expand a leading `~` in a path-like string to the user's home dir.
 ///
-/// Tera-side users should prefer `{{ home() }}` (the std-helpers
-/// function), but a literal `~/...` is a common enough mistake to be
-/// worth handling silently.
+/// Only `~` on its own and `~/…` / `~\…` are expanded. `~foo` (which
+/// in POSIX shells refers to user `foo`'s home dir) is left untouched
+/// rather than misread as `<home>/foo`. Tera-side users should still
+/// prefer `{{ home() }}`; this helper exists for the common literal
+/// `~/...` case.
 fn expand_home(s: &str) -> PathBuf {
-    if let Some(rest) = s.strip_prefix('~') {
+    let is_bare = s == "~";
+    let is_rooted = s.starts_with("~/") || s.starts_with("~\\");
+    if is_bare || is_rooted {
         if let Some(home) = directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf()) {
-            let rest = rest.trim_start_matches(['/', '\\']);
-            if rest.is_empty() {
+            if is_bare {
                 return home;
             }
-            return home.join(rest);
+            // s[2..] skips the `~/` or `~\`, leaving a relative remainder.
+            return home.join(&s[2..]);
         }
     }
     PathBuf::from(s)
@@ -477,5 +497,58 @@ exec_concurrency = 32
     #[test]
     fn expand_home_passes_through_absolute_paths() {
         assert_eq!(expand_home("/etc/shoka"), PathBuf::from("/etc/shoka"));
+    }
+
+    #[test]
+    fn expand_home_bare_tilde_yields_home() {
+        let p = expand_home("~");
+        assert!(p.is_absolute(), "bare ~ should expand to home, got {p:?}");
+    }
+
+    #[test]
+    fn expand_home_does_not_touch_tilde_user_syntax() {
+        // POSIX `~<user>` is a deliberate non-target: silently treating
+        // `~foo` as `$HOME/foo` would be wrong, so we pass it through.
+        assert_eq!(expand_home("~foo"), PathBuf::from("~foo"));
+        assert_eq!(expand_home("~bar/baz"), PathBuf::from("~bar/baz"));
+    }
+
+    #[test]
+    fn override_with_custom_filename_is_loaded() {
+        // `--config custom.toml` (whose name doesn't match the
+        // `config.*.toml` discovery pattern) must still be loaded.
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("custom.toml"),
+            r#"
+[global]
+root = "/from/custom"
+default_host = "gitlab.com"
+"#,
+        )
+        .unwrap();
+        let paths = ShokaPaths::resolve(Some(&tmp.path().join("custom.toml")))
+            .expect("ShokaPaths::resolve");
+        let cfg = ShokaConfig::load(&paths).expect("load");
+        assert_eq!(cfg.global.root.as_deref(), Some("/from/custom"));
+        assert_eq!(cfg.global.default_host, "gitlab.com");
+    }
+
+    #[test]
+    fn override_does_not_duplicate_when_file_matches_canonical_name() {
+        // When `--config config.toml` is passed (same name as the
+        // canonical discovery entry), it should still load exactly
+        // once — duplicate prepend would re-run Tera and double-merge.
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("config.toml"),
+            r#"
+[global]
+root = "/once"
+"#,
+        )
+        .unwrap();
+        let cfg = ShokaConfig::load(&paths_at(tmp.path())).expect("load");
+        assert_eq!(cfg.global.root.as_deref(), Some("/once"));
     }
 }

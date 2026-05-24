@@ -4,16 +4,23 @@
 //! commands that need it. Resolution honours `$SHOKA_CONFIG` (or `--config
 //! <path>` on the CLI, which clap also fills from `$SHOKA_CONFIG`) by
 //! pinning the config file path directly; otherwise the OS default from
-//! [`directories::ProjectDirs`] is used:
+//! [`directories::ProjectDirs::from("", "yukimemi", "shoka")`][pd] is
+//! used. On the platforms we care about that resolves to roughly:
 //!
-//! | platform | config dir                   | state / cache dir              |
-//! | :------- | :--------------------------- | :----------------------------- |
-//! | Linux    | `$XDG_CONFIG_HOME/shoka`     | `$XDG_DATA_HOME/shoka`         |
-//! | macOS    | `~/Library/Application Support/shoka` | `~/Library/Application Support/shoka` |
-//! | Windows  | `%APPDATA%\shoka\config`     | `%APPDATA%\shoka\data`         |
+//! | platform | config dir                                      |
+//! | :------- | :---------------------------------------------- |
+//! | Linux    | `$XDG_CONFIG_HOME/shoka`                        |
+//! | macOS    | `~/Library/Application Support/.yukimemi.shoka` |
+//! | Windows  | `%APPDATA%\yukimemi\shoka\config`               |
 //!
-//! `state.toml` always lives under the state dir; `cache.toml` under the
-//! cache dir.
+//! See the [`directories` crate docs][pd] for the authoritative
+//! per-platform behaviour and any future changes — the table above is
+//! a quick reference, not a contract.
+//!
+//! `state.toml` always lives under the state dir; `cache.toml` under
+//! the cache dir.
+//!
+//! [pd]: https://docs.rs/directories/latest/directories/struct.ProjectDirs.html
 
 use std::path::{Path, PathBuf};
 
