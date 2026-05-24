@@ -49,13 +49,11 @@ impl ShokaPaths {
 
         let (config_file, config_dir) = match config_override {
             Some(p) => {
-                let abs = if p.is_absolute() {
-                    p.to_path_buf()
-                } else {
-                    std::env::current_dir()
-                        .context("could not read current directory")?
-                        .join(p)
-                };
+                // `std::path::absolute` handles `.` / `..` correctly
+                // without requiring the path to exist (helpful when
+                // first-run setup is about to create the file).
+                let abs = std::path::absolute(p)
+                    .with_context(|| format!("absolutising config path {}", p.display()))?;
                 let dir = abs
                     .parent()
                     .map(Path::to_path_buf)

@@ -207,17 +207,14 @@ impl ShokaConfig {
         // and any sibling `config.*.toml` overlays still win in their usual
         // alphabetical order.
         //
-        // The canonicalize-based dedup check uses an explicit
-        // `(Some, Some)` match — comparing `Option::None` to `None`
-        // would otherwise wrongly treat two paths that *both* failed
-        // to canonicalize as equal, causing a missed prepend.
+        // `is_ok_and` keeps the dedup conservative: when canonicalize
+        // fails for either side, treat as "not equal" so the explicit
+        // path is prepended rather than silently dropped.
         if explicit.exists() {
-            let explicit_can = explicit.canonicalize().ok();
-            let already_listed = files.iter().any(|p| {
-                matches!(
-                    (explicit_can.as_ref(), p.canonicalize().ok().as_ref()),
-                    (Some(a), Some(b)) if a == b
-                )
+            let already_listed = explicit.canonicalize().is_ok_and(|explicit_can| {
+                files
+                    .iter()
+                    .any(|p| p.canonicalize().is_ok_and(|p_can| p_can == explicit_can))
             });
             if !already_listed {
                 files.insert(0, explicit.to_path_buf());
@@ -286,7 +283,11 @@ impl ShokaConfig {
                 .default_host
                 .clone()
                 .unwrap_or_else(|| g.default_host.clone()),
-            exec_concurrency: prof.exec_concurrency.unwrap_or(g.exec_concurrency),
+            // Floor at 1 — a user-provided `exec_concurrency = 0`
+            // would otherwise feed straight into thread-pool builders
+            // and tokio::JoinSet sizing, where 0 typically panics or
+            // deadlocks. 1 is the smallest safe sequential value.
+            exec_concurrency: prof.exec_concurrency.unwrap_or(g.exec_concurrency).max(1),
             ui: g.ui.clone(),
             shell: g.shell.clone(),
             hosts: self.hosts.clone(),
@@ -669,8 +670,8 @@ exec_concurrency = 32
 
     #[test]
     fn expand_home_makes_relative_input_absolute() {
-        // Gemini review on PR #9: resolved `root` should be absolute
-        // regardless of caller cwd. This guards the contract.
+        // Guards the contract: resolved `root` must be absolute
+        // regardless of caller cwd.
         let expanded = expand_home("relative/repos");
         assert!(
             expanded.is_absolute(),
