@@ -19,7 +19,49 @@ include = [
     "LICENSE",
 ]
 
+[lib]
+name = "shoka"
+path = "src/lib.rs"
+
+[[bin]]
+name = "shoka"
+path = "src/main.rs"
+
 [dependencies]
+# config / templating
+teravars = { version = "0.1.6", features = ["merge", "std-helpers"] }
+serde = { version = "1.0.228", features = ["derive"] }
+toml = "1.1.2"
+
+# CLI / fuzzy fallback
+clap = { version = "4.6.1", features = ["derive", "env"] }
+clap_complete = "4.6.5"
+inquire = "0.9.4"
+
+# async / parallel exec
+tokio = { version = "1.52.3", features = ["full"] }
+
+# misc
+directories = "6.0.0"
+which = "8.0.0"
+anyhow = "1.0.102"
+thiserror = "2.0.18"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+owo-colors = "4.3.0"
+
+# TUI (phase 2 で本格採用、skeleton 段階では未使用)
+# ratatui = "0.30"
+# crossterm = "0.29"
+# nucleo = "0.5"
+
+# gh integration (phase 1 後半 / phase 2 で octocrab 追加)
+# octocrab = "0.45"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
 
 [profile.release]
 lto = true

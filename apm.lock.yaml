@@ -1,10 +1,10 @@
 lockfile_version: '1'
-generated_at: '2026-05-10T04:14:04.730041+00:00'
+generated_at: '2026-05-24T19:25:10.429165+00:00'
 apm_version: 0.12.1
 dependencies:
 - repo_url: yukimemi/renri
   host: github.com
-  resolved_commit: 50c3ee2f9fadbe726fbe695cf1846b970feb62f0
+  resolved_commit: 1d5accf8d9e7ac428f5fb3c6e731cf34b722ba7f
   resolved_ref: main
   package_type: apm_package
   deployed_files:
