@@ -1,0 +1,156 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Skip cache save on PR runs — the Post step's tar.exe is
+          # flaky on windows-latest (file locks under target/ make
+          # the save fail and mark the otherwise-green job FAILURE,
+          # blocking renovate auto-merge for downstream consumers).
+          # Main keeps saving so every PR rebuild gets a warm cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+        # The GH Actions cache backend transient-flakes the restore
+        # step on windows-latest just often enough to gate release
+        # pipelines (verified on yukimemi/kanade@v0.6.2 — the cache
+        # restore died mid-tar, killed the Windows build matrix, and
+        # blocked the publish). Fall through to a cold cargo build
+        # when the restore errors out: ~3–5 min slower on a single
+        # job, but self-healing instead of release-blocking.
+        continue-on-error: true
+      - run: cargo check --all-targets
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+        # See the check job above for why continue-on-error is set
+        # on every rust-cache restore (transient GH Actions cache
+        # backend flake on windows-latest).
+        continue-on-error: true
+      # `cargo test --all-targets` covers lib / bins / tests / benches
+      # / examples but EXCLUDES doc tests, so run --doc separately.
+      # Doc-test step is gated on `src/lib.rs` presence: `cargo test
+      # --doc` errors with `no library targets found` on bin-only
+      # crates (yukimemi/todoke#50, yukimemi/rvpm#176 track the
+      # consumer-side refactor). Drop this `if:` once both land.
+      - run: cargo test --all-targets
+      - if: ${{ hashFiles('src/lib.rs') != '' }}
+        run: cargo test --doc
+
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    # Matrix across all three OSes so OS-specific dead code (e.g. helpers
+    # gated under `cfg(target_os = "windows")`) is caught everywhere, not
+    # just on the maintainer's machine. Without this, a Windows-only
+    # helper looks fine on a Windows pre-push hook but blows up the Linux
+    # clippy run.
+    name: clippy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+        # See the check job above for why continue-on-error is set
+        # on every rust-cache restore (transient GH Actions cache
+        # backend flake on windows-latest).
+        continue-on-error: true
+      - run: cargo clippy --all-targets -- -D warnings
+
+  lockfile:
+    # Catches stale Cargo.lock (e.g. version bumped in Cargo.toml but lock
+    # still points at the old version) before it reaches the publish job,
+    # which uses --locked and would otherwise fail there.
+    name: cargo lockfile in sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+        # See the check job above for why continue-on-error is set
+        # on every rust-cache restore (transient GH Actions cache
+        # backend flake on windows-latest).
+        continue-on-error: true
+      - run: cargo check --locked --all-targets
+
+  coverage:
+    # llvm-cov on Linux + Codecov upload. taiki-e/install-action grabs the
+    # cargo-llvm-cov binary. codecov-action@v5 nominally accepts tokenless
+    # uploads from public repos, but in practice Codecov rejects them with
+    # 'Token required - not valid tokenless upload', so plumb CODECOV_TOKEN
+    # through as a repo secret. `fail_ci_if_error: false` still keeps a
+    # flaky upload from gating merges.
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+        # See the check job above for why continue-on-error is set
+        # on every rust-cache restore (transient GH Actions cache
+        # backend flake on windows-latest).
+        continue-on-error: true
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+      - uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: lcov.info
+          fail_ci_if_error: false
