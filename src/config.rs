@@ -176,6 +176,23 @@ impl ShokaConfig {
     /// Returns [`ShokaConfig::default`] when the config dir is missing
     /// or contains no `config*.toml` files.
     pub fn load(paths: &ShokaPaths) -> Result<Self> {
+        // First-run bootstrap: if the config file is missing entirely,
+        // drop a starter at the expected path so shoka is usable
+        // immediately after install. Subsequent runs find the file
+        // and skip this step. Emitted at info level so users can see
+        // it under the default `warn,shoka=info` filter.
+        let explicit = paths.config_file();
+        if !explicit.exists() {
+            write_starter(paths).with_context(|| {
+                format!("auto-creating starter config at {}", explicit.display())
+            })?;
+            tracing::info!(
+                target: "shoka",
+                "wrote starter config to {} (first-run bootstrap)",
+                explicit.display()
+            );
+        }
+
         let dir = paths.config_dir();
         let mut files: Vec<PathBuf> = if dir.exists() {
             discover_config_files(dir)
@@ -189,7 +206,6 @@ impl ShokaConfig {
         // `config.*.toml` discovery pattern. Prepend so it acts as the base
         // and any sibling `config.*.toml` overlays still win in their usual
         // alphabetical order.
-        let explicit = paths.config_file();
         if explicit.exists() {
             let explicit_can = explicit.canonicalize().ok();
             let already_listed = files.iter().any(|p| p.canonicalize().ok() == explicit_can);
@@ -271,6 +287,88 @@ impl ShokaConfig {
     }
 }
 
+/// Starter `config.toml` content written by `shoka doctor --init`.
+///
+/// Designed to be a usable baseline as soon as the user edits the
+/// `root = ...` line: everything else is commented out with examples
+/// of the available knobs and a pointer to the project docs.
+pub const STARTER_CONFIG: &str = r#"# shoka config — see https://github.com/yukimemi/shoka for the full schema.
+#
+# Files are layered: this `config.toml` is the base, `config.*.toml`
+# siblings merge on top in alphabetical order, and `config.local.toml`
+# always wins. Use `--config PATH` or $SHOKA_CONFIG to point at a
+# specific file.
+
+# [vars]
+# # User-defined variables. Standard helpers home() / env(name=...) /
+# # is_windows() etc. are pre-registered. Reference vars in later TOML
+# # values via Tera (see docs above for syntax); the example below
+# # uses home().
+# work_root = "{{ home() }}/work"
+
+[global]
+# Filesystem root under which repositories are cloned. Required.
+root = "~/src"
+
+# Path layout template. Variables injected at clone time:
+# root, host, owner, name, profile, vcs, protocol. Default produces
+# a flat <root>/<host>/<owner>/<name> tree.
+# (To set, write a Tera template string here — see the project docs.)
+
+# default_vcs = "auto"          # "auto" | "git" | "jj"
+# default_protocol = "https"    # "https" | "ssh"
+# default_host = "github.com"
+# default_profile = "personal"
+# exec_concurrency = 8
+
+# [global.ui]
+# status_cache_ttl_secs = 60
+# tui_refresh_ms = 250
+
+# [global.shell]
+# cd_command_name = "s"
+
+# Per-host overrides — merge over the global values.
+# [hosts."github.com"]
+# protocol = "ssh"
+
+# Profiles — `--profile NAME` / $SHOKA_PROFILE / global.default_profile
+# selects one. Profile fields override [global] when set; absent fields
+# fall through to the global value.
+# [profiles.personal]
+# root = "~/src"
+#
+# [profiles.work]
+# root = "~/work"
+# default_host = "github.com"
+#
+# [profiles.work.git_config]
+# "user.email" = "work@example.com"
+"#;
+
+/// Write [`STARTER_CONFIG`] to `paths.config_file()`, creating the
+/// config directory if needed.
+///
+/// Errors out (without writing) if the target file already exists —
+/// the caller is responsible for asking the user to confirm an
+/// overwrite if that's desired.
+pub fn write_starter(paths: &ShokaPaths) -> Result<()> {
+    let target = paths.config_file();
+    if target.exists() {
+        anyhow::bail!(
+            "config file already exists at {}; not overwriting",
+            target.display()
+        );
+    }
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating config dir {}", parent.display()))?;
+    }
+    std::fs::write(target, STARTER_CONFIG)
+        .with_context(|| format!("writing starter config to {}", target.display()))?;
+    Ok(())
+}
+
 /// Expand a leading `~` in a path-like string to the user's home dir.
 ///
 /// Only `~` on its own and `~/…` / `~\…` are expanded. `~foo` (which
@@ -309,21 +407,49 @@ mod tests {
     }
 
     #[test]
-    fn missing_config_dir_yields_defaults() {
-        let cfg = ShokaConfig::load(&paths_at(Path::new(
-            "/definitely/does/not/exist/shoka-cfg-test",
-        )))
-        .expect("load tolerates missing dir");
-        assert!(cfg.global.root.is_none());
-        assert_eq!(cfg.global.default_vcs, VcsDefault::Auto);
-        assert_eq!(cfg.global.exec_concurrency, 8);
+    fn load_auto_writes_starter_when_missing() {
+        // First-run bootstrap: load() finds no config file, writes a
+        // starter at the canonical path, and proceeds to load it. End
+        // state should be the starter's view of the world (root set
+        // to `~/src`, no profiles defined yet).
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("config.toml");
+        assert!(!target.exists(), "preconditions: target must not exist yet");
+        let cfg =
+            ShokaConfig::load(&paths_at(tmp.path())).expect("load should auto-create starter");
+        assert!(
+            target.exists(),
+            "load must have written the starter at {target:?}"
+        );
+        assert_eq!(cfg.global.root.as_deref(), Some("~/src"));
+        assert!(
+            cfg.profiles.is_empty(),
+            "starter does not define any profiles"
+        );
     }
 
     #[test]
-    fn empty_config_dir_yields_defaults() {
+    fn load_does_not_overwrite_existing_config() {
+        // Subsequent runs: load() must NOT clobber an existing config
+        // (the user-edited file). It only auto-creates when missing.
         let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("config.toml"),
+            r#"
+[global]
+root = "/user/edited"
+"#,
+        )
+        .unwrap();
         let cfg = ShokaConfig::load(&paths_at(tmp.path())).expect("load");
-        assert!(cfg.profiles.is_empty());
+        assert_eq!(cfg.global.root.as_deref(), Some("/user/edited"));
+        // File body should still be the user's, not the starter.
+        let body = fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        assert!(body.contains("/user/edited"));
+        assert!(
+            !body.contains("shoka config — see"),
+            "starter header should not have been written over user content"
+        );
     }
 
     #[test]
@@ -532,6 +658,64 @@ default_host = "gitlab.com"
         let cfg = ShokaConfig::load(&paths).expect("load");
         assert_eq!(cfg.global.root.as_deref(), Some("/from/custom"));
         assert_eq!(cfg.global.default_host, "gitlab.com");
+    }
+
+    #[test]
+    fn write_starter_creates_file_when_missing() {
+        let tmp = TempDir::new().unwrap();
+        // Point config_file at a yet-to-exist subdir to also exercise
+        // the `create_dir_all` path.
+        let target = tmp.path().join("nested").join("config.toml");
+        let paths = ShokaPaths::resolve(Some(&target)).unwrap();
+        assert!(!target.exists());
+
+        write_starter(&paths).expect("write_starter on fresh path");
+        assert!(target.exists(), "starter file should exist at {target:?}");
+
+        let body = fs::read_to_string(&target).unwrap();
+        assert!(
+            body.contains("[global]"),
+            "starter should contain [global] section, got: {body}"
+        );
+        assert!(
+            body.contains("root ="),
+            "starter should set root = ..., got: {body}"
+        );
+    }
+
+    #[test]
+    fn write_starter_refuses_to_overwrite() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("config.toml");
+        fs::write(&target, "# existing user config\n").unwrap();
+        let paths = ShokaPaths::resolve(Some(&target)).unwrap();
+
+        let err = write_starter(&paths).expect_err("write_starter must refuse overwrite");
+        assert!(
+            err.to_string().contains("already exists"),
+            "error should mention existing file: {err}"
+        );
+
+        // Original content must be intact.
+        let body = fs::read_to_string(&target).unwrap();
+        assert_eq!(body, "# existing user config\n");
+    }
+
+    #[test]
+    fn starter_content_is_loadable() {
+        // Round-trip: write starter, then load it through the regular
+        // pipeline. This guards against the starter regressing into
+        // syntactically-invalid TOML or unrenderable Tera.
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("config.toml");
+        let paths = ShokaPaths::resolve(Some(&target)).unwrap();
+        write_starter(&paths).expect("write");
+        let cfg = ShokaConfig::load(&paths).expect("load starter");
+        // The starter sets root = "~/src" (uncommented); everything else
+        // is commented out. So we expect root set and defaults elsewhere.
+        assert_eq!(cfg.global.root.as_deref(), Some("~/src"));
+        assert_eq!(cfg.global.default_vcs, VcsDefault::Auto);
+        assert_eq!(cfg.global.default_host, "github.com");
     }
 
     #[test]

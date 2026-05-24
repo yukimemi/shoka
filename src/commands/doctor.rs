@@ -1,10 +1,10 @@
 //! `shoka doctor` — diagnose paths + config resolution.
 //!
 //! Phase 1's first real command. Prints the resolved [`ShokaPaths`],
-//! attempts to load [`ShokaConfig`] from the layered config tree, and
-//! reports the effective [`ResolvedConfig`] under the active profile.
-//! Useful both as a smoke test for new installs and as the rendering
-//! target while paths / config code is in flux.
+//! loads [`ShokaConfig`] (auto-creating a starter file on first run),
+//! and reports the effective [`ResolvedConfig`] under the active
+//! profile. Useful as a smoke test for new installs and as the
+//! rendering target while paths / config code is in flux.
 //!
 //! [`ShokaConfig`]: crate::config::ShokaConfig
 //! [`ResolvedConfig`]: crate::config::ResolvedConfig
@@ -28,16 +28,7 @@ pub async fn run(ctx: &ShokaContext) -> Result<()> {
     println!("  cache file  : {}", p.cache_file().display());
     println!();
 
-    let config_exists = p.config_file().exists();
-    println!(
-        "{}  ({})",
-        "config".underline(),
-        if config_exists {
-            "found".green().to_string()
-        } else {
-            "no config file yet — defaults in use".dimmed().to_string()
-        }
-    );
+    let pre_existed = p.config_file().exists();
 
     let cfg = match ShokaConfig::load(p) {
         Ok(c) => c,
@@ -46,6 +37,18 @@ pub async fn run(ctx: &ShokaContext) -> Result<()> {
             return Ok(());
         }
     };
+
+    println!(
+        "{}  ({})",
+        "config".underline(),
+        if pre_existed {
+            "found".green().to_string()
+        } else {
+            "starter just written — edit `root = ...` to customize"
+                .cyan()
+                .to_string()
+        }
+    );
 
     let profile_name = cfg.resolve_profile_name(ctx.profile_override.as_deref());
     println!(
