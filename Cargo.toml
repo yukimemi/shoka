@@ -59,7 +59,7 @@ owo-colors = "4.3.0"
 # octocrab = "0.45"
 
 [dev-dependencies]
-assert_cmd = "2"
+assert_cmd = "2.2.2"
 predicates = "3"
 tempfile = "3"
 
