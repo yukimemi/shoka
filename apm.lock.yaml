@@ -1,5 +1,5 @@
 lockfile_version: '1'
-generated_at: '2026-05-24T19:25:10.429165+00:00'
+generated_at: '2026-05-24T22:45:41.348289+00:00'
 apm_version: 0.12.1
 dependencies:
 - repo_url: yukimemi/renri
@@ -10,4 +10,4 @@ dependencies:
   deployed_files:
   - .agents/skills/renri
   - .claude/skills/renri
-  content_hash: sha256:64f3babacb8a6d1fad43275d5617548239bf70762b108f94ec1865016cef6a96
+  content_hash: sha256:c80841c07eb2fad50aba38b2fd693977c4e8a790724a698c68e59e2e1d1341f3

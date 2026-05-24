@@ -61,6 +61,8 @@ pub enum Command {
     Note(NoteArgs),
 
     /// Diagnose environment (gh, git, jj presence; config validity).
+    /// The first command run on a fresh machine also auto-creates a
+    /// starter `config.toml` at the resolved config path.
     Doctor,
 
     /// Launch the TUI dashboard explicitly.
