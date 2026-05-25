@@ -78,7 +78,16 @@ pub async fn run(ctx: &ShokaContext) -> Result<()> {
             .flatten()
             .collect::<Vec<_>>()
             .join(", ");
-            println!("    [{idx}] {} → {override_summary}", route.raw.pattern);
+            // Skip the arrow when there's no overrides to show — a
+            // bare `→ ` line is just noise. A future route may exist
+            // purely for matching (e.g., to opt into a flag that's
+            // not config-shaped); render it without the trailing
+            // arrow in that case.
+            if override_summary.is_empty() {
+                println!("    [{idx}] {}", route.raw.pattern);
+            } else {
+                println!("    [{idx}] {} → {override_summary}", route.raw.pattern);
+            }
         }
     }
     if r.profile_provided_root {
