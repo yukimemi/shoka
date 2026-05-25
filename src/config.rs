@@ -550,6 +550,49 @@ impl ResolvedConfig {
             matched_route: None,
         }
     }
+
+    /// Render the on-disk clone path for `repo` by feeding the
+    /// resolved [`CloneTarget`]'s `layout` template through Tera with
+    /// the per-repo context (`root` / `host` / `owner` / `name` /
+    /// `profile` / `vcs` / `protocol`) populated.
+    ///
+    /// Lives here (rather than on `Repo`) because the resolution
+    /// owns the destination context — same repo can land in different
+    /// paths under different routes / profiles, and the layout
+    /// template is itself a config-level concern.
+    pub fn clone_path_for(&self, repo: &crate::state::Repo) -> Result<PathBuf> {
+        use teravars::{Context, Engine};
+
+        let spec = format!("{}/{}/{}", repo.host, repo.owner, repo.name);
+        let target = self.resolve_target(&spec);
+
+        // Per-repo `vcs` override on the Repo itself wins over the
+        // route / global default — that's the contract `set --vcs`
+        // promises.
+        let vcs = repo.vcs.unwrap_or(target.default_vcs);
+
+        let mut ctx = Context::new();
+        ctx.insert("root", &target.root.to_string_lossy().to_string());
+        ctx.insert("host", &repo.host);
+        ctx.insert("owner", &repo.owner);
+        ctx.insert("name", &repo.name);
+        ctx.insert(
+            "profile",
+            &self.active_profile.as_deref().unwrap_or("default"),
+        );
+        ctx.insert("vcs", &format!("{vcs:?}").to_lowercase());
+        ctx.insert(
+            "protocol",
+            &format!("{:?}", target.default_protocol).to_lowercase(),
+        );
+
+        let mut engine = Engine::new();
+        let rendered = engine
+            .render(&target.layout, &ctx)
+            .with_context(|| format!("rendering layout `{}` for {spec}", target.layout))?;
+
+        Ok(PathBuf::from(rendered))
+    }
 }
 
 /// Starter `config.toml` content written by `shoka doctor --init`.
