@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-labelledby="shoka-icon-title shoka-icon-desc">
+  <title id="shoka-icon-title">shoka</title>
+  <desc id="shoka-icon-desc">A bookshelf framed by ink-black rails on a washi-cream background. Six aubergine-and-grape book spines sit on the shelf; the fourth, a lighter old-rose purple, is lifted slightly out of the case and bears a vermilion ▶ cursor — the volume being pulled off the shelf.</desc>
+
+  <rect width="512" height="512" fill="#F4ECDE"/>
+
+  <g fill="#2A2418">
+    <rect x="56" y="80"  width="400" height="10"/>
+    <rect x="56" y="438" width="400" height="10"/>
+    <rect x="56" y="80"  width="10"  height="368"/>
+    <rect x="446" y="80" width="10"  height="368"/>
+  </g>
+
+  <g>
+    <rect x="80"  y="92" width="52" height="344" fill="#4A2540"/>
+    <rect x="80"  y="110" width="52" height="2"  fill="#F4ECDE" opacity="0.32"/>
+    <rect x="80"  y="416" width="52" height="2"  fill="#F4ECDE" opacity="0.32"/>
+    <rect x="91"  y="252" width="30" height="2"  fill="#F4ECDE" opacity="0.50"/>
+
+    <rect x="136" y="92" width="58" height="344" fill="#6D3458"/>
+    <rect x="136" y="110" width="58" height="2"  fill="#F4ECDE" opacity="0.32"/>
+    <rect x="136" y="416" width="58" height="2"  fill="#F4ECDE" opacity="0.32"/>
+    <rect x="148" y="252" width="34" height="2"  fill="#F4ECDE" opacity="0.50"/>
+
+    <rect x="198" y="92" width="48" height="344" fill="#4A2540"/>
+    <rect x="198" y="110" width="48" height="2"  fill="#F4ECDE" opacity="0.32"/>
+    <rect x="198" y="416" width="48" height="2"  fill="#F4ECDE" opacity="0.32"/>
+    <rect x="208" y="252" width="28" height="2"  fill="#F4ECDE" opacity="0.50"/>
+
+    <rect x="318" y="92" width="54" height="344" fill="#6D3458"/>
+    <rect x="318" y="110" width="54" height="2"  fill="#F4ECDE" opacity="0.32"/>
+    <rect x="318" y="416" width="54" height="2"  fill="#F4ECDE" opacity="0.32"/>
+    <rect x="329" y="252" width="32" height="2"  fill="#F4ECDE" opacity="0.50"/>
+
+    <rect x="376" y="92" width="56" height="344" fill="#4A2540"/>
+    <rect x="376" y="110" width="56" height="2"  fill="#F4ECDE" opacity="0.32"/>
+    <rect x="376" y="416" width="56" height="2"  fill="#F4ECDE" opacity="0.32"/>
+    <rect x="387" y="252" width="34" height="2"  fill="#F4ECDE" opacity="0.50"/>
+  </g>
+
+  <g>
+    <rect x="250" y="424" width="64" height="14" fill="#2A2418" opacity="0.18"/>
+    <rect x="250" y="76"  width="64" height="346" fill="#9B6FB0" stroke="#2A2418" stroke-width="1.5"/>
+    <rect x="250" y="94"  width="64" height="2"  fill="#F4ECDE" opacity="0.60"/>
+    <rect x="250" y="404" width="64" height="2"  fill="#F4ECDE" opacity="0.60"/>
+    <polygon points="268,226 298,250 268,274" fill="#C8362A"/>
+  </g>
+</svg>

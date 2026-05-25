@@ -1,6 +1,11 @@
-# shoka
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg" />
+    <img src="assets/logo.svg" width="520" alt="shoka 書架 — your repository bookshelf" />
+  </picture>
+</p>
 
-> 書架 — your repository bookshelf.
+<p align="center"><em>your repository bookshelf.</em></p>
 
 A repository workspace manager written in Rust. A modern,
 jj-aware successor to [ghq](https://github.com/x-motemen/ghq)
