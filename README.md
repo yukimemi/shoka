@@ -108,7 +108,9 @@ travels out-of-band.
 # one-shot (current session):
 shoka init-shell powershell --name s | Out-String | Invoke-Expression
 
-# persistent (append to $PROFILE):
+# persistent (append to $PROFILE — create it first if missing,
+# which it is on a fresh PowerShell install):
+if (!(Test-Path $PROFILE)) { New-Item -Type File -Path $PROFILE -Force | Out-Null }
 shoka init-shell powershell --name s | Add-Content $PROFILE
 . $PROFILE
 ```
@@ -116,8 +118,11 @@ shoka init-shell powershell --name s | Add-Content $PROFILE
 ### bash / zsh
 
 ```sh
-# add to ~/.bashrc or ~/.zshrc:
-eval "$(shoka init-shell bash --name s)"   # or zsh
+# bash — add to ~/.bashrc:
+eval "$(shoka init-shell bash --name s)"
+
+# zsh — add to ~/.zshrc:
+eval "$(shoka init-shell zsh --name s)"
 ```
 
 ### fish
@@ -147,6 +152,10 @@ default_host = "github.com"
 default_protocol = "https"
 default_vcs = "auto"
 
+[global.cache]
+background_refresh = true
+refresh_threshold_secs = 60
+
 [[routes]]
 pattern = "host:github.com/mycompany"
 root = "~/src/work"
@@ -154,10 +163,6 @@ default_protocol = "ssh"
 
 [profiles.work]
 default_host = "github.mycompany.com"
-
-[global.cache]
-background_refresh = true
-refresh_threshold_secs = 60
 ```
 
 Route patterns support `host:<host>`, `host:<host>/<owner>`, and
