@@ -119,8 +119,21 @@ struct Stale {
 }
 
 /// Walk the shelf, resolve each repo's clone path, return the ones
-/// whose path is missing on disk. Resolution shares one Tera engine
-/// across the walk — same trick as `shoka list`.
+/// whose path is **definitely** missing on disk.
+///
+/// "Definitely missing" is narrower than [`Path::is_dir`] returns. The
+/// `is_dir` shortcut treats *every* error (permission denied, network
+/// mount offline, transient I/O hiccup, …) as "not a directory",
+/// which would silently mark a perfectly-alive repo as stale and
+/// delete it from the shelf on the next `--yes`.
+///
+/// Instead, [`std::fs::metadata`] is queried explicitly and only
+/// [`std::io::ErrorKind::NotFound`] turns into a removal candidate.
+/// Other errors are logged at warn level and the repo is left
+/// untouched on the shelf — better to under-prune than to lose an
+/// alive entry because the user briefly couldn't reach a mounted
+/// drive. Resolution shares one Tera engine across the walk — same
+/// trick as `shoka list`.
 fn find_stale(shelf: &Shelf, resolved: &ResolvedConfig) -> Result<Vec<Stale>> {
     let mut engine = Engine::new();
     let mut out = Vec::new();
@@ -128,14 +141,39 @@ fn find_stale(shelf: &Shelf, resolved: &ResolvedConfig) -> Result<Vec<Stale>> {
         let path = resolved
             .clone_path_for(repo, &mut engine)
             .with_context(|| format!("resolving clone path for {}", repo.slug()))?;
-        if !path.is_dir() {
-            out.push(Stale {
-                host: repo.host.clone(),
-                owner: repo.owner.clone(),
-                name: repo.name.clone(),
-                slug: repo.slug(),
-                path: path.display().to_string(),
-            });
+        match std::fs::metadata(&path) {
+            // Path exists but isn't a directory (someone replaced
+            // the clone with a file?). Still stale enough to flag —
+            // shoka can't cd into a non-directory either.
+            Ok(meta) if !meta.is_dir() => {
+                out.push(Stale {
+                    host: repo.host.clone(),
+                    owner: repo.owner.clone(),
+                    name: repo.name.clone(),
+                    slug: repo.slug(),
+                    path: path.display().to_string(),
+                });
+            }
+            Ok(_) => {} // Live directory — keep on shelf.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                out.push(Stale {
+                    host: repo.host.clone(),
+                    owner: repo.owner.clone(),
+                    name: repo.name.clone(),
+                    slug: repo.slug(),
+                    path: path.display().to_string(),
+                });
+            }
+            Err(e) => {
+                // Permission denied, transient I/O, offline network
+                // mount, … — explicitly *don't* mark as stale.
+                tracing::warn!(
+                    target: "shoka",
+                    "skipping {} for prune: cannot stat {} ({e})",
+                    repo.slug(),
+                    path.display()
+                );
+            }
         }
     }
     Ok(out)
@@ -176,6 +214,22 @@ mod tests {
         let stale = find_stale(&shelf, &resolved).unwrap();
         assert_eq!(stale.len(), 1);
         assert_eq!(stale[0].name, "ghost");
+    }
+
+    #[test]
+    fn find_stale_flags_file_at_clone_path_too() {
+        // Edge case: something at the clone path *is* there, but it's
+        // a file rather than a directory. shoka can't cd into a file
+        // either, so the entry is just as stale.
+        let tmp = TempDir::new().unwrap();
+        let resolved = make_resolved(tmp.path().to_string_lossy().as_ref());
+        let mut shelf = Shelf::default();
+        shelf.add(Repo::new("github.com", "u", "weird")).unwrap();
+        std::fs::write(tmp.path().join("weird"), "i am a file\n").unwrap();
+
+        let stale = find_stale(&shelf, &resolved).unwrap();
+        assert_eq!(stale.len(), 1, "file-at-clone-path should flag stale");
+        assert_eq!(stale[0].name, "weird");
     }
 
     #[test]
