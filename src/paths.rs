@@ -20,6 +20,15 @@
 //! `state.toml` always lives under the state dir; `cache.toml` under
 //! the cache dir.
 //!
+//! State / cache locations honour two env-var overrides:
+//!
+//! - `SHOKA_STATE_DIR` — directory holding `state.toml`.
+//! - `SHOKA_CACHE_DIR` — directory holding `cache.toml`.
+//!
+//! Both are intended for integration tests that must not write into
+//! the user's real OS data directory; they're also documented for any
+//! advanced caller who deliberately wants non-default locations.
+//!
 //! [pd]: https://docs.rs/directories/latest/directories/struct.ProjectDirs.html
 
 use std::path::{Path, PathBuf};
@@ -63,11 +72,16 @@ impl ShokaPaths {
             None => (default_config_dir.join("config.toml"), default_config_dir),
         };
 
+        let state_dir =
+            env_override("SHOKA_STATE_DIR").unwrap_or_else(|| project.data_dir().to_path_buf());
+        let cache_dir =
+            env_override("SHOKA_CACHE_DIR").unwrap_or_else(|| project.cache_dir().to_path_buf());
+
         Ok(Self {
             config_file,
             config_dir,
-            state_dir: project.data_dir().to_path_buf(),
-            cache_dir: project.cache_dir().to_path_buf(),
+            state_dir,
+            cache_dir,
         })
     }
 
@@ -100,6 +114,19 @@ impl ShokaPaths {
     pub fn cache_file(&self) -> PathBuf {
         self.cache_dir.join("cache.toml")
     }
+}
+
+/// Read a directory-pointing env var. Returns `None` for unset or
+/// empty; absolutises against cwd via [`std::path::absolute`] so
+/// relative inputs (e.g. tests passing temp paths) are consistent
+/// with the `config_override` branch above.
+fn env_override(var: &str) -> Option<PathBuf> {
+    let raw = std::env::var_os(var)?;
+    if raw.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(raw);
+    std::path::absolute(&p).ok().or(Some(p))
 }
 
 #[cfg(test)]
