@@ -1241,6 +1241,7 @@ dependencies = [
  "clap_complete",
  "directories",
  "inquire",
+ "libc",
  "owo-colors",
  "predicates",
  "regex",
