@@ -28,7 +28,6 @@
 
 use std::io;
 use std::path::PathBuf;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::event::{
@@ -216,30 +215,49 @@ impl App {
     }
 }
 
+/// RAII guard: enabling raw mode + alt-screen in `new`, tearing
+/// them down in `drop`. Using a guard rather than an explicit
+/// cleanup block at the end of `run_app` means a panic anywhere
+/// inside the TUI still restores the terminal — without the guard,
+/// the user would be stranded in raw mode with their input
+/// invisible until they hit `reset`.
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn new() -> Result<Self> {
+        enable_raw_mode().context("enabling terminal raw mode")?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)
+            .context("entering alt screen")?;
+        Ok(Self)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        // Best-effort cleanup — there's nothing we can do if any of
+        // these fail (no panic-in-drop), and the user is going to
+        // get their terminal back one way or another. Print cursor
+        // show explicitly: LeaveAlternateScreen restores the main
+        // buffer but the cursor visibility flag persists, and we
+        // hid it via TableState rendering.
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            io::stdout(),
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            crossterm::cursor::Show
+        );
+    }
+}
+
 /// Main loop. Returns `Ok(Some(idx))` when the user pressed Enter on
-/// a row, `Ok(None)` when they quit (q / Esc / Ctrl-C). Always tears
-/// down the terminal cleanly even if the inner draw / event-read
-/// errors out.
+/// a row, `Ok(None)` when they quit (q / Esc / Ctrl-C). The
+/// [`TerminalGuard`] takes care of teardown — including on panic.
 fn run_app(app: &mut App) -> Result<Option<usize>> {
-    enable_raw_mode().context("enabling terminal raw mode")?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture).context("entering alt screen")?;
-    let backend = CrosstermBackend::new(stdout);
+    let _guard = TerminalGuard::new()?;
+    let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).context("constructing ratatui terminal")?;
-
-    let result = event_loop(&mut terminal, app);
-
-    // Tear down regardless of how the loop exited — leaving the
-    // terminal in raw mode + alt screen is the worst kind of crash.
-    let _ = disable_raw_mode();
-    let _ = execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    );
-    let _ = terminal.show_cursor();
-
-    result
+    event_loop(&mut terminal, app)
 }
 
 fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<Option<usize>> {
@@ -251,11 +269,11 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<O
             .draw(|f| ui(f, app))
             .map_err(|e| anyhow::anyhow!("drawing frame: {e}"))?;
 
-        // 100 ms tick — fast enough that a Ctrl-C feels responsive,
-        // slow enough that we're not hammering the event queue.
-        if !event::poll(Duration::from_millis(100)).context("polling for events")? {
-            continue;
-        }
+        // Block on `read()` rather than polling: there's no
+        // animation or background work to drive, and Ctrl-C arrives
+        // as a `KeyEvent` under crossterm's raw mode (not a signal),
+        // so we're never stranded waiting. The polled variant
+        // burned CPU + wall-time for no UX gain.
         let evt = event::read().context("reading event")?;
         let Event::Key(key) = evt else { continue };
         if key.kind == KeyEventKind::Release {
@@ -319,7 +337,7 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<O
     }
 }
 
-fn ui(f: &mut Frame, app: &App) {
+fn ui(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -347,7 +365,7 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(line), area);
 }
 
-fn render_table(f: &mut Frame, area: Rect, app: &App) {
+fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
     let header_row = Row::new(vec!["repo", "path", "tags"]).style(
         Style::default()
             .add_modifier(Modifier::BOLD)
@@ -386,7 +404,12 @@ fn render_table(f: &mut Frame, area: Rect, app: &App) {
                 .border_style(Style::default().fg(Color::DarkGray)),
         );
 
-    f.render_stateful_widget(table, area, &mut app.table_state.clone());
+    // Pass the real `TableState` by `&mut` so the scroll offset
+    // ratatui computes (for keeping the highlighted row visible as
+    // the cursor moves off-screen) actually persists across frames.
+    // Cloning here would discard those mutations and break long-
+    // shelf scrolling.
+    f.render_stateful_widget(table, area, &mut app.table_state);
 }
 
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
