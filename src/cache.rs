@@ -27,10 +27,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::git_status::GitStatusSnapshot;
 use crate::paths::ShokaPaths;
 
-/// Current on-disk schema version. Bump on a breaking shape change.
-pub const CACHE_VERSION: u32 = 1;
+/// Current on-disk schema version. Bumped to **2** when the per-repo
+/// `git_status` field landed — readers with the old version on disk
+/// see the optional field as default-`None` and keep working.
+pub const CACHE_VERSION: u32 = 2;
 
 /// Cache file contents. Mirrors [`crate::state::Shelf`]'s shape
 /// intentionally — both files are walked by the same patterns
@@ -76,12 +79,20 @@ pub struct RepoCache {
     /// [`is_stale`]: RepoCache::is_stale
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_refreshed: Option<u64>,
-    // Phase-2 fields land here:
-    //   pub git_status: Option<GitStatusSnapshot>,
-    //   pub gh:         Option<GhSnapshot>,
-    // The schema's `version` bumps when they're introduced so a
-    // downgraded shoka refuses an unknown-shape cache rather than
-    // dropping the new fields silently.
+
+    /// Last captured per-repo git state — branch + dirty + ahead /
+    /// behind. Populated by [`crate::git_status::capture`] during
+    /// `cache refresh`. `None` when a refresh hasn't run yet, or
+    /// when the repo couldn't be opened (the refresher logs a warn
+    /// and leaves the previous snapshot untouched). The TUI renders
+    /// `?` for repos in the `None` state so users can tell "haven't
+    /// checked yet" apart from "clean".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_status: Option<GitStatusSnapshot>,
+    // The Phase 2b `gh: Option<GhSnapshot>` (PR / CI counts via
+    // octocrab) lands as a sibling field; another version bump
+    // accompanies it so a downgraded shoka refuses the unknown shape
+    // rather than dropping the new data silently.
 }
 
 impl RepoCache {
@@ -92,6 +103,7 @@ impl RepoCache {
             owner: owner.into(),
             name: name.into(),
             last_refreshed: None,
+            git_status: None,
         }
     }
 

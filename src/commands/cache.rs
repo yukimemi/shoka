@@ -30,7 +30,9 @@ use crate::cache::{Cache, current_unix_secs};
 use crate::cli::CacheCommand;
 use crate::commands::ShokaContext;
 use crate::config::ShokaConfig;
+use crate::git_status;
 use crate::state::{Repo, Shelf};
+use teravars::Engine;
 
 pub async fn dispatch(ctx: &ShokaContext, cmd: CacheCommand) -> Result<()> {
     match cmd {
@@ -74,21 +76,59 @@ async fn refresh(
     let mut refreshed = 0;
     let mut skipped_threshold = 0;
     let mut skipped_filter = 0;
+    let mut capture_errors = 0;
+
+    // One Tera engine for the whole walk — clone_path_for renders
+    // per repo, and the engine setup cost dominates a sub-ms gix
+    // status call on a small repo.
+    let mut engine = Engine::new();
 
     for repo in &shelf.repos {
         if !tags.is_empty() && !has_all_tags(repo, &tags) {
             skipped_filter += 1;
             continue;
         }
+        // Resolve the clone path *before* mutably borrowing the
+        // cache entry: resolved.clone_path_for can fail, and bailing
+        // mid-mutation would leave the cache half-updated.
+        let path = match resolved.clone_path_for(repo, &mut engine) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    target: "shoka",
+                    "skipping {} for refresh: path resolve failed ({e:#})",
+                    repo.slug()
+                );
+                capture_errors += 1;
+                continue;
+            }
+        };
+
         let entry = cache.upsert(repo);
         if !force && !entry.is_stale(threshold, now) {
             skipped_threshold += 1;
             continue;
         }
-        // Phase-1 placeholder: the actual git_status / gh snapshot
-        // refresh lands in a follow-up. For now, recording
-        // last_refreshed is enough to exercise the threshold logic
-        // end-to-end and prove the plumbing.
+
+        // Capture the gix snapshot. Errors are logged + counted but
+        // don't abort the refresh — one broken repo shouldn't stop
+        // the rest of the shelf from updating. The previous snapshot
+        // (if any) survives so the TUI keeps showing the last-known
+        // state rather than going blank.
+        match git_status::capture(&path) {
+            Ok(snapshot) => {
+                entry.git_status = Some(snapshot);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "shoka",
+                    "git status capture failed for {} at {}: {e:#}",
+                    repo.slug(),
+                    path.display()
+                );
+                capture_errors += 1;
+            }
+        }
         entry.last_refreshed = Some(now);
         refreshed += 1;
     }
@@ -101,7 +141,7 @@ async fn refresh(
         // SHOKA_LOG for users who want to peek at refresh history.
         tracing::info!(
             target: "shoka",
-            "background cache refresh: {refreshed} updated, {skipped_threshold} fresh, {skipped_filter} filtered ({} on shelf)",
+            "background cache refresh: {refreshed} updated, {skipped_threshold} fresh, {skipped_filter} filtered, {capture_errors} capture errors ({} on shelf)",
             shelf.len()
         );
     } else {
@@ -126,6 +166,13 @@ async fn refresh(
                 "  {} {} filtered out by --tag",
                 "↩".dimmed(),
                 skipped_filter
+            );
+        }
+        if capture_errors > 0 {
+            println!(
+                "  {} {} capture errors (previous snapshot kept; see SHOKA_LOG=warn)",
+                "!".red(),
+                capture_errors
             );
         }
     }

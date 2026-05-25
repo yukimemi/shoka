@@ -11,17 +11,18 @@
 //! Layout (3 rows):
 //!
 //! 1. Header — counts + active filter prefix.
-//! 2. Table — slug / path / tags, current selection highlighted.
+//! 2. Table — slug / branch / ahead-behind / dirty / path / tags,
+//!    current selection highlighted. Status columns read the
+//!    cached `git_status` snapshot off `cache.toml`; entries that
+//!    haven't been refreshed yet render `?` so users can tell
+//!    "unchecked" apart from "clean".
 //! 3. Footer — mode-specific key hints, or the live filter input.
 //!
 //! What's intentionally **not** here yet:
 //!
-//! - **Git status snapshot.** `branch / ahead-behind / dirty / open
-//!   PRs / CI` come from the cache layer, which doesn't yet collect
-//!   them. That work belongs in a follow-up PR that extends
-//!   `cache refresh` to capture the snapshot via `gix::status` +
-//!   `octocrab`; this PR plumbs through the table data model so the
-//!   columns can be added without restructuring.
+//! - **GitHub PR / CI counts.** Phase 2b — needs `octocrab` and
+//!   `gh auth token` wiring. The cache schema already has room
+//!   reserved for a sibling `gh: Option<GhSnapshot>` field.
 //! - **Multi-select / bulk ops.** The TUI is currently a fancy `cd`
 //!   picker. Bulk `exec --tag X -- ...` would be a natural extension.
 //! - **OSC 7 cwd hint.** Phase 3 polish.
@@ -48,10 +49,12 @@ use ratatui::widgets::{Block, Borders, Paragraph, Row, Table, TableState};
 use ratatui::{Terminal, prelude::Backend};
 use teravars::Engine;
 
+use crate::cache::Cache;
 use crate::cli::TuiArgs;
 use crate::commands::ShokaContext;
 use crate::commands::cd::emit_path;
 use crate::config::{ResolvedConfig, ShokaConfig};
+use crate::git_status::GitStatusSnapshot;
 use crate::state::{Repo, Shelf};
 
 pub async fn run(ctx: &ShokaContext, args: TuiArgs) -> Result<()> {
@@ -69,7 +72,20 @@ pub async fn run(ctx: &ShokaContext, args: TuiArgs) -> Result<()> {
         );
     }
 
-    let rows = build_rows(&shelf, &resolved, &args.tags)?;
+    // Cache load is best-effort: a missing / corrupt cache still
+    // lets the dashboard open (rows just render with `?` in the
+    // status columns). The user can recover via `shoka cache clear`
+    // + a refresh — the alternative (refusing to open the TUI)
+    // would block them from doing it from inside shoka itself.
+    let cache = match Cache::load(&ctx.paths) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(target: "shoka", "tui: cache load failed, falling back to no-status mode ({e:#})");
+            Cache::default()
+        }
+    };
+
+    let rows = build_rows(&shelf, &resolved, &cache, &args.tags)?;
     if rows.is_empty() {
         anyhow::bail!(
             "no repos matched the tag filter ({} on the shelf total)",
@@ -97,11 +113,17 @@ struct DashRow {
     /// Display string — `tags.join(", ")` cached so we don't
     /// re-join per frame.
     tags_display: String,
+    /// Cached git status snapshot from `cache.toml`. `None` when
+    /// the entry hasn't been refreshed yet — the TUI renders that
+    /// distinctly from "snapshot says clean" so users can tell
+    /// "unchecked" apart from "no changes".
+    status: Option<GitStatusSnapshot>,
 }
 
 fn build_rows(
     shelf: &Shelf,
     resolved: &ResolvedConfig,
+    cache: &Cache,
     tag_filter: &[String],
 ) -> Result<Vec<DashRow>> {
     let mut engine = Engine::new();
@@ -113,10 +135,14 @@ fn build_rows(
         let path = resolved
             .clone_path_for(repo, &mut engine)
             .with_context(|| format!("resolving clone path for {}", repo.slug()))?;
+        let status = cache
+            .find(&repo.host, &repo.owner, &repo.name)
+            .and_then(|c| c.git_status.clone());
         out.push(DashRow {
             slug: repo.slug(),
             path,
             tags_display: repo.tags.join(", "),
+            status,
         });
     }
     Ok(out)
@@ -366,7 +392,7 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
-    let header_row = Row::new(vec!["repo", "path", "tags"]).style(
+    let header_row = Row::new(vec!["repo", "branch", "↑↓", "✓", "path", "tags"]).style(
         Style::default()
             .add_modifier(Modifier::BOLD)
             .fg(Color::Yellow),
@@ -377,8 +403,12 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
         .iter()
         .map(|&idx| {
             let row = &app.rows[idx];
+            let (branch, ahead_behind, dirty) = status_cells(row.status.as_ref());
             Row::new(vec![
                 row.slug.clone(),
+                branch,
+                ahead_behind,
+                dirty,
                 row.path.display().to_string(),
                 row.tags_display.clone(),
             ])
@@ -386,9 +416,12 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
         .collect();
 
     let widths = [
-        Constraint::Percentage(35),
-        Constraint::Percentage(50),
-        Constraint::Percentage(15),
+        Constraint::Percentage(30), // repo
+        Constraint::Length(14),     // branch (fixed-ish; truncated below)
+        Constraint::Length(8),      // ↑N ↓N
+        Constraint::Length(2),      // dirty glyph
+        Constraint::Min(20),        // path takes the rest
+        Constraint::Length(14),     // tags
     ];
     let table = Table::new(rows, widths)
         .header(header_row)
@@ -410,6 +443,27 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
     // Cloning here would discard those mutations and break long-
     // shelf scrolling.
     f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+/// Format the three status cells the dashboard renders for one row.
+/// Returns `(branch, ahead_behind, dirty)`. When `status` is `None`
+/// (entry hasn't been refreshed yet), all three show a faint `?`
+/// rather than blank — users can tell "unchecked" from "clean".
+fn status_cells(status: Option<&GitStatusSnapshot>) -> (String, String, String) {
+    let Some(s) = status else {
+        return ("?".into(), "?".into(), "?".into());
+    };
+    let branch = s.branch.clone().unwrap_or_else(|| "-".into());
+    let ahead_behind = match (s.ahead, s.behind) {
+        (Some(0), Some(0)) => "=".to_string(),
+        (Some(a), Some(b)) if a > 0 && b > 0 => format!("↑{a} ↓{b}"),
+        (Some(a), Some(0)) if a > 0 => format!("↑{a}"),
+        (Some(0), Some(b)) if b > 0 => format!("↓{b}"),
+        // Either side unknown — no upstream ref to compare against.
+        _ => "-".into(),
+    };
+    let dirty = if s.dirty { "●".into() } else { "✓".into() };
+    (branch, ahead_behind, dirty)
 }
 
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
@@ -434,8 +488,67 @@ mod tests {
                 slug: (*s).into(),
                 path: PathBuf::from("/tmp"),
                 tags_display: String::new(),
+                status: None,
             })
             .collect()
+    }
+
+    fn snap(
+        branch: &str,
+        ahead: Option<usize>,
+        behind: Option<usize>,
+        dirty: bool,
+    ) -> GitStatusSnapshot {
+        GitStatusSnapshot {
+            branch: Some(branch.into()),
+            dirty,
+            ahead,
+            behind,
+        }
+    }
+
+    #[test]
+    fn status_cells_renders_unknown_for_missing_snapshot() {
+        let (b, ab, d) = status_cells(None);
+        assert_eq!(b, "?");
+        assert_eq!(ab, "?");
+        assert_eq!(d, "?");
+    }
+
+    #[test]
+    fn status_cells_renders_clean_branch_with_equal_marker() {
+        let s = snap("main", Some(0), Some(0), false);
+        let (b, ab, d) = status_cells(Some(&s));
+        assert_eq!(b, "main");
+        assert_eq!(ab, "=");
+        assert_eq!(d, "✓");
+    }
+
+    #[test]
+    fn status_cells_renders_ahead_only_and_behind_only() {
+        let (_, ab_ahead, _) = status_cells(Some(&snap("x", Some(3), Some(0), false)));
+        assert_eq!(ab_ahead, "↑3");
+        let (_, ab_behind, _) = status_cells(Some(&snap("x", Some(0), Some(2), false)));
+        assert_eq!(ab_behind, "↓2");
+    }
+
+    #[test]
+    fn status_cells_renders_diverged_with_both_arrows() {
+        let (_, ab, _) = status_cells(Some(&snap("x", Some(2), Some(5), false)));
+        assert_eq!(ab, "↑2 ↓5");
+    }
+
+    #[test]
+    fn status_cells_renders_dash_when_upstream_unknown() {
+        // No upstream ref → both ahead/behind are None → dash.
+        let (_, ab, _) = status_cells(Some(&snap("x", None, None, false)));
+        assert_eq!(ab, "-");
+    }
+
+    #[test]
+    fn status_cells_renders_dirty_glyph() {
+        let (_, _, d) = status_cells(Some(&snap("x", Some(0), Some(0), true)));
+        assert_eq!(d, "●");
     }
 
     #[test]
