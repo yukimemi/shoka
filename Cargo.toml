@@ -67,7 +67,7 @@ gix = { version = "0.83", default-features = false, features = [
 
 # Recursive directory walking for `shoka import` (find `.git`
 # subdirs in a ghq-style tree).
-walkdir = "2"
+walkdir = "2.5.0"
 
 # TUI (phase 2 で本格採用、skeleton 段階では未使用)
 # ratatui = "0.30"
