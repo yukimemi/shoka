@@ -153,6 +153,12 @@ pub struct PruneArgs {
     /// Don't actually remove anything; just print candidates.
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Skip the interactive confirmation. Implies you have already
+    /// reviewed the candidate list (`--dry-run` first is a good
+    /// habit). No-op when combined with `--dry-run`.
+    #[arg(long, short)]
+    pub yes: bool,
 }
 
 #[derive(Debug, Args)]
