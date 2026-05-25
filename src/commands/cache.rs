@@ -90,7 +90,7 @@ async fn refresh(
     // is unaffected. Token resolution is cheap, but the client
     // includes an HTTP connection pool we want to share across
     // repos; pulling it inside the loop would be silly.
-    let gh_client = match gh::resolve_token() {
+    let gh_client = match gh::resolve_token().await {
         Some(token) => match gh::build_client(&token) {
             Ok(c) => Some(c),
             Err(e) => {

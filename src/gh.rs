@@ -67,23 +67,30 @@ pub enum CiStatus {
 /// Resolve a GitHub token via the documented priority chain. Returns
 /// `None` when no token is reachable; callers should treat that as
 /// "skip gh fields, populate everything else".
-pub fn resolve_token() -> Option<String> {
+///
+/// `async` because the CLI-subprocess fallback runs through
+/// [`tokio::process::Command`] — calling a blocking
+/// [`std::process::Command`] here would stall the runtime worker
+/// while `gh auth token` does its filesystem reads on
+/// auth-status, which is rude inside the refresh's tokio context.
+pub async fn resolve_token() -> Option<String> {
     if let Ok(t) = std::env::var("GITHUB_TOKEN") {
         if !t.is_empty() {
             return Some(t);
         }
     }
-    gh_cli_token()
+    gh_cli_token().await
 }
 
 /// Best-effort subprocess to `gh auth token`. Any failure mode (no
 /// `gh` on PATH, not logged in, exit != 0, empty output) yields
 /// `None` — the caller treats that the same as "no token".
-fn gh_cli_token() -> Option<String> {
+async fn gh_cli_token() -> Option<String> {
     let gh = which::which("gh").ok()?;
-    let output = std::process::Command::new(gh)
+    let output = tokio::process::Command::new(gh)
         .args(["auth", "token"])
         .output()
+        .await
         .ok()?;
     if !output.status.success() {
         return None;
@@ -102,15 +109,22 @@ pub fn build_client(token: &str) -> Result<Octocrab> {
         .build()?)
 }
 
-/// Capture the per-repo snapshot. Both inner calls swallow their
-/// errors into a `None` field — partial data beats blanking the
-/// snapshot, and the per-call timeouts in octocrab keep a flaky
-/// rate-limit / 404 from hanging the refresh.
+/// Capture the per-repo snapshot. Errors **propagate**: either
+/// inner call failing (rate limit, network, 404) returns `Err` so
+/// the caller's contract — "success = update entry, error = leave
+/// the previous snapshot intact" — actually holds.
+///
+/// The earlier `.ok().flatten()` version silently buried transient
+/// errors into a snapshot with `None` fields, which then overwrote
+/// the cached snapshot and blanked the dashboard until the next
+/// successful refresh. Per-field `None` is now reserved for "API
+/// returned no data" (e.g. zero workflow runs) — distinct from
+/// "API errored", which is now a hard fail.
 pub async fn capture_snapshot(client: &Octocrab, owner: &str, name: &str) -> Result<GhSnapshot> {
-    let open_pr_count = open_pr_count(client, owner, name).await.ok();
-    let ci_status = latest_ci_status(client, owner, name).await.ok().flatten();
+    let open_pr_count = open_pr_count(client, owner, name).await?;
+    let ci_status = latest_ci_status(client, owner, name).await?;
     Ok(GhSnapshot {
-        open_pr_count,
+        open_pr_count: Some(open_pr_count),
         ci_status,
     })
 }
@@ -169,14 +183,14 @@ fn classify_ci(run: &octocrab::models::workflows::Run) -> CiStatus {
 mod tests {
     use super::*;
 
-    #[test]
-    fn resolve_token_uses_env_when_set() {
+    #[tokio::test]
+    async fn resolve_token_uses_env_when_set() {
         // Snapshot + restore env so the test doesn't leak.
         let prev = std::env::var("GITHUB_TOKEN").ok();
         unsafe {
             std::env::set_var("GITHUB_TOKEN", "test-token-xyz");
         }
-        assert_eq!(resolve_token().as_deref(), Some("test-token-xyz"));
+        assert_eq!(resolve_token().await.as_deref(), Some("test-token-xyz"));
         match prev {
             Some(p) => unsafe { std::env::set_var("GITHUB_TOKEN", p) },
             None => unsafe { std::env::remove_var("GITHUB_TOKEN") },
