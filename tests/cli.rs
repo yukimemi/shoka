@@ -275,6 +275,45 @@ fn cd_unique_hint_prints_path_to_stdout() {
 }
 
 #[test]
+fn cd_writes_path_to_sidechannel_when_env_var_is_set() {
+    // The shell wrapper sets SHOKA_CD_OUT to a temp file and reads
+    // the path from there, so `inquire`'s stdout-writing prompt UI
+    // doesn't get captured by the wrapper's command substitution.
+    // Verify the sidechannel actually works: with the env var set,
+    // stdout must stay empty and the path lands in the named file.
+    let (mut cmd, tmp) = cmd_with_isolated_config();
+    seed_shelf(
+        &tmp.path().join("state"),
+        &[("github.com", "yukimemi", "shoka")],
+    );
+    let expected = tmp
+        .path()
+        .join("root")
+        .join("github.com")
+        .join("yukimemi")
+        .join("shoka");
+    std::fs::create_dir_all(&expected).unwrap();
+    let out_file = tmp.path().join("cd-out");
+
+    let assertion = cmd
+        .env("SHOKA_CD_OUT", &out_file)
+        .args(["cd", "shoka"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).to_string();
+    assert!(
+        stdout.is_empty(),
+        "stdout should be empty when SHOKA_CD_OUT is set, got: {stdout:?}"
+    );
+    let from_file = std::fs::read_to_string(&out_file).expect("sidechannel file written");
+    assert_eq!(
+        std::fs::canonicalize(from_file.trim()).unwrap(),
+        std::fs::canonicalize(&expected).unwrap(),
+        "sidechannel should hold the resolved path"
+    );
+}
+
+#[test]
 fn cd_unknown_on_disk_path_errors_cleanly() {
     // Stale shelf entry: the repo is listed, but its clone path
     // doesn't actually exist on disk. cd must surface that as a

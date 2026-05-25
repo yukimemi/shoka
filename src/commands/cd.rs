@@ -1,10 +1,22 @@
 //! `shoka cd` — resolve a shelf entry to its on-disk path.
 //!
 //! Doesn't actually change the parent shell's cwd — a child process
-//! can't. Instead, the chosen repo's clone path is printed verbatim
-//! to **stdout**, and a thin shell wrapper installed via
-//! `shoka init-shell <shell>` runs `cd "$(shoka cd $args)"` so the
-//! parent shell does the actual cd.
+//! can't. Instead, the chosen repo's clone path is emitted via one
+//! of two channels:
+//!
+//! - **`$SHOKA_CD_OUT` (wrapper contract)** — when this env var is
+//!   set, the path is written to the named file and nothing goes to
+//!   stdout. The shell wrapper installed by `shoka init-shell`
+//!   creates a temp file, points the env var at it, redirects shoka
+//!   cd's stdout to stderr (so `inquire`'s prompt UI is *visible* to
+//!   the user instead of being captured), and finally reads the temp
+//!   file to do the `cd`. This sidechannel is the only safe way to
+//!   pair an interactive picker with a captured path — `inquire`
+//!   0.9 writes its UI to stdout and exposes no public switch to
+//!   stderr, so the wrapper must give the path its own channel.
+//! - **stdout (manual contract)** — when the env var is unset, the
+//!   path is printed to stdout. Useful when invoking `shoka cd`
+//!   directly to feed a script or copy a path.
 //!
 //! Matching:
 //!
@@ -17,9 +29,12 @@
 //!   thing and ended up somewhere else" beats a clear "no match".
 //!
 //! Sanity: the resolved path is verified to exist on disk before
-//! being printed. A stale shelf entry (repo moved / deleted)
+//! being emitted. A stale shelf entry (repo moved / deleted)
 //! produces a clear shoka error rather than the shell's confusing
 //! `cd: No such file or directory`.
+
+use std::fmt;
+use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use inquire::Select;
@@ -28,6 +43,10 @@ use crate::cli::CdArgs;
 use crate::commands::ShokaContext;
 use crate::config::ShokaConfig;
 use crate::state::{Repo, Shelf};
+
+/// Env var the shell wrapper uses to receive the resolved path
+/// out-of-band from stdout. See module docs.
+pub const CD_OUT_ENV: &str = "SHOKA_CD_OUT";
 
 pub async fn run(ctx: &ShokaContext, args: CdArgs) -> Result<()> {
     let cfg = ShokaConfig::load(&ctx.paths)?;
@@ -75,10 +94,32 @@ pub async fn run(ctx: &ShokaContext, args: CdArgs) -> Result<()> {
         );
     }
 
-    // The shell wrapper consumes stdout, so be strict: only the path,
-    // no decoration, no trailing color codes.
-    println!("{}", path.display());
+    emit_path(&path)?;
     Ok(())
+}
+
+/// Emit the resolved path. When [`CD_OUT_ENV`] is set, write to that
+/// file (and nothing to stdout — the wrapper rendered the prompt UI
+/// on stdout-redirected-to-stderr, and reads the path back from this
+/// file). When unset, write to stdout for the direct-invocation case.
+fn emit_path(path: &Path) -> Result<()> {
+    let rendered = path.to_string_lossy();
+    match std::env::var_os(CD_OUT_ENV) {
+        Some(out) if !out.is_empty() => {
+            std::fs::write(&out, rendered.as_bytes()).with_context(|| {
+                format!(
+                    "writing path to ${CD_OUT_ENV}={}",
+                    Path::new(&out).display()
+                )
+            })
+        }
+        // Trailing newline only on the stdout path: command substitution
+        // strips it, while the sidechannel reader doesn't expect one.
+        _ => {
+            println!("{rendered}");
+            Ok(())
+        }
+    }
 }
 
 /// Match `hint` against the candidate slugs (case-insensitive
@@ -104,23 +145,33 @@ fn choose_by_hint<'a>(candidates: &[&'a Repo], hint: &str) -> Result<&'a Repo> {
 
 /// Fuzzy-select among `candidates` via [`inquire::Select`] (which
 /// uses its own internal fuzzy match algorithm; nucleo only lands
-/// for the TUI). Items are labelled by [`Repo::slug`] so the picker
-/// shows the same identifier `shoka list` does.
+/// for the TUI). Items are wrapped in a thin `Display` adapter so
+/// the picker can return the chosen [`Repo`] reference directly —
+/// no string round-trip + linear scan on the way back.
 fn fuzzy_pick<'a>(candidates: &[&'a Repo], prompt: &str) -> Result<&'a Repo> {
     if candidates.is_empty() {
         // Defensive: callers already filter to non-empty, but in case
         // a future caller forgets, surface the empty-case explicitly.
         bail!("nothing to pick — candidate list is empty");
     }
-    let labels: Vec<String> = candidates.iter().map(|r| r.slug()).collect();
-    let chosen = Select::new(prompt, labels.clone())
+
+    /// `inquire::Select` requires its options to be `Display` and
+    /// returns the chosen option by value. A reference-carrying
+    /// wrapper lets us hand the picker borrowed `&Repo`s and pull the
+    /// reference back out without reallocating slug strings.
+    #[derive(Clone)]
+    struct RepoItem<'r>(&'r Repo);
+    impl fmt::Display for RepoItem<'_> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(&self.0.slug())
+        }
+    }
+
+    let items: Vec<RepoItem<'a>> = candidates.iter().copied().map(RepoItem).collect();
+    let chosen = Select::new(prompt, items)
         .prompt()
         .context("repo selection cancelled")?;
-    let idx = labels
-        .iter()
-        .position(|l| l == &chosen)
-        .context("picker returned an unknown label")?;
-    Ok(candidates[idx])
+    Ok(chosen.0)
 }
 
 #[cfg(test)]
