@@ -102,7 +102,12 @@ pub async fn run(ctx: &ShokaContext, args: CdArgs) -> Result<()> {
 /// file (and nothing to stdout — the wrapper rendered the prompt UI
 /// on stdout-redirected-to-stderr, and reads the path back from this
 /// file). When unset, write to stdout for the direct-invocation case.
-fn emit_path(path: &Path) -> Result<()> {
+///
+/// Public so `shoka tui` can reuse the exact same sidechannel
+/// contract for its Enter-to-cd flow: the same shell wrapper that
+/// services `shoka cd` also picks up the path that `shoka tui`
+/// writes when the user picks a repo.
+pub fn emit_path(path: &Path) -> Result<()> {
     let rendered = path.to_string_lossy();
     match std::env::var_os(CD_OUT_ENV) {
         Some(out) if !out.is_empty() => {
