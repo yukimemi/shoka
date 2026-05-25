@@ -41,7 +41,14 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     let cmd = cli
         .cmd
         .unwrap_or(Command::Tui(TuiArgs { tags: Vec::new() }));
-    match cmd {
+
+    // Decide BEFORE running the subcommand, so a panicking or
+    // erroring subcommand still gets the bg refresh fired. The bg
+    // refresh is opportunistic — its job is "freshen the cache for
+    // the next command", and that holds even when this one failed.
+    let bg_eligible = bg_refresh_eligible(&cmd);
+
+    let result = match cmd {
         Command::Clone(a) => clone::run(&ctx, a).await,
         Command::List(a) => list::run(&ctx, a).await,
         Command::Cd(a) => cd::run(&ctx, a).await,
@@ -62,5 +69,90 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Completion(a) => completion::run(a).await,
         Command::InitShell(a) => init_shell::run(a).await,
         Command::Cache(c) => cache::dispatch(&ctx, c).await,
+    };
+
+    if bg_eligible {
+        // Best-effort: never let a failed bg-refresh spawn affect
+        // the user-visible exit. The `try_spawn_bg_refresh` helper
+        // itself silently returns Ok when the config opts out.
+        if let Err(e) = cache::try_spawn_bg_refresh(&ctx) {
+            tracing::debug!(target: "shoka", "background refresh spawn failed: {e:#}");
+        }
+    }
+
+    result
+}
+
+/// Decide whether the dispatcher should fire a background cache
+/// refresh after the subcommand finishes.
+///
+/// Excludes:
+///
+/// - `cache` itself — would loop forever; the explicit `cache
+///   refresh` already updates the cache.
+/// - `completion` / `init-shell` — script generators that don't
+///   touch the shelf or read the cache. Spawning a refresh from
+///   them surprises shells doing tab-completion lookups.
+/// - `tui` — long-running; the TUI owns its own refresh strategy
+///   (will land with the dashboard PR). Firing a one-off refresh
+///   at start would compete with that.
+///
+/// Doctor is *not* excluded: it doesn't write state but it's a
+/// natural "are things OK" checkpoint, and freshening the cache
+/// after a doctor run benefits the next subcommand.
+fn bg_refresh_eligible(cmd: &Command) -> bool {
+    !matches!(
+        cmd,
+        Command::Cache(_) | Command::Completion(_) | Command::InitShell(_) | Command::Tui(_)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::{
+        CacheCommand, CdArgs, CloneArgs, CompletionArgs, InitShellArgs, ListArgs, SupportedShell,
+        TuiArgs,
+    };
+
+    fn cache_refresh() -> Command {
+        Command::Cache(CacheCommand::Refresh {
+            force: false,
+            tags: vec![],
+            background: false,
+        })
+    }
+
+    #[test]
+    fn bg_refresh_eligible_excludes_cache_and_friends() {
+        assert!(!bg_refresh_eligible(&cache_refresh()));
+        assert!(!bg_refresh_eligible(&Command::Cache(CacheCommand::Show)));
+        assert!(!bg_refresh_eligible(&Command::Cache(CacheCommand::Clear)));
+        assert!(!bg_refresh_eligible(&Command::Completion(CompletionArgs {
+            shell: clap_complete::Shell::Bash
+        })));
+        assert!(!bg_refresh_eligible(&Command::InitShell(InitShellArgs {
+            shell: SupportedShell::Bash,
+            name: "s".into(),
+        })));
+        assert!(!bg_refresh_eligible(&Command::Tui(TuiArgs {
+            tags: vec![],
+        })));
+    }
+
+    #[test]
+    fn bg_refresh_eligible_includes_user_facing_commands() {
+        assert!(bg_refresh_eligible(&Command::Clone(CloneArgs {
+            url: None
+        })));
+        assert!(bg_refresh_eligible(&Command::List(ListArgs {
+            tags: vec![],
+            has_agents: false,
+        })));
+        assert!(bg_refresh_eligible(&Command::Cd(CdArgs {
+            repo: None,
+            tags: vec![],
+        })));
+        assert!(bg_refresh_eligible(&Command::Doctor));
     }
 }

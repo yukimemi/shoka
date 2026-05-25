@@ -59,6 +59,11 @@ regex = "1.12.3"
 # gh integration (phase 1 後半 / phase 2 で octocrab 追加)
 # octocrab = "0.45"
 
+[target.'cfg(unix)'.dependencies]
+# setsid() for detached background refresh spawn. Tiny crate,
+# unix-only dep so Windows builds don't pull it.
+libc = "0.2"
+
 [dev-dependencies]
 assert_cmd = "2.2.2"
 predicates = "3.1.4"

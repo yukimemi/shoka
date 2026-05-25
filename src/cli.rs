@@ -91,6 +91,12 @@ pub enum CacheCommand {
         /// Restrict to repos carrying every listed tag (AND).
         #[arg(long = "tag", value_name = "TAG")]
         tags: Vec<String>,
+        /// Internal flag — set by the dispatcher when spawning the
+        /// detached background refresh. Suppresses the pretty
+        /// summary output and downgrades errors to log messages so
+        /// nothing leaks back to the parent process.
+        #[arg(long, hide = true)]
+        background: bool,
     },
     /// Dump the raw cache.toml to stdout.
     Show,
