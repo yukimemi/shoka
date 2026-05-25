@@ -8,19 +8,28 @@
 //! authoritative `[vars]` resolution at the end.
 //!
 //! The post-merge [`ShokaConfig`] is then collapsed into a
-//! [`ResolvedConfig`] for the active profile / host: profile fields
-//! override the corresponding `[global]` fields when set, with anything
-//! unset falling through to the global value.
+//! [`ResolvedConfig`] for the active profile: profile fields override
+//! the corresponding `[global]` fields when set, with anything unset
+//! falling through to the global value.
 //!
 //! Profile resolution order: explicit `--profile <name>` CLI flag,
 //! `$SHOKA_PROFILE` environment variable, `global.default_profile`. If
 //! none matches, profile-less mode is used (the global values are taken
 //! verbatim and no profile-only fields like `git_config` apply).
+//!
+//! **Clone destination routing** runs on top of the resolved config:
+//! [`ResolvedConfig::resolve_target`] takes a `host/owner/name` spec
+//! and returns a [`CloneTarget`]. Precedence is
+//! `profile.root` > first matching `[[routes]]` entry > `[global].root`
+//! (so an explicit profile always wins over auto-routing). See [`Route`]
+//! / [`compile_pattern`] for the pattern syntax (`host:<host>`,
+//! `host:<host>/<owner>`, or `/<regex>/`).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use teravars::{Engine, discover_config_files, load_merged, system_context};
 
@@ -35,8 +44,11 @@ use crate::paths::ShokaPaths;
 #[serde(default)]
 pub struct ShokaConfig {
     pub global: GlobalConfig,
+    /// Clone-destination routing rules. Evaluated top-to-bottom at
+    /// clone time; the first matching entry wins. See [`Route`] and
+    /// [`compile_pattern`] for pattern syntax.
     #[serde(default)]
-    pub hosts: BTreeMap<String, HostConfig>,
+    pub routes: Vec<Route>,
     #[serde(default)]
     pub profiles: BTreeMap<String, ProfileConfig>,
 }
@@ -123,13 +135,114 @@ impl Default for ShellConfig {
     }
 }
 
-/// Per-host overrides — used at clone time / when displaying URLs.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct HostConfig {
-    pub protocol: Option<Protocol>,
+/// A `[[routes]]` entry. Matches a repository spec (`host/owner/name`)
+/// against [`Route::pattern`] and, on hit, overrides the corresponding
+/// `[global]` fields when they're `Some`.
+///
+/// Pattern syntax (see [`compile_pattern`] for the parser):
+///
+/// - `host:<host>` — host exact match (also matches `<host>/...` prefix).
+/// - `host:<host>/<owner>` — host + owner prefix.
+/// - `/<regex>/` — full regex, matched against the spec string.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Route {
+    pub pattern: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layout: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_vcs: Option<VcsDefault>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_protocol: Option<Protocol>,
+}
+
+/// A [`Route`] with its [`pattern`](Route::pattern) parsed once at
+/// [`ShokaConfig::resolve`] time so the per-clone matcher loop doesn't
+/// pay a re-compile cost.
+#[derive(Debug, Clone)]
+pub struct CompiledRoute {
+    pub raw: Route,
+    pub pattern: PatternKind,
+}
+
+/// Compiled form of a [`Route::pattern`].
+#[derive(Debug, Clone)]
+pub enum PatternKind {
+    /// `host:<host>` — matches spec when it equals `<host>` or starts
+    /// with `<host>/`.
+    HostExact(String),
+    /// `host:<host>/<owner>` — matches when spec equals
+    /// `<host>/<owner>` or starts with `<host>/<owner>/`.
+    HostOwner { host: String, owner: String },
+    /// `/<regex>/` — full regex match against the spec.
+    Regex(Regex),
+}
+
+impl PatternKind {
+    /// Test the pattern against a `host/owner/name` (or `host/owner`,
+    /// or just `host`) spec.
+    pub fn matches(&self, spec: &str) -> bool {
+        match self {
+            PatternKind::HostExact(h) => spec == h || spec.starts_with(&format!("{h}/")),
+            PatternKind::HostOwner { host, owner } => {
+                let exact = format!("{host}/{owner}");
+                let prefix = format!("{exact}/");
+                spec == exact || spec.starts_with(&prefix)
+            }
+            PatternKind::Regex(re) => re.is_match(spec),
+        }
+    }
+}
+
+/// Parse a [`Route::pattern`] string into a [`PatternKind`].
+///
+/// Returns a descriptive error for unrecognised forms so a typo'd
+/// pattern surfaces at `config load` time rather than the first
+/// clone attempt.
+pub fn compile_pattern(s: &str) -> Result<PatternKind> {
+    if let Some(rest) = s.strip_prefix("host:") {
+        if rest.is_empty() {
+            bail!("`host:` pattern requires a host name: `{s}`");
+        }
+        if let Some((host, owner)) = rest.split_once('/') {
+            if host.is_empty() || owner.is_empty() {
+                bail!("`host:<host>/<owner>` requires both segments: `{s}`");
+            }
+            if owner.contains('/') {
+                bail!(
+                    "`host:` shortcut supports `host:<host>` or `host:<host>/<owner>`; \
+                     for deeper matches use `/<regex>/`: `{s}`"
+                );
+            }
+            return Ok(PatternKind::HostOwner {
+                host: host.to_string(),
+                owner: owner.to_string(),
+            });
+        }
+        return Ok(PatternKind::HostExact(rest.to_string()));
+    }
+    if s.len() >= 2 && s.starts_with('/') && s.ends_with('/') {
+        let body = &s[1..s.len() - 1];
+        let re = Regex::new(body).with_context(|| format!("compiling regex pattern `{s}`"))?;
+        return Ok(PatternKind::Regex(re));
+    }
+    bail!("unknown route pattern `{s}` — use `host:<host>`, `host:<host>/<owner>`, or `/<regex>/`")
+}
+
+/// Resolved clone destination for a given repo spec — the output of
+/// [`ResolvedConfig::resolve_target`].
+#[derive(Debug, Clone)]
+pub struct CloneTarget {
+    pub root: PathBuf,
+    pub layout: String,
+    pub default_vcs: VcsDefault,
+    pub default_protocol: Protocol,
+    /// Index into [`ResolvedConfig::routes`] that decided the target,
+    /// or `None` when either the active profile's `root` won or the
+    /// `[global]` fallback applied. Useful for `shoka where`-style
+    /// debug subcommands and tracing output.
+    pub matched_route: Option<usize>,
 }
 
 /// Per-profile overrides on top of `[global]`.
@@ -164,9 +277,18 @@ pub struct ResolvedConfig {
     pub exec_concurrency: usize,
     pub ui: UiConfig,
     pub shell: ShellConfig,
-    pub hosts: BTreeMap<String, HostConfig>,
+    /// Routes compiled at `resolve()` time so per-clone matching
+    /// doesn't pay a regex-build cost. Order is preserved from the
+    /// source config (first match wins).
+    pub routes: Vec<CompiledRoute>,
     pub git_config: BTreeMap<String, String>,
     pub active_profile: Option<String>,
+    /// `true` when the active profile supplied its own `root`. Drives
+    /// the `profile.root > routes > global.root` precedence in
+    /// [`ResolvedConfig::resolve_target`] — with this flag set,
+    /// routes don't get a chance to override (the user picked the
+    /// profile, so honour it).
+    pub profile_provided_root: bool,
     pub raw: ShokaConfig,
 }
 
@@ -281,10 +403,28 @@ impl ShokaConfig {
         let prof = prof.unwrap_or_default();
         let g = &self.global;
 
+        let profile_provided_root = prof.root.is_some();
         let root_str = prof.root.as_deref().or(g.root.as_deref()).ok_or_else(|| {
             anyhow!("`global.root` (or `profiles.<name>.root`) must be set in config")
         })?;
         let root = expand_home(root_str);
+
+        // Compile all route patterns up-front so a typo'd pattern
+        // surfaces here (at config-load time) rather than on the
+        // first clone attempt.
+        let routes: Vec<CompiledRoute> = self
+            .routes
+            .iter()
+            .enumerate()
+            .map(|(idx, r)| {
+                let pattern = compile_pattern(&r.pattern)
+                    .with_context(|| format!("compiling routes[{idx}] pattern"))?;
+                Ok::<_, anyhow::Error>(CompiledRoute {
+                    raw: r.clone(),
+                    pattern,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(ResolvedConfig {
             root,
@@ -302,11 +442,68 @@ impl ShokaConfig {
             exec_concurrency: prof.exec_concurrency.unwrap_or(g.exec_concurrency).max(1),
             ui: g.ui.clone(),
             shell: g.shell.clone(),
-            hosts: self.hosts.clone(),
+            routes,
             git_config: prof.git_config.clone(),
             active_profile,
+            profile_provided_root,
             raw: self,
         })
+    }
+}
+
+impl ResolvedConfig {
+    /// Resolve the clone destination for a `host/owner/name` spec.
+    ///
+    /// Precedence (matches the documented design):
+    ///
+    /// 1. **Active profile's `root`** — if the resolved profile set
+    ///    its own `root`, routes are skipped entirely. The user
+    ///    picked the profile explicitly (CLI / env / default), so
+    ///    that intent wins over auto-routing.
+    /// 2. **First matching `[[routes]]` entry** — iterated in source
+    ///    order; the matched route's `root` / `layout` / `default_vcs`
+    ///    / `default_protocol` overrides take effect (with any fields
+    ///    the route leaves `None` falling through to the resolved
+    ///    `[global]` value).
+    /// 3. **Global fallback** — if no route matches, the resolved
+    ///    `[global]` values apply unchanged.
+    pub fn resolve_target(&self, spec: &str) -> CloneTarget {
+        if self.profile_provided_root {
+            return CloneTarget {
+                root: self.root.clone(),
+                layout: self.layout.clone(),
+                default_vcs: self.default_vcs,
+                default_protocol: self.default_protocol,
+                matched_route: None,
+            };
+        }
+        for (idx, route) in self.routes.iter().enumerate() {
+            if route.pattern.matches(spec) {
+                return CloneTarget {
+                    root: route
+                        .raw
+                        .root
+                        .as_deref()
+                        .map(expand_home)
+                        .unwrap_or_else(|| self.root.clone()),
+                    layout: route
+                        .raw
+                        .layout
+                        .clone()
+                        .unwrap_or_else(|| self.layout.clone()),
+                    default_vcs: route.raw.default_vcs.unwrap_or(self.default_vcs),
+                    default_protocol: route.raw.default_protocol.unwrap_or(self.default_protocol),
+                    matched_route: Some(idx),
+                };
+            }
+        }
+        CloneTarget {
+            root: self.root.clone(),
+            layout: self.layout.clone(),
+            default_vcs: self.default_vcs,
+            default_protocol: self.default_protocol,
+            matched_route: None,
+        }
     }
 }
 
@@ -351,9 +548,23 @@ root = "~/src"
 # [global.shell]
 # cd_command_name = "s"
 
-# Per-host overrides — merge over the global values.
-# [hosts."github.com"]
-# protocol = "ssh"
+# Routes — evaluated top-to-bottom at clone time; first hit wins.
+# Pattern syntax:
+#   host:<host>             - host exact (or `<host>/...` prefix)
+#   host:<host>/<owner>     - host + owner prefix
+#   /<regex>/               - full regex (Rust regex crate)
+# A matching route's `root` / `layout` / `default_vcs` / `default_protocol`
+# override the corresponding [global] fields. Absent fields fall through.
+# Precedence: profile.root (when set) > routes > [global].root.
+#
+# [[routes]]
+# pattern = "host:github.com/mycompany"
+# root    = "~/src/work"
+#
+# [[routes]]
+# pattern = "host:gitlab.com"
+# root    = "~/src/gitlab"
+# default_protocol = "ssh"
 
 # Profiles — `--profile NAME` / $SHOKA_PROFILE / global.default_profile
 # selects one. Profile fields override [global] when set; absent fields
@@ -555,30 +766,246 @@ root = "{{ vars.repo_root }}"
         assert_eq!(cfg.global.root.as_deref(), Some("/data/repos"));
     }
 
+    // --- routes ---------------------------------------------------
+
     #[test]
-    fn host_override_is_visible_after_resolve() {
+    fn compile_pattern_host_exact() {
+        let p = compile_pattern("host:github.com").unwrap();
+        assert!(p.matches("github.com"));
+        assert!(p.matches("github.com/foo"));
+        assert!(p.matches("github.com/foo/bar"));
+        assert!(!p.matches("gitlab.com"));
+        assert!(!p.matches("github.com.evil"));
+    }
+
+    #[test]
+    fn compile_pattern_host_owner() {
+        let p = compile_pattern("host:github.com/yukimemi").unwrap();
+        assert!(p.matches("github.com/yukimemi"));
+        assert!(p.matches("github.com/yukimemi/shoka"));
+        assert!(!p.matches("github.com/other"));
+        assert!(!p.matches("github.com/yukimemi-other"));
+        assert!(!p.matches("github.com"));
+    }
+
+    #[test]
+    fn compile_pattern_regex() {
+        let p = compile_pattern(r"/^github\.com/foo-.*$/").unwrap();
+        assert!(p.matches("github.com/foo-bar"));
+        assert!(p.matches("github.com/foo-bar/baz"));
+        assert!(!p.matches("github.com/bar"));
+    }
+
+    #[test]
+    fn compile_pattern_rejects_garbage() {
+        for bad in [
+            "github.com",       // missing prefix
+            "host:",            // empty host
+            "host:/",           // empty parts
+            "host:foo/",        // empty owner
+            "host:/bar",        // empty host
+            "/",                // just one slash
+            "host:foo/bar/baz", // deeper than owner — must use regex
+        ] {
+            assert!(
+                compile_pattern(bad).is_err(),
+                "pattern `{bad}` should fail to compile"
+            );
+        }
+    }
+
+    #[test]
+    fn compile_pattern_rejects_invalid_regex() {
+        let err = compile_pattern("/[/").unwrap_err();
+        assert!(
+            err.to_string().contains("regex"),
+            "error should mention regex: {err}"
+        );
+    }
+
+    fn route(pattern: &str, root: &str) -> Route {
+        Route {
+            pattern: pattern.into(),
+            root: Some(root.into()),
+            layout: None,
+            default_vcs: None,
+            default_protocol: None,
+        }
+    }
+
+    fn resolved_with(routes: Vec<Route>) -> ResolvedConfig {
+        ShokaConfig {
+            global: GlobalConfig {
+                root: Some("/global".into()),
+                ..Default::default()
+            },
+            routes,
+            ..Default::default()
+        }
+        .resolve(None)
+        .expect("resolve")
+    }
+
+    #[test]
+    fn resolve_target_falls_back_to_global_when_no_route_matches() {
+        let r = resolved_with(vec![route("host:gitlab.com", "/elsewhere")]);
+        let t = r.resolve_target("github.com/foo/bar");
+        assert!(t.matched_route.is_none());
+        assert!(t.root.ends_with("global"));
+    }
+
+    #[test]
+    fn resolve_target_first_match_wins() {
+        let r = resolved_with(vec![
+            route("host:github.com/yukimemi", "/personal"),
+            route("host:github.com", "/github-catchall"),
+        ]);
+        let t = r.resolve_target("github.com/yukimemi/shoka");
+        assert_eq!(t.matched_route, Some(0));
+        assert!(t.root.ends_with("personal"));
+    }
+
+    #[test]
+    fn resolve_target_route_overrides_pass_through_unset_fields() {
+        let r = ShokaConfig {
+            global: GlobalConfig {
+                root: Some("/global".into()),
+                layout: "{{ root }}/L".into(),
+                ..Default::default()
+            },
+            routes: vec![Route {
+                pattern: "host:github.com".into(),
+                root: Some("/gh".into()),
+                layout: None, // should fall through to global
+                default_vcs: Some(VcsDefault::Jj),
+                default_protocol: None,
+            }],
+            ..Default::default()
+        }
+        .resolve(None)
+        .expect("resolve");
+        let t = r.resolve_target("github.com/foo/bar");
+        assert!(t.root.ends_with("gh"));
+        assert_eq!(t.layout, "{{ root }}/L"); // fell through
+        assert_eq!(t.default_vcs, VcsDefault::Jj);
+        assert_eq!(t.default_protocol, Protocol::Https); // global default
+    }
+
+    #[test]
+    fn resolve_target_profile_root_beats_routes() {
+        // When the active profile pinned its own root, routes don't
+        // get a chance to override — this is the "explicit user
+        // intent beats auto-routing" rule.
+        let cfg = ShokaConfig {
+            global: GlobalConfig {
+                root: Some("/global".into()),
+                ..Default::default()
+            },
+            routes: vec![route("host:github.com", "/routed")],
+            profiles: BTreeMap::from([(
+                "work".into(),
+                ProfileConfig {
+                    root: Some("/work".into()),
+                    ..Default::default()
+                },
+            )]),
+        };
+        let r = cfg.resolve(Some("work")).expect("resolve");
+        assert!(r.profile_provided_root);
+        let t = r.resolve_target("github.com/foo/bar");
+        assert!(
+            t.matched_route.is_none(),
+            "profile.root should skip route matching, got {:?}",
+            t.matched_route
+        );
+        assert!(t.root.ends_with("work"));
+    }
+
+    #[test]
+    fn resolve_target_routes_run_when_profile_lacks_root() {
+        // Profile is active but didn't pin a root → routes still run.
+        let cfg = ShokaConfig {
+            global: GlobalConfig {
+                root: Some("/global".into()),
+                ..Default::default()
+            },
+            routes: vec![route("host:github.com", "/routed")],
+            profiles: BTreeMap::from([(
+                "vcs-only".into(),
+                ProfileConfig {
+                    default_vcs: Some(VcsDefault::Jj),
+                    ..Default::default()
+                },
+            )]),
+        };
+        let r = cfg.resolve(Some("vcs-only")).expect("resolve");
+        assert!(!r.profile_provided_root);
+        let t = r.resolve_target("github.com/foo/bar");
+        assert_eq!(t.matched_route, Some(0));
+        assert!(t.root.ends_with("routed"));
+    }
+
+    #[test]
+    fn resolve_errors_on_bad_route_pattern() {
+        let cfg = ShokaConfig {
+            global: GlobalConfig {
+                root: Some("/r".into()),
+                ..Default::default()
+            },
+            routes: vec![Route {
+                pattern: "not-a-valid-pattern".into(),
+                root: None,
+                layout: None,
+                default_vcs: None,
+                default_protocol: None,
+            }],
+            ..Default::default()
+        };
+        let err = cfg.resolve(None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("routes[0]") && msg.contains("unknown route pattern"),
+            "error should locate the bad pattern: {msg}"
+        );
+    }
+
+    #[test]
+    fn routes_round_trip_through_toml_load() {
         let tmp = TempDir::new().unwrap();
         fs::write(
             tmp.path().join("config.toml"),
             r#"
 [global]
-root = "/r"
-default_protocol = "https"
+root = "/global"
 
-[hosts."github.com"]
-protocol = "ssh"
+[[routes]]
+pattern = "host:github.com/mycompany"
+root = "/work"
+
+[[routes]]
+pattern = "host:gitlab.com"
+root = "/gitlab"
+default_protocol = "ssh"
 "#,
         )
         .unwrap();
         let cfg = ShokaConfig::load(&paths_at(tmp.path())).expect("load");
-        let resolved = cfg.resolve(None).expect("resolve");
-        assert_eq!(resolved.default_protocol, Protocol::Https);
-        let gh = resolved
-            .hosts
-            .get("github.com")
-            .expect("github.com host config present");
-        assert_eq!(gh.protocol, Some(Protocol::Ssh));
+        assert_eq!(cfg.routes.len(), 2);
+        let r = cfg.resolve(None).expect("resolve");
+
+        let t1 = r.resolve_target("github.com/mycompany/internal-tool");
+        assert_eq!(t1.matched_route, Some(0));
+        assert!(t1.root.ends_with("work"));
+
+        let t2 = r.resolve_target("gitlab.com/anyone/anything");
+        assert_eq!(t2.matched_route, Some(1));
+        assert_eq!(t2.default_protocol, Protocol::Ssh);
+
+        let t3 = r.resolve_target("github.com/other/repo");
+        assert!(t3.matched_route.is_none());
     }
+
+    // --- end routes -----------------------------------------------
 
     #[test]
     fn profile_overrides_global_root() {

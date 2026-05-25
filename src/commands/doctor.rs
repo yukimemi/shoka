@@ -62,11 +62,30 @@ pub async fn run(ctx: &ShokaContext) -> Result<()> {
     println!("  default proto  : {:?}", r.default_protocol);
     println!("  default host   : {}", r.default_host);
     println!("  exec concur.   : {}", r.exec_concurrency);
-    if !r.hosts.is_empty() {
-        println!("  hosts:");
-        for (host, h) in &r.hosts {
-            println!("    {host}: {h:?}");
+    if !r.routes.is_empty() {
+        println!("  routes:");
+        for (idx, route) in r.routes.iter().enumerate() {
+            let override_summary = [
+                route.raw.root.as_deref().map(|v| format!("root={v}")),
+                route.raw.layout.as_deref().map(|v| format!("layout={v}")),
+                route.raw.default_vcs.map(|v| format!("vcs={v:?}")),
+                route
+                    .raw
+                    .default_protocol
+                    .map(|v| format!("protocol={v:?}")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(", ");
+            println!("    [{idx}] {} → {override_summary}", route.raw.pattern);
         }
+    }
+    if r.profile_provided_root {
+        println!(
+            "  {} (profile pinned `root`; routes won't run for clones in this profile)",
+            "note:".dimmed()
+        );
     }
     if !r.git_config.is_empty() {
         println!("  git_config (profile):");
