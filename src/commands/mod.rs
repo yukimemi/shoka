@@ -1,6 +1,7 @@
 use crate::cli::{Cli, Command, TagCommand, TuiArgs};
 use crate::paths::ShokaPaths;
 
+pub mod cache;
 pub mod cd;
 pub mod clone;
 pub mod completion;
@@ -60,5 +61,6 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Tui(a) => tui::run(&ctx, a).await,
         Command::Completion(a) => completion::run(a).await,
         Command::InitShell(a) => init_shell::run(a).await,
+        Command::Cache(c) => cache::dispatch(&ctx, c).await,
     }
 }

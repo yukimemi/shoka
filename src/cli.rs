@@ -73,6 +73,31 @@ pub enum Command {
 
     /// Print the shell integration wrapper for `cd` (PowerShell / bash / zsh / fish).
     InitShell(InitShellArgs),
+
+    /// Per-repo volatile cache management (refresh / show / clear).
+    #[command(subcommand)]
+    Cache(CacheCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CacheCommand {
+    /// Refresh cache entries for the shelf. Skips repos whose
+    /// `last_refreshed` is within `[global.cache].refresh_threshold_secs`
+    /// of now, unless `--force` is passed.
+    Refresh {
+        /// Bypass the staleness threshold; refresh every entry.
+        #[arg(long)]
+        force: bool,
+        /// Restrict to repos carrying every listed tag (AND).
+        #[arg(long = "tag", value_name = "TAG")]
+        tags: Vec<String>,
+    },
+    /// Dump the raw cache.toml to stdout.
+    Show,
+    /// Drop every cache entry. Equivalent to `rm cache.toml`, but
+    /// goes through the atomic-save path so we don't leave half-
+    /// written state behind.
+    Clear,
 }
 
 #[derive(Debug, Args)]
