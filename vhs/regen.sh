@@ -25,7 +25,15 @@ if [[ -z "${GITHUB_TOKEN:-}" ]]; then
     echo "         set it to get real data: https://github.com/settings/tokens" >&2
 fi
 
-exec docker run --rm \
-    -v "$PWD:/vhs" \
-    -e GITHUB_TOKEN="${GITHUB_TOKEN:-}" \
-    shoka-vhs "$TAPE"
+# Build the docker arg list incrementally so an unset GITHUB_TOKEN
+# stays *unset* inside the container — passing `-e GITHUB_TOKEN=""`
+# would define it as an empty string, which `gh::resolve_token`
+# treats as "missing token" but other reqwest layers might try
+# anyway and trip 401s.
+docker_args=(run --rm -v "$PWD:/vhs")
+if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    docker_args+=(-e "GITHUB_TOKEN=$GITHUB_TOKEN")
+fi
+docker_args+=(shoka-vhs "$TAPE")
+
+exec docker "${docker_args[@]}"

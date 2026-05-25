@@ -82,10 +82,16 @@ RUN printf '%s\n' \
 # data to read (branch / ahead-behind / dirty), and the gh capture
 # returns real PR / CI numbers when GITHUB_TOKEN is set at run time.
 # Shallow clones keep the image lean (-> ~30 MB instead of hundreds).
+# Note the explicit `|| exit 1`: a POSIX `sh` `for` loop's exit
+# status is the status of its *last* command, so a mid-loop clone
+# failure (transient network, deleted repo) would let the RUN
+# succeed with a partially-staged sandbox. Forcing per-iteration
+# exit on failure makes the build crash visibly instead.
 RUN for repo in shoka renri kanade teravars; do \
         git clone --depth 1 --quiet \
             "https://github.com/yukimemi/${repo}.git" \
-            "${SHOKA_SANDBOX}/root/github.com/yukimemi/${repo}"; \
+            "${SHOKA_SANDBOX}/root/github.com/yukimemi/${repo}" \
+        || exit 1; \
     done
 
 # Default working dir; bind-mount the host vhs/ here at run time.
