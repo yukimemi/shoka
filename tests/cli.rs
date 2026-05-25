@@ -468,6 +468,100 @@ fn exec_propagates_failure_exit_code() {
     );
 }
 
+#[test]
+fn prune_empty_shelf_is_a_no_op() {
+    let (mut cmd, _tmp) = cmd_with_isolated_config();
+    let assertion = cmd.args(["prune", "--dry-run"]).assert().success();
+    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).to_string();
+    assert!(
+        stdout.contains("shelf is empty"),
+        "expected empty-shelf message, got: {stdout}"
+    );
+}
+
+#[test]
+fn prune_no_stale_entries_is_a_no_op() {
+    // All shelf entries have their clone paths on disk → nothing to
+    // prune. The exit code should still be 0 and the output should
+    // report 0 candidates.
+    let (mut cmd, tmp) = cmd_with_isolated_config();
+    seed_shelf(
+        &tmp.path().join("state"),
+        &[("github.com", "yukimemi", "shoka")],
+    );
+    let path = tmp.path().join("root/github.com/yukimemi/shoka");
+    std::fs::create_dir_all(&path).unwrap();
+    let assertion = cmd.args(["prune", "--dry-run"]).assert().success();
+    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).to_string();
+    assert!(
+        stdout.contains("0 of 1 repo(s) have missing clone paths"),
+        "expected 0/1 stale report, got: {stdout}"
+    );
+}
+
+#[test]
+fn prune_dry_run_lists_candidates_without_modifying_shelf() {
+    let (mut cmd, tmp) = cmd_with_isolated_config();
+    let state_dir = tmp.path().join("state");
+    seed_shelf(
+        &state_dir,
+        &[
+            ("github.com", "yukimemi", "alive"),
+            ("github.com", "yukimemi", "ghost"),
+        ],
+    );
+    // Only `alive`'s clone path exists.
+    std::fs::create_dir_all(tmp.path().join("root/github.com/yukimemi/alive")).unwrap();
+
+    let assertion = cmd.args(["prune", "--dry-run"]).assert().success();
+    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).to_string();
+    assert!(
+        stdout.contains("1 of 2 repo(s) have missing clone paths"),
+        "expected 1/2 stale report, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("yukimemi/ghost"),
+        "expected stale slug in output, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("dry run"),
+        "expected dry-run hint, got: {stdout}"
+    );
+
+    // Shelf must be untouched — count still 2.
+    let body = std::fs::read_to_string(state_dir.join("state.toml")).unwrap();
+    assert!(body.contains("alive"), "alive entry lost: {body}");
+    assert!(body.contains("ghost"), "ghost entry lost: {body}");
+}
+
+#[test]
+fn prune_yes_removes_stale_entries() {
+    let (mut cmd, tmp) = cmd_with_isolated_config();
+    let state_dir = tmp.path().join("state");
+    seed_shelf(
+        &state_dir,
+        &[
+            ("github.com", "yukimemi", "alive"),
+            ("github.com", "yukimemi", "ghost"),
+        ],
+    );
+    std::fs::create_dir_all(tmp.path().join("root/github.com/yukimemi/alive")).unwrap();
+
+    let assertion = cmd.args(["prune", "--yes"]).assert().success();
+    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).to_string();
+    assert!(
+        stdout.contains("removed 1 stale entry"),
+        "expected 1-removed summary, got: {stdout}"
+    );
+
+    let body = std::fs::read_to_string(state_dir.join("state.toml")).unwrap();
+    assert!(body.contains("alive"), "alive should remain: {body}");
+    assert!(
+        !body.contains("ghost"),
+        "ghost should be gone after prune --yes: {body}"
+    );
+}
+
 /// Smoke test that the binary builds, parses args, and exits cleanly
 /// for `--help`. Catches surface-level clap regressions early without
 /// poking at any specific subcommand.
