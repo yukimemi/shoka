@@ -48,7 +48,14 @@ pub async fn run(ctx: &ShokaContext, args: ImportArgs) -> Result<()> {
         source.display()
     );
 
-    for entry in WalkDir::new(&source).follow_links(false).into_iter() {
+    // We use the explicit iterator (rather than the implicit
+    // `for in IntoIter`) so we can call `it.skip_current_dir()` the
+    // moment we recognise a `.git/`. Without that hand-off, walkdir
+    // happily descends into `objects/` / `refs/` for every repo —
+    // tens of thousands of dead-end entries per shelf. The earlier
+    // comment claimed we didn't descend; we now actually don't.
+    let mut it = WalkDir::new(&source).follow_links(false).into_iter();
+    while let Some(entry) = it.next() {
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
@@ -58,13 +65,12 @@ pub async fn run(ctx: &ShokaContext, args: ImportArgs) -> Result<()> {
             }
         };
 
-        // We're hunting `.git/` directories specifically. Skipping
-        // non-`.git` entries early keeps the walk cheap; once we hit
-        // a `.git`, we don't descend (no need to crawl the object
-        // store).
         if entry.file_name() != ".git" || !entry.path().is_dir() {
             continue;
         }
+        // Found a repo — record it, then prune the walk so the
+        // object store doesn't get crawled.
+        it.skip_current_dir();
 
         let repo_root = match entry.path().parent() {
             Some(p) => p,
@@ -200,11 +206,15 @@ fn parse_remote_url(url: &gix::Url) -> Result<RemoteParts> {
     let host = url.host().context("remote URL has no host")?.to_string();
     // gix stores paths as bytes; valid SSH / HTTPS git URLs are
     // ASCII in practice, but go through `to_str` for safety.
-    let path = std::str::from_utf8(url.path.as_ref())
+    //
+    // Trim slashes *first*, then strip the `.git` suffix exactly
+    // once. Order matters: `owner/repo.git/` would otherwise survive
+    // the suffix step ("doesn't end with `.git`") and pass through
+    // with the bogus dotfile attached to the name.
+    let trimmed = std::str::from_utf8(url.path.as_ref())
         .context("remote URL path is not UTF-8")?
-        .trim_start_matches('/')
-        .trim_end_matches(".git")
-        .trim_end_matches('/');
+        .trim_matches('/');
+    let path = trimmed.strip_suffix(".git").unwrap_or(trimmed);
     let mut iter = path.splitn(2, '/');
     let owner = iter
         .next()
@@ -270,6 +280,17 @@ mod tests {
     #[test]
     fn ssh_url_with_trailing_slash() {
         let p = parse("https://github.com/foo/bar/").unwrap();
+        assert_eq!(p.owner, "foo");
+        assert_eq!(p.name, "bar");
+    }
+
+    #[test]
+    fn trailing_slash_after_dot_git_strips_both() {
+        // Regression for the slash-before-strip ordering: with the
+        // naive `trim_end(".git").trim_end('/')` pair, this would
+        // leave `name = "bar.git"` because `.git` didn't end the
+        // string yet. trim-then-strip gets it right.
+        let p = parse("https://github.com/foo/bar.git/").unwrap();
         assert_eq!(p.owner, "foo");
         assert_eq!(p.name, "bar");
     }
