@@ -560,14 +560,14 @@ impl ResolvedConfig {
     /// owns the destination context — same repo can land in different
     /// paths under different routes / profiles, and the layout
     /// template is itself a config-level concern.
-    /// Render the on-disk clone path for `repo`.
     ///
-    /// The caller owns the [`Engine`] so multi-repo loops (e.g.
-    /// `shoka list`) can construct it once and reuse it across the
-    /// whole shelf rather than paying the Tera-setup cost per repo.
-    /// For one-off callers the convenience wrapper
-    /// [`clone_path_for_one`](Self::clone_path_for_one) builds and
-    /// discards a fresh engine.
+    /// The caller owns the [`teravars::Engine`] so multi-repo loops
+    /// (e.g. `shoka list`'s shelf walk) construct it once and reuse
+    /// it across every repo rather than paying the Tera setup cost
+    /// per call. One-off callers can use [`clone_path_for_one`] for
+    /// a single-shot engine.
+    ///
+    /// [`clone_path_for_one`]: Self::clone_path_for_one
     pub fn clone_path_for(
         &self,
         repo: &crate::state::Repo,
@@ -575,7 +575,7 @@ impl ResolvedConfig {
     ) -> Result<PathBuf> {
         use teravars::Context;
 
-        let spec = format!("{}/{}/{}", repo.host, repo.owner, repo.name);
+        let spec = repo.slug();
         let target = self.resolve_target(&spec);
 
         // Per-repo `vcs` override on the Repo itself wins over the
