@@ -123,9 +123,17 @@ fn ahead_behind(repo: &gix::Repository, branch: Option<&str>) -> (Option<usize>,
             .id()
             .detach();
 
-        let merge_base = repo.merge_base(head_id, upstream_id).ok()?.detach();
-        let ahead = count_first_ancestor(repo, merge_base, head_id).ok()?;
-        let behind = count_first_ancestor(repo, merge_base, upstream_id).ok()?;
+        // Set-difference via `with_hidden`: walk from one tip,
+        // hide everything reachable from the other. No merge_base
+        // needed — gix prunes side branches at the boundary so we
+        // don't traverse into the shared history, which fixes the
+        // "merge / diverged history walks back to root" perf bug
+        // the boundary-on-direct-match implementation had.
+        if head_id == upstream_id {
+            return Some((0, 0));
+        }
+        let ahead = count_reachable_excluding(repo, head_id, upstream_id).ok()?;
+        let behind = count_reachable_excluding(repo, upstream_id, head_id).ok()?;
         Some((ahead, behind))
     };
     match inner() {
@@ -134,27 +142,26 @@ fn ahead_behind(repo: &gix::Repository, branch: Option<&str>) -> (Option<usize>,
     }
 }
 
-/// Count commits walked back from `tip` (inclusive) until reaching
-/// `boundary` (exclusive). When `boundary == tip`, returns `0`.
-/// Assumes `boundary` is an ancestor of `tip` (which is true when
-/// the caller passed `merge_base(tip, other)`); if not, returns
-/// the count of *all* commits walked (i.e., the whole reachable
-/// set), which is a reasonable fallback for diverged histories.
-fn count_first_ancestor(
+/// Count commits reachable from `tip` but **not** from `hide`.
+/// Equivalent to `git rev-list --count <tip> ^<hide>`.
+///
+/// Uses gix's [`with_hidden`] so the walker treats `hide` *and its
+/// entire ancestor set* as off-limits. Without that, a diverged
+/// history (merge commits, side branches) would walk back to the
+/// root commit chasing parents that don't share an obvious linear
+/// path; performance scales with diverge distance instead of total
+/// repo history.
+///
+/// [`with_hidden`]: gix::revision::walk::Platform::with_hidden
+fn count_reachable_excluding(
     repo: &gix::Repository,
-    boundary: gix::ObjectId,
     tip: gix::ObjectId,
+    hide: gix::ObjectId,
 ) -> Result<usize> {
-    if boundary == tip {
-        return Ok(0);
-    }
-    let walk = repo.rev_walk([tip]).all()?;
+    let walk = repo.rev_walk([tip]).with_hidden([hide]).all()?;
     let mut count = 0usize;
     for item in walk {
-        let info = item?;
-        if info.id == boundary {
-            return Ok(count);
-        }
+        item?;
         count += 1;
     }
     Ok(count)
