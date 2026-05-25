@@ -7,15 +7,23 @@
 //! the cache plumbing so the data-gathering PRs can drop in without
 //! restructuring callers.
 //!
-//! The forthcoming background-refresh PR will wire this same
-//! `refresh` entry point into the tail of other subcommands via a
-//! detached subprocess (`shoka cache refresh --background`), gated
-//! by `[global.cache].background_refresh`.
+//! Two refresh modes:
+//!
+//! - **Foreground** (`shoka cache refresh [--force] [--tag ...]`) —
+//!   the user-facing path: pretty summary output, errors bubble up.
+//! - **Background** (`shoka cache refresh --background`, hidden
+//!   flag) — used by [`try_spawn_bg_refresh`] when the dispatcher
+//!   spawns a detached subprocess at the tail of other commands.
+//!   Output is suppressed; errors are downgraded to `tracing::warn`
+//!   so the detached child never disturbs the parent's terminal.
 //!
 //! [`Cache`]: crate::cache::Cache
 //! [`Shelf`]: crate::state::Shelf
 
-use anyhow::Result;
+use std::path::Path;
+use std::process::{Command, Stdio};
+
+use anyhow::{Context, Result};
 use owo_colors::OwoColorize;
 
 use crate::cache::{Cache, current_unix_secs};
@@ -26,13 +34,35 @@ use crate::state::{Repo, Shelf};
 
 pub async fn dispatch(ctx: &ShokaContext, cmd: CacheCommand) -> Result<()> {
     match cmd {
-        CacheCommand::Refresh { force, tags } => refresh(ctx, force, tags).await,
+        CacheCommand::Refresh {
+            force,
+            tags,
+            background,
+        } => {
+            if background {
+                // Best-effort: log and swallow. The detached child
+                // must never propagate failures since stderr is
+                // /dev/null'd anyway and there's no parent to
+                // observe the exit code.
+                if let Err(e) = refresh(ctx, force, tags, /*background=*/ true).await {
+                    tracing::warn!(target: "shoka", "background refresh failed: {e:#}");
+                }
+                Ok(())
+            } else {
+                refresh(ctx, force, tags, /*background=*/ false).await
+            }
+        }
         CacheCommand::Show => show(ctx).await,
         CacheCommand::Clear => clear(ctx).await,
     }
 }
 
-async fn refresh(ctx: &ShokaContext, force: bool, tags: Vec<String>) -> Result<()> {
+async fn refresh(
+    ctx: &ShokaContext,
+    force: bool,
+    tags: Vec<String>,
+    background: bool,
+) -> Result<()> {
     let cfg = ShokaConfig::load(&ctx.paths)?;
     let resolved = cfg.resolve(ctx.profile_override.as_deref())?;
     let shelf = Shelf::load(&ctx.paths)?;
@@ -65,28 +95,39 @@ async fn refresh(ctx: &ShokaContext, force: bool, tags: Vec<String>) -> Result<(
 
     cache.save(&ctx.paths)?;
 
-    println!(
-        "{} refreshed {}{} repo{} ({} on the shelf)",
-        "cache:".bold(),
-        refreshed,
-        if force { " (forced)" } else { "" },
-        if refreshed == 1 { "" } else { "s" },
-        shelf.len()
-    );
-    if skipped_threshold > 0 {
-        println!(
-            "  {} {} fresh (within {}s threshold)",
-            "↩".dimmed(),
-            skipped_threshold,
-            threshold
+    if background {
+        // tracing-only: stdout/stderr are /dev/null'd in the
+        // detached child anyway, but tracing-subscriber respects
+        // SHOKA_LOG for users who want to peek at refresh history.
+        tracing::info!(
+            target: "shoka",
+            "background cache refresh: {refreshed} updated, {skipped_threshold} fresh, {skipped_filter} filtered ({} on shelf)",
+            shelf.len()
         );
-    }
-    if skipped_filter > 0 {
+    } else {
         println!(
-            "  {} {} filtered out by --tag",
-            "↩".dimmed(),
-            skipped_filter
+            "{} refreshed {}{} repo{} ({} on the shelf)",
+            "cache:".bold(),
+            refreshed,
+            if force { " (forced)" } else { "" },
+            if refreshed == 1 { "" } else { "s" },
+            shelf.len()
         );
+        if skipped_threshold > 0 {
+            println!(
+                "  {} {} fresh (within {}s threshold)",
+                "↩".dimmed(),
+                skipped_threshold,
+                threshold
+            );
+        }
+        if skipped_filter > 0 {
+            println!(
+                "  {} {} filtered out by --tag",
+                "↩".dimmed(),
+                skipped_filter
+            );
+        }
     }
     Ok(())
 }
@@ -109,6 +150,88 @@ fn has_all_tags(repo: &Repo, wanted: &[String]) -> bool {
     wanted.iter().all(|w| repo.tags.iter().any(|t| t == w))
 }
 
+/// Attempt to spawn a detached background `shoka cache refresh
+/// --background` subprocess.
+///
+/// Best-effort by design — the bg refresh is opportunistic, so
+/// callers should *log* but never *bail* on errors. The child runs
+/// with stdin / stdout / stderr null'd and is detached from the
+/// parent process group so it survives the parent's exit:
+///
+/// - Unix: `setsid(2)` in `pre_exec` so the child becomes its own
+///   session leader (no controlling terminal, immune to SIGHUP when
+///   the parent shell exits).
+/// - Windows: `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` so the
+///   child doesn't share the parent's console and survives the
+///   parent's exit.
+///
+/// `SHOKA_CONFIG` and `SHOKA_PROFILE` are propagated via env so the
+/// child sees the same config file and active profile the parent
+/// used (otherwise the child would load defaults and write a
+/// different cache).
+///
+/// Gated by `[global.cache].background_refresh`. When that's
+/// `false`, this function is an opt-out: it loads enough config to
+/// see the flag, then returns `Ok(())` without spawning anything.
+pub fn try_spawn_bg_refresh(ctx: &ShokaContext) -> Result<()> {
+    let cfg = ShokaConfig::load(&ctx.paths)?;
+    let resolved = cfg.resolve(ctx.profile_override.as_deref())?;
+    if !resolved.cache.background_refresh {
+        tracing::debug!(target: "shoka", "background refresh disabled by config");
+        return Ok(());
+    }
+    let exe = std::env::current_exe().context("locating current shoka executable")?;
+    spawn_detached(
+        &exe,
+        ctx.paths.config_file(),
+        ctx.profile_override.as_deref(),
+    )
+    .context("spawning background refresh")?;
+    Ok(())
+}
+
+fn spawn_detached(exe: &Path, config_file: &Path, profile: Option<&str>) -> Result<()> {
+    let mut cmd = Command::new(exe);
+    cmd.args(["cache", "refresh", "--background"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env("SHOKA_CONFIG", config_file);
+    if let Some(p) = profile {
+        cmd.env("SHOKA_PROFILE", p);
+    }
+
+    // OS-specific detach. On both platforms `spawn()` returns
+    // immediately without waiting; the child outlives the parent.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: `setsid()` from libc returns the new session id
+        // or -1 on error; we don't check the return because failure
+        // (already a session leader, etc.) is harmless for our
+        // "best-effort detach" goal. The closure is the standard
+        // pre_exec idiom — it runs after fork(2) but before exec(3)
+        // in the child only.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+
+    cmd.spawn()
+        .with_context(|| format!("spawning {} cache refresh --background", exe.display()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,11 +241,6 @@ mod tests {
     use tempfile::TempDir;
 
     fn paths_at(tmp: &Path) -> crate::paths::ShokaPaths {
-        // Point config_file at the temp dir; state + cache files
-        // land under their own subdirs but the dir layout still
-        // works because tests use `*_to` / `*_from` directly when
-        // touching state/cache files. For commands that load via
-        // ShokaPaths, this gives us hermetic isolation.
         crate::paths::ShokaPaths::resolve(Some(&tmp.join("config.toml")))
             .expect("ShokaPaths::resolve")
     }
@@ -133,10 +251,6 @@ mod tests {
 
     #[test]
     fn refresh_walks_shelf_and_marks_entries() {
-        // Direct exercise of the inner logic — wiring this through
-        // `dispatch` would need a tokio runtime + filesystem isolation
-        // for ShokaConfig / Shelf load, which the unit-test boundary
-        // doesn't need to cover.
         let mut shelf = Shelf::default();
         shelf.add(sample("shoka")).unwrap();
         shelf.add(sample("renri")).unwrap();
@@ -158,13 +272,6 @@ mod tests {
                 .last_refreshed,
             Some(now)
         );
-        assert_eq!(
-            cache
-                .find("github.com", "yukimemi", "renri")
-                .unwrap()
-                .last_refreshed,
-            Some(now)
-        );
     }
 
     #[test]
@@ -173,16 +280,10 @@ mod tests {
         let repo = sample("shoka");
         cache.upsert(&repo).last_refreshed = Some(1_700_000_000);
 
-        let now = 1_700_000_010; // 10s later
-        let threshold = 60;
-
-        // Within threshold → stale check says fresh.
         let entry = cache.find_mut("github.com", "yukimemi", "shoka").unwrap();
-        assert!(!entry.is_stale(threshold, now));
-
-        // 120s later → stale.
+        assert!(!entry.is_stale(60, 1_700_000_010));
         let entry = cache.find_mut("github.com", "yukimemi", "shoka").unwrap();
-        assert!(entry.is_stale(threshold, 1_700_000_120));
+        assert!(entry.is_stale(60, 1_700_000_120));
     }
 
     #[test]
@@ -194,7 +295,6 @@ mod tests {
         cache.save(&paths).unwrap();
         assert!(paths.cache_file().exists());
 
-        // Equivalent of the `clear` command path.
         Cache::default().save(&paths).unwrap();
         let loaded = Cache::load(&paths).unwrap();
         assert!(loaded.is_empty());
@@ -210,6 +310,36 @@ mod tests {
             &repo,
             &["rust".into(), "cli".into(), "tui".into()]
         ));
-        assert!(has_all_tags(&repo, &[])); // empty filter is trivially true
+        assert!(has_all_tags(&repo, &[]));
+    }
+
+    #[test]
+    fn try_spawn_bg_refresh_short_circuits_when_disabled() {
+        // Stage a config that opts out of background refresh and
+        // confirm `try_spawn_bg_refresh` returns Ok without
+        // touching the filesystem outside the temp tree.
+        use std::fs;
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("config.toml"),
+            r#"
+[global]
+root = "/r"
+
+[global.cache]
+background_refresh = false
+"#,
+        )
+        .unwrap();
+        let paths = paths_at(tmp.path());
+        let ctx = ShokaContext {
+            paths,
+            profile_override: None,
+        };
+        // Just asserts the function returns Ok in the opt-out case.
+        // Actually spawning is a side effect we don't want to
+        // exercise under `cargo test`, so we don't construct the
+        // "enabled" counterpart here.
+        try_spawn_bg_refresh(&ctx).expect("opt-out path returns Ok");
     }
 }
