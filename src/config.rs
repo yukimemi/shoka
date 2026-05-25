@@ -157,13 +157,19 @@ pub struct Route {
     pub default_protocol: Option<Protocol>,
 }
 
-/// A [`Route`] with its [`pattern`](Route::pattern) parsed once at
-/// [`ShokaConfig::resolve`] time so the per-clone matcher loop doesn't
-/// pay a re-compile cost.
+/// A [`Route`] with its [`pattern`](Route::pattern) parsed and
+/// [`root`](Route::root) expanded once at [`ShokaConfig::resolve`]
+/// time so the per-clone matcher loop doesn't pay a re-compile or
+/// re-expansion cost. Multiple `clone` calls in one process (think
+/// `shoka exec` or the upcoming TUI) iterate routes hot.
 #[derive(Debug, Clone)]
 pub struct CompiledRoute {
     pub raw: Route,
     pub pattern: PatternKind,
+    /// `expand_home`'d form of [`Route::root`], pre-computed so the
+    /// matcher hot path doesn't re-tilde-expand and re-absolutise
+    /// the same string every clone.
+    pub resolved_root: Option<PathBuf>,
 }
 
 /// Compiled form of a [`Route::pattern`].
@@ -199,12 +205,11 @@ impl PatternKind {
 
 /// Returns `true` when `spec` either equals `prefix` or starts with
 /// `prefix` followed by a `/` segment boundary. Byte-indexed so it
-/// allocates nothing.
+/// allocates nothing. Single `starts_with` upfront keeps the common
+/// "no match" case fast (it bails immediately on prefix mismatch).
 fn prefix_or_exact_match(spec: &str, prefix: &str) -> bool {
-    spec == prefix
-        || (spec.len() > prefix.len()
-            && spec.as_bytes().get(prefix.len()) == Some(&b'/')
-            && spec.starts_with(prefix))
+    spec.starts_with(prefix)
+        && (spec.len() == prefix.len() || spec.as_bytes().get(prefix.len()) == Some(&b'/'))
 }
 
 /// Parse a [`Route::pattern`] string into a [`PatternKind`].
@@ -431,7 +436,9 @@ impl ShokaConfig {
 
         // Compile all route patterns up-front so a typo'd pattern
         // surfaces here (at config-load time) rather than on the
-        // first clone attempt.
+        // first clone attempt. While we're here, pre-expand each
+        // route's `root` so the matcher hot path doesn't re-tilde +
+        // re-absolutise the same string every clone.
         let routes: Vec<CompiledRoute> = self
             .routes
             .iter()
@@ -439,9 +446,11 @@ impl ShokaConfig {
             .map(|(idx, r)| {
                 let pattern = compile_pattern(&r.pattern)
                     .with_context(|| format!("compiling routes[{idx}] pattern"))?;
+                let resolved_root = r.root.as_deref().map(expand_home);
                 Ok::<_, anyhow::Error>(CompiledRoute {
                     raw: r.clone(),
                     pattern,
+                    resolved_root,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -517,11 +526,13 @@ impl ResolvedConfig {
         for (idx, route) in self.routes.iter().enumerate() {
             if route.pattern.matches(spec) {
                 return CloneTarget {
+                    // Use the pre-expanded path stored on the
+                    // CompiledRoute so the hot path skips
+                    // expand_home (which absolutises against cwd and
+                    // does tilde substitution).
                     root: route
-                        .raw
-                        .root
-                        .as_deref()
-                        .map(expand_home)
+                        .resolved_root
+                        .clone()
                         .unwrap_or_else(|| self.root.clone()),
                     layout: route.raw.layout.clone().unwrap_or_else(|| g.layout.clone()),
                     default_vcs: route.raw.default_vcs.unwrap_or(g.default_vcs),
