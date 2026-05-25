@@ -126,11 +126,17 @@ fn build_url(host: &str, owner: &str, name: &str, protocol: Protocol) -> String 
 /// Heuristic: does `s` look like a URL we should hand verbatim to
 /// gix, vs. a ghq-style shorthand we have to assemble ourselves?
 ///
-/// - `://` → any explicit scheme (`https://`, `ssh://`, `file://`, …).
-/// - `<user>@<host>:` → scp-style SSH shorthand. The `:` separator
-///   distinguishes it from `host/owner/name` (which contains no `:`).
+/// Any colon is enough. Shorthands (`owner/name`, `host/owner/name`)
+/// are colon-free by construction, and the URL forms we care about
+/// all contain one: `://` for explicit schemes (`https://`, `ssh://`,
+/// `file://`, …), `<user>@<host>:` for the canonical SCP shorthand,
+/// and `<host>:<path>` for the userless SCP shorthand that picks up
+/// the default user from `~/.ssh/config` (e.g.
+/// `github.com:owner/repo.git`). The earlier `'@' && ':'` shape
+/// missed that last case and produced bogus URLs like
+/// `https://github.com/github.com:foo/bar.git`.
 fn looks_like_url(s: &str) -> bool {
-    s.contains("://") || (s.contains('@') && s.contains(':'))
+    s.contains(':')
 }
 
 #[cfg(test)]
@@ -221,6 +227,20 @@ mod tests {
         // The URL we hand to gix should be the input verbatim — we
         // don't want to rewrite a user-provided URL.
         assert_eq!(url.to_string(), "https://github.com/foo/bar.git");
+    }
+
+    #[test]
+    fn clone_input_userless_scp_ssh_passes_through() {
+        // Regression: the older `'@' && ':'` heuristic misclassified
+        // userless SCP-style SSH URLs (which rely on a default user
+        // from `~/.ssh/config`) as shorthand and built
+        // `https://github.com/github.com:foo/bar.git`. The colon-only
+        // check correctly routes these to gix verbatim.
+        let (parts, _) =
+            parse_clone_input("github.com:foo/bar.git", "example.com", Protocol::Https).unwrap();
+        assert_eq!(parts.host, "github.com");
+        assert_eq!(parts.owner, "foo");
+        assert_eq!(parts.name, "bar");
     }
 
     #[test]
