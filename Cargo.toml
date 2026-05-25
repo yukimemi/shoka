@@ -71,10 +71,12 @@ gix = { version = "0.83", default-features = false, features = [
 # subdirs in a ghq-style tree).
 walkdir = "2.5.0"
 
-# TUI (phase 2 で本格採用、skeleton 段階では未使用)
-# ratatui = "0.30"
-# crossterm = "0.29"
-# nucleo = "0.5"
+# TUI (Phase 2 dashboard). nucleo carries the fuzzy-match algorithm
+# only — inquire still handles the CLI single-shot pickers (`cd` no-arg
+# etc.); nucleo lives entirely inside the ratatui app.
+ratatui = "0.30"
+crossterm = "0.29"
+nucleo = "0.5"
 
 # gh integration (phase 1 後半 / phase 2 で octocrab 追加)
 # octocrab = "0.45"
