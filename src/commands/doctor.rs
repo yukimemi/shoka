@@ -14,6 +14,7 @@ use owo_colors::OwoColorize;
 
 use crate::commands::ShokaContext;
 use crate::config::ShokaConfig;
+use crate::state::Shelf;
 
 pub async fn run(ctx: &ShokaContext) -> Result<()> {
     let p = &ctx.paths;
@@ -72,6 +73,21 @@ pub async fn run(ctx: &ShokaContext) -> Result<()> {
         for (k, v) in &r.git_config {
             println!("    {k} = {v:?}");
         }
+    }
+
+    // Shelf summary. Don't make doctor fail when the shelf is
+    // unparseable — surface the error inline and keep going. Doctor
+    // is a diagnostic, so a corrupt shelf is *information* (the
+    // user wants to know), not a hard stop.
+    println!();
+    println!("{}", "shelf".underline());
+    match Shelf::load(p) {
+        Ok(s) if s.is_empty() => println!(
+            "  {} (no repos yet — `shoka clone <url>` to add one)",
+            "0 repos".dimmed()
+        ),
+        Ok(s) => println!("  {} repos on the shelf (schema v{})", s.len(), s.version),
+        Err(e) => println!("  {} {e:#}", "shelf load failed:".red()),
     }
 
     Ok(())
