@@ -27,13 +27,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::gh::GhSnapshot;
 use crate::git_status::GitStatusSnapshot;
 use crate::paths::ShokaPaths;
 
-/// Current on-disk schema version. Bumped to **2** when the per-repo
-/// `git_status` field landed — readers with the old version on disk
-/// see the optional field as default-`None` and keep working.
-pub const CACHE_VERSION: u32 = 2;
+/// Current on-disk schema version. Bumped to **3** when the per-repo
+/// `gh` field (open PR count + CI status) landed; the existing
+/// `git_status` field bumped it to 2. Readers with an older version
+/// see the new optional fields as default-`None` and keep working.
+pub const CACHE_VERSION: u32 = 3;
 
 /// Cache file contents. Mirrors [`crate::state::Shelf`]'s shape
 /// intentionally — both files are walked by the same patterns
@@ -89,10 +91,16 @@ pub struct RepoCache {
     /// checked yet" apart from "clean".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_status: Option<GitStatusSnapshot>,
-    // The Phase 2b `gh: Option<GhSnapshot>` (PR / CI counts via
-    // octocrab) lands as a sibling field; another version bump
-    // accompanies it so a downgraded shoka refuses the unknown shape
-    // rather than dropping the new data silently.
+
+    /// Cached GitHub snapshot — open PR count + most-recent CI
+    /// conclusion. Populated by [`crate::gh::capture_snapshot`]
+    /// during `cache refresh` when a token is reachable and the
+    /// repo's host is `github.com`. `None` for non-github hosts,
+    /// missing tokens, or rate-limit / network errors — the TUI
+    /// renders `-` in those cells so users can tell "no data" apart
+    /// from a definite zero PRs / no CI runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gh: Option<GhSnapshot>,
 }
 
 impl RepoCache {
@@ -104,6 +112,7 @@ impl RepoCache {
             name: name.into(),
             last_refreshed: None,
             git_status: None,
+            gh: None,
         }
     }
 

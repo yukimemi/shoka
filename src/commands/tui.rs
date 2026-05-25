@@ -11,18 +11,16 @@
 //! Layout (3 rows):
 //!
 //! 1. Header — counts + active filter prefix.
-//! 2. Table — slug / branch / ahead-behind / dirty / path / tags,
+//! 2. Table — slug / branch / ↑↓ / ✓ / PR / CI / path / tags,
 //!    current selection highlighted. Status columns read the
-//!    cached `git_status` snapshot off `cache.toml`; entries that
-//!    haven't been refreshed yet render `?` so users can tell
-//!    "unchecked" apart from "clean".
+//!    cached `git_status` + `gh` snapshots off `cache.toml`;
+//!    entries that haven't been refreshed yet render `?` (git) /
+//!    `-` (gh) so users can tell "unchecked" or "no data" apart
+//!    from a definite zero.
 //! 3. Footer — mode-specific key hints, or the live filter input.
 //!
 //! What's intentionally **not** here yet:
 //!
-//! - **GitHub PR / CI counts.** Phase 2b — needs `octocrab` and
-//!   `gh auth token` wiring. The cache schema already has room
-//!   reserved for a sibling `gh: Option<GhSnapshot>` field.
 //! - **Multi-select / bulk ops.** The TUI is currently a fancy `cd`
 //!   picker. Bulk `exec --tag X -- ...` would be a natural extension.
 //! - **OSC 7 cwd hint.** Phase 3 polish.
@@ -54,6 +52,7 @@ use crate::cli::TuiArgs;
 use crate::commands::ShokaContext;
 use crate::commands::cd::emit_path;
 use crate::config::{ResolvedConfig, ShokaConfig};
+use crate::gh::{CiStatus, GhSnapshot};
 use crate::git_status::GitStatusSnapshot;
 use crate::state::{Repo, Shelf};
 
@@ -118,6 +117,11 @@ struct DashRow {
     /// distinctly from "snapshot says clean" so users can tell
     /// "unchecked" apart from "no changes".
     status: Option<GitStatusSnapshot>,
+    /// Cached gh snapshot — open PR count + most-recent CI
+    /// conclusion. `None` for non-github hosts, missing tokens, or
+    /// API errors; TUI renders `-` in the PR/CI cells for that
+    /// case so users can distinguish "no data" from "zero PRs".
+    gh: Option<GhSnapshot>,
 }
 
 fn build_rows(
@@ -135,14 +139,15 @@ fn build_rows(
         let path = resolved
             .clone_path_for(repo, &mut engine)
             .with_context(|| format!("resolving clone path for {}", repo.slug()))?;
-        let status = cache
-            .find(&repo.host, &repo.owner, &repo.name)
-            .and_then(|c| c.git_status.clone());
+        let cache_entry = cache.find(&repo.host, &repo.owner, &repo.name);
+        let status = cache_entry.and_then(|c| c.git_status.clone());
+        let gh = cache_entry.and_then(|c| c.gh.clone());
         out.push(DashRow {
             slug: repo.slug(),
             path,
             tags_display: repo.tags.join(", "),
             status,
+            gh,
         });
     }
     Ok(out)
@@ -392,7 +397,10 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
-    let header_row = Row::new(vec!["repo", "branch", "↑↓", "✓", "path", "tags"]).style(
+    let header_row = Row::new(vec![
+        "repo", "branch", "↑↓", "✓", "PR", "CI", "path", "tags",
+    ])
+    .style(
         Style::default()
             .add_modifier(Modifier::BOLD)
             .fg(Color::Yellow),
@@ -404,11 +412,14 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
         .map(|&idx| {
             let row = &app.rows[idx];
             let (branch, ahead_behind, dirty) = status_cells(row.status.as_ref());
+            let (pr, ci) = gh_cells(row.gh.as_ref());
             Row::new(vec![
                 row.slug.clone(),
                 branch,
                 ahead_behind,
                 dirty,
+                pr,
+                ci,
                 row.path.display().to_string(),
                 row.tags_display.clone(),
             ])
@@ -416,11 +427,13 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
         .collect();
 
     let widths = [
-        Constraint::Percentage(30), // repo
-        Constraint::Length(14),     // branch (fixed-ish; truncated below)
+        Constraint::Percentage(28), // repo
+        Constraint::Length(14),     // branch
         Constraint::Length(8),      // ↑N ↓N
         Constraint::Length(2),      // dirty glyph
-        Constraint::Min(20),        // path takes the rest
+        Constraint::Length(4),      // PR count (e.g. "99+")
+        Constraint::Length(2),      // CI glyph
+        Constraint::Min(20),        // path
         Constraint::Length(14),     // tags
     ];
     let table = Table::new(rows, widths)
@@ -443,6 +456,31 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
     // Cloning here would discard those mutations and break long-
     // shelf scrolling.
     f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+/// Format the two gh cells (open PR count + CI glyph). `(-, -)`
+/// when the snapshot is `None` (non-github host, missing token, or
+/// API error); otherwise PR count is clamped to "99+" so the
+/// 4-char column doesn't blow out on a busy mono-repo, and CI is
+/// reduced to a single glyph for at-a-glance scanning.
+fn gh_cells(snap: Option<&GhSnapshot>) -> (String, String) {
+    let Some(snap) = snap else {
+        return ("-".into(), "-".into());
+    };
+    let pr = match snap.open_pr_count {
+        Some(n) if n >= 100 => "99+".into(),
+        Some(n) => n.to_string(),
+        None => "-".into(),
+    };
+    let ci = match snap.ci_status {
+        Some(CiStatus::Success) => "✓".into(),
+        Some(CiStatus::Failure) => "✗".into(),
+        Some(CiStatus::Pending) => "◐".into(),
+        Some(CiStatus::Skipped) => "○".into(),
+        Some(CiStatus::Other) => "!".into(),
+        None => "-".into(),
+    };
+    (pr, ci)
 }
 
 /// Format the three status cells the dashboard renders for one row.
@@ -489,8 +527,70 @@ mod tests {
                 path: PathBuf::from("/tmp"),
                 tags_display: String::new(),
                 status: None,
+                gh: None,
             })
             .collect()
+    }
+
+    #[test]
+    fn gh_cells_renders_dashes_when_snapshot_missing() {
+        let (pr, ci) = gh_cells(None);
+        assert_eq!(pr, "-");
+        assert_eq!(ci, "-");
+    }
+
+    #[test]
+    fn gh_cells_renders_count_and_status_glyph() {
+        let snap = GhSnapshot {
+            open_pr_count: Some(5),
+            ci_status: Some(CiStatus::Success),
+        };
+        let (pr, ci) = gh_cells(Some(&snap));
+        assert_eq!(pr, "5");
+        assert_eq!(ci, "✓");
+    }
+
+    #[test]
+    fn gh_cells_clamps_pr_count_at_99_plus() {
+        let snap = GhSnapshot {
+            open_pr_count: Some(150),
+            ci_status: None,
+        };
+        let (pr, _) = gh_cells(Some(&snap));
+        assert_eq!(pr, "99+");
+    }
+
+    #[test]
+    fn gh_cells_distinguishes_zero_from_none() {
+        // Zero PRs is a definite "no PRs"; None is "didn't check".
+        // The cell strings must differ so the user can tell.
+        let zero = GhSnapshot {
+            open_pr_count: Some(0),
+            ci_status: None,
+        };
+        let (pr_zero, _) = gh_cells(Some(&zero));
+        let (pr_none, _) = gh_cells(None);
+        assert_eq!(pr_zero, "0");
+        assert_eq!(pr_none, "-");
+        assert_ne!(pr_zero, pr_none);
+    }
+
+    #[test]
+    fn gh_cells_renders_each_ci_status() {
+        for (status, expected) in [
+            (CiStatus::Success, "✓"),
+            (CiStatus::Failure, "✗"),
+            (CiStatus::Pending, "◐"),
+            (CiStatus::Skipped, "○"),
+            (CiStatus::Other, "!"),
+        ] {
+            let snap = GhSnapshot {
+                open_pr_count: None,
+                ci_status: Some(status),
+            };
+            let (_, ci) = gh_cells(Some(&snap));
+            assert_eq!(ci, expected, "ci glyph for {status:?}");
+        }
     }
 
     fn snap(

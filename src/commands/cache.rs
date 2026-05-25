@@ -30,6 +30,7 @@ use crate::cache::{Cache, current_unix_secs};
 use crate::cli::CacheCommand;
 use crate::commands::ShokaContext;
 use crate::config::ShokaConfig;
+use crate::gh;
 use crate::git_status;
 use crate::state::{Repo, Shelf};
 use teravars::Engine;
@@ -77,11 +78,28 @@ async fn refresh(
     let mut skipped_threshold = 0;
     let mut skipped_filter = 0;
     let mut capture_errors = 0;
+    let mut gh_errors = 0;
 
     // One Tera engine for the whole walk — clone_path_for renders
     // per repo, and the engine setup cost dominates a sub-ms gix
     // status call on a small repo.
     let mut engine = Engine::new();
+
+    // Build a gh client once if a token is reachable. Missing token
+    // just means gh fields stay None — non-gh capture (gix status)
+    // is unaffected. Token resolution is cheap, but the client
+    // includes an HTTP connection pool we want to share across
+    // repos; pulling it inside the loop would be silly.
+    let gh_client = match gh::resolve_token().await {
+        Some(token) => match gh::build_client(&token) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!(target: "shoka", "gh client init failed: {e:#}");
+                None
+            }
+        },
+        None => None,
+    };
 
     for repo in &shelf.repos {
         if !tags.is_empty() && !has_all_tags(repo, &tags) {
@@ -129,6 +147,32 @@ async fn refresh(
                 capture_errors += 1;
             }
         }
+
+        // gh snapshot: only attempt when a client is available AND
+        // the host is github.com (other hosts would return 404).
+        // Per-call errors are logged but never propagated — a rate-
+        // limited or temporarily-unreachable API shouldn't blank
+        // the dashboard. Phase 2b: serial, because parallelising
+        // the loop while keeping `cache` mutably borrowed is more
+        // restructuring than this PR can absorb; the parallel-fanout
+        // PR can land separately once we collect the rest of the
+        // refresh into a tasks-then-merge shape.
+        if let Some(client) = gh_client.as_ref() {
+            if repo.host == "github.com" {
+                match gh::capture_snapshot(client, &repo.owner, &repo.name).await {
+                    Ok(snap) => entry.gh = Some(snap),
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "shoka",
+                            "gh snapshot failed for {}: {e:#}",
+                            repo.slug()
+                        );
+                        gh_errors += 1;
+                    }
+                }
+            }
+        }
+
         entry.last_refreshed = Some(now);
         refreshed += 1;
     }
@@ -141,7 +185,7 @@ async fn refresh(
         // SHOKA_LOG for users who want to peek at refresh history.
         tracing::info!(
             target: "shoka",
-            "background cache refresh: {refreshed} updated, {skipped_threshold} fresh, {skipped_filter} filtered, {capture_errors} capture errors ({} on shelf)",
+            "background cache refresh: {refreshed} updated, {skipped_threshold} fresh, {skipped_filter} filtered, {capture_errors} capture errors, {gh_errors} gh errors ({} on shelf)",
             shelf.len()
         );
     } else {
@@ -173,6 +217,19 @@ async fn refresh(
                 "  {} {} capture errors (previous snapshot kept; see SHOKA_LOG=warn)",
                 "!".red(),
                 capture_errors
+            );
+        }
+        if gh_errors > 0 {
+            println!(
+                "  {} {} gh API errors (rate limit / 404? previous snapshot kept)",
+                "!".red(),
+                gh_errors
+            );
+        }
+        if gh_client.is_none() {
+            println!(
+                "  {} no GITHUB_TOKEN / gh CLI — PR + CI columns will stay empty",
+                "↩".dimmed()
             );
         }
     }
