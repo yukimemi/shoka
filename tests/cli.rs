@@ -61,6 +61,20 @@ background_refresh = false
     (cmd, tmp)
 }
 
+/// Write a minimal `state.toml` describing the given `(host, owner, name)`
+/// triples to the test's state dir. Useful for tests that want a
+/// pre-populated shelf without running `shoka clone` / `import` first.
+fn seed_shelf(state_dir: &Path, repos: &[(&str, &str, &str)]) {
+    std::fs::create_dir_all(state_dir).unwrap();
+    let mut body = String::from("version = 1\n");
+    for (host, owner, name) in repos {
+        body.push_str(&format!(
+            "\n[[repos]]\nhost = \"{host}\"\nowner = \"{owner}\"\nname = \"{name}\"\n"
+        ));
+    }
+    std::fs::write(state_dir.join("state.toml"), body).expect("write state.toml");
+}
+
 /// Initialise a minimal git repo at `dir` and stamp a `remote.origin`
 /// pointing at `url`. Sidesteps gix's higher-level remote-config API
 /// (which would require a working tree commit + writing back via
@@ -197,6 +211,124 @@ fn clone_refuses_to_overwrite_a_non_empty_destination() {
     assert!(
         stderr.contains("already exists") || stderr.contains("not empty"),
         "expected occupied-dest error in stderr, got: {stderr}"
+    );
+}
+
+#[test]
+fn cd_with_empty_shelf_errors_cleanly() {
+    let (mut cmd, _tmp) = cmd_with_isolated_config();
+    let assertion = cmd.args(["cd", "anything"]).assert().failure();
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("shelf is empty"),
+        "expected empty-shelf hint in stderr, got: {stderr}"
+    );
+}
+
+#[test]
+fn cd_no_matching_hint_errors_cleanly() {
+    let (mut cmd, tmp) = cmd_with_isolated_config();
+    seed_shelf(
+        &tmp.path().join("state"),
+        &[("github.com", "yukimemi", "shoka")],
+    );
+    let assertion = cmd.args(["cd", "no-such-repo"]).assert().failure();
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("no repos on the shelf match"),
+        "expected no-match error in stderr, got: {stderr}"
+    );
+}
+
+#[test]
+fn cd_unique_hint_prints_path_to_stdout() {
+    // The cd output contract: stdout is exactly the resolved path, so
+    // the shell wrapper's `cd "$(shoka cd $args)"` actually lands in
+    // the right place. Anything chatty (banners, slugs) belongs on
+    // stderr or not at all.
+    let (mut cmd, tmp) = cmd_with_isolated_config();
+    seed_shelf(
+        &tmp.path().join("state"),
+        &[("github.com", "yukimemi", "shoka")],
+    );
+    // The ghq layout puts the clone under `<root>/github.com/yukimemi/shoka`.
+    // Create that directory so the existence check passes.
+    let expected = tmp
+        .path()
+        .join("root")
+        .join("github.com")
+        .join("yukimemi")
+        .join("shoka");
+    std::fs::create_dir_all(&expected).unwrap();
+
+    let assertion = cmd.args(["cd", "shoka"]).assert().success();
+    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout)
+        .trim_end()
+        .to_string();
+    // Compare as canonical paths so trailing slashes / case differences
+    // on Windows don't trip the assertion.
+    assert_eq!(
+        std::fs::canonicalize(&stdout).unwrap(),
+        std::fs::canonicalize(&expected).unwrap(),
+        "stdout should be the resolved path"
+    );
+}
+
+#[test]
+fn cd_writes_path_to_sidechannel_when_env_var_is_set() {
+    // The shell wrapper sets SHOKA_CD_OUT to a temp file and reads
+    // the path from there, so `inquire`'s stdout-writing prompt UI
+    // doesn't get captured by the wrapper's command substitution.
+    // Verify the sidechannel actually works: with the env var set,
+    // stdout must stay empty and the path lands in the named file.
+    let (mut cmd, tmp) = cmd_with_isolated_config();
+    seed_shelf(
+        &tmp.path().join("state"),
+        &[("github.com", "yukimemi", "shoka")],
+    );
+    let expected = tmp
+        .path()
+        .join("root")
+        .join("github.com")
+        .join("yukimemi")
+        .join("shoka");
+    std::fs::create_dir_all(&expected).unwrap();
+    let out_file = tmp.path().join("cd-out");
+
+    let assertion = cmd
+        .env("SHOKA_CD_OUT", &out_file)
+        .args(["cd", "shoka"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).to_string();
+    assert!(
+        stdout.is_empty(),
+        "stdout should be empty when SHOKA_CD_OUT is set, got: {stdout:?}"
+    );
+    let from_file = std::fs::read_to_string(&out_file).expect("sidechannel file written");
+    assert_eq!(
+        std::fs::canonicalize(from_file.trim()).unwrap(),
+        std::fs::canonicalize(&expected).unwrap(),
+        "sidechannel should hold the resolved path"
+    );
+}
+
+#[test]
+fn cd_unknown_on_disk_path_errors_cleanly() {
+    // Stale shelf entry: the repo is listed, but its clone path
+    // doesn't actually exist on disk. cd must surface that as a
+    // shoka error (not let the shell discover it with a confusing
+    // `cd: No such file`).
+    let (mut cmd, tmp) = cmd_with_isolated_config();
+    seed_shelf(
+        &tmp.path().join("state"),
+        &[("github.com", "yukimemi", "ghost-repo")],
+    );
+    let assertion = cmd.args(["cd", "ghost-repo"]).assert().failure();
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("doesn't exist"),
+        "expected stale-entry hint in stderr, got: {stderr}"
     );
 }
 
