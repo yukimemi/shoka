@@ -167,32 +167,44 @@ pub struct CompiledRoute {
 }
 
 /// Compiled form of a [`Route::pattern`].
+///
+/// Both `host:` variants store a pre-joined string so [`matches`] is
+/// allocation-free in the hot path. The shared "prefix-with-`/`-or-equal"
+/// matcher is hoisted into [`prefix_or_exact_match`] so the two
+/// variants share a single byte-level boundary check.
+///
+/// [`matches`]: PatternKind::matches
 #[derive(Debug, Clone)]
 pub enum PatternKind {
     /// `host:<host>` — matches spec when it equals `<host>` or starts
     /// with `<host>/`.
     HostExact(String),
-    /// `host:<host>/<owner>` — matches when spec equals
-    /// `<host>/<owner>` or starts with `<host>/<owner>/`.
-    HostOwner { host: String, owner: String },
+    /// `host:<host>/<owner>` — stored pre-joined as `<host>/<owner>`
+    /// so matching is allocation-free.
+    HostOwner(String),
     /// `/<regex>/` — full regex match against the spec.
     Regex(Regex),
 }
 
 impl PatternKind {
     /// Test the pattern against a `host/owner/name` (or `host/owner`,
-    /// or just `host`) spec.
+    /// or just `host`) spec. Hot path: no allocations.
     pub fn matches(&self, spec: &str) -> bool {
         match self {
-            PatternKind::HostExact(h) => spec == h || spec.starts_with(&format!("{h}/")),
-            PatternKind::HostOwner { host, owner } => {
-                let exact = format!("{host}/{owner}");
-                let prefix = format!("{exact}/");
-                spec == exact || spec.starts_with(&prefix)
-            }
+            PatternKind::HostExact(h) | PatternKind::HostOwner(h) => prefix_or_exact_match(spec, h),
             PatternKind::Regex(re) => re.is_match(spec),
         }
     }
+}
+
+/// Returns `true` when `spec` either equals `prefix` or starts with
+/// `prefix` followed by a `/` segment boundary. Byte-indexed so it
+/// allocates nothing.
+fn prefix_or_exact_match(spec: &str, prefix: &str) -> bool {
+    spec == prefix
+        || (spec.len() > prefix.len()
+            && spec.as_bytes().get(prefix.len()) == Some(&b'/')
+            && spec.starts_with(prefix))
 }
 
 /// Parse a [`Route::pattern`] string into a [`PatternKind`].
@@ -215,15 +227,23 @@ pub fn compile_pattern(s: &str) -> Result<PatternKind> {
                      for deeper matches use `/<regex>/`: `{s}`"
                 );
             }
-            return Ok(PatternKind::HostOwner {
-                host: host.to_string(),
-                owner: owner.to_string(),
-            });
+            // Pre-join so the matcher's hot path stays allocation-free.
+            return Ok(PatternKind::HostOwner(format!("{host}/{owner}")));
         }
         return Ok(PatternKind::HostExact(rest.to_string()));
     }
     if s.len() >= 2 && s.starts_with('/') && s.ends_with('/') {
         let body = &s[1..s.len() - 1];
+        if body.is_empty() {
+            // `//` would compile to a regex matching every spec — a
+            // very effective unintentional catch-all. Force the user
+            // to be explicit (write the actual catch-all `/.*/` or
+            // drop the route entirely).
+            bail!(
+                "empty regex pattern `//` would match every repo spec; \
+                 write `/.*/` if a catch-all is intended, or remove the route"
+            );
+        }
         let re = Regex::new(body).with_context(|| format!("compiling regex pattern `{s}`"))?;
         return Ok(PatternKind::Regex(re));
     }
@@ -805,6 +825,7 @@ root = "{{ vars.repo_root }}"
             "host:foo/",        // empty owner
             "host:/bar",        // empty host
             "/",                // just one slash
+            "//",               // empty regex body — would catch-all
             "host:foo/bar/baz", // deeper than owner — must use regex
         ] {
             assert!(
@@ -812,6 +833,15 @@ root = "{{ vars.repo_root }}"
                 "pattern `{bad}` should fail to compile"
             );
         }
+    }
+
+    #[test]
+    fn compile_pattern_explicit_catchall_regex_works() {
+        // Empty `//` is rejected, but the explicit `/.*/` catch-all
+        // is accepted and matches everything.
+        let p = compile_pattern("/.*/").unwrap();
+        assert!(p.matches("github.com/foo/bar"));
+        assert!(p.matches(""));
     }
 
     #[test]
