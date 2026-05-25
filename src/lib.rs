@@ -6,5 +6,6 @@ pub mod commands;
 pub mod config;
 pub mod gh;
 pub mod paths;
+pub mod remote;
 pub mod state;
 pub mod vcs;

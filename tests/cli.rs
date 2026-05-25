@@ -6,42 +6,76 @@
 //! fixtures under [`tempfile::TempDir`] so the user's real
 //! `$XDG_CONFIG_HOME/shoka` is never touched.
 //!
-//! Background: shoka's bg-refresh wiring (`commands::dispatch`)
-//! spawns `shoka cache refresh --background` as a detached child
-//! after most commands. To keep these tests fast and hermetic we
-//! point `$SHOKA_CONFIG` at a temp file with
-//! `background_refresh = false` so the bg spawn short-circuits.
+//! Hermeticity comes from three env-var overrides set by
+//! [`cmd_with_isolated_config`]:
+//!
+//! - `SHOKA_CONFIG` — points at a tempdir config with
+//!   `background_refresh = false` so the bg-refresh spawn short-
+//!   circuits and tests stay fast.
+//! - `SHOKA_STATE_DIR` — redirects `state.toml` into the tempdir so
+//!   `clone` / `import` don't pollute the real OS data directory.
+//! - `SHOKA_CACHE_DIR` — same idea, for `cache.toml`.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
 use tempfile::TempDir;
 
-/// Build an `assert_cmd::Command` pre-seeded with `SHOKA_CONFIG`
-/// pointing at a hermetic config that disables background refresh.
-/// Returns the command + the tempdir guard (drop to clean up).
+/// Build an `assert_cmd::Command` pre-seeded with a hermetic config
+/// plus state / cache dirs under a fresh [`TempDir`]. The returned
+/// tempdir's `path()` is also the clone root, so callers can assert
+/// on cloned-into paths directly.
 fn cmd_with_isolated_config() -> (Command, TempDir) {
     let tmp = TempDir::new().expect("temp dir");
     let cfg = tmp.path().join("config.toml");
+    let root = tmp.path().join("root");
+    std::fs::create_dir_all(&root).expect("mkdir root");
+    let state_dir = tmp.path().join("state");
+    std::fs::create_dir_all(&state_dir).expect("mkdir state");
+    let cache_dir = tmp.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).expect("mkdir cache");
+
     let mut f = std::fs::File::create(&cfg).expect("write config.toml");
-    f.write_all(
-        br#"
+    write!(
+        f,
+        r#"
 [global]
-root = "/tmp/shoka-it-root"
+root = "{root}"
 
 [global.cache]
 background_refresh = false
 "#,
+        // TOML strings need backslashes escaped on Windows paths.
+        root = root.display().to_string().replace('\\', "\\\\"),
     )
     .expect("write config body");
 
     let mut cmd = Command::cargo_bin("shoka").expect("binary built");
     cmd.env("SHOKA_CONFIG", &cfg)
+        .env("SHOKA_STATE_DIR", &state_dir)
+        .env("SHOKA_CACHE_DIR", &cache_dir)
         // Strip any inherited profile so the test exercises the
         // default code path regardless of the dev's environment.
         .env_remove("SHOKA_PROFILE");
     (cmd, tmp)
+}
+
+/// Initialise a minimal git repo at `dir` and stamp a `remote.origin`
+/// pointing at `url`. Sidesteps gix's higher-level remote-config API
+/// (which would require a working tree commit + writing back via
+/// `config_snapshot_mut().commit()`); for the import scan we only
+/// need the `[remote "origin"] url = ...` lines to be present in
+/// `.git/config`, so we append them after init.
+fn init_git_repo_with_remote(dir: &Path, url: &str) {
+    std::fs::create_dir_all(dir).unwrap();
+    gix::init(dir).expect("gix init");
+    let cfg = dir.join(".git").join("config");
+    let mut body = std::fs::read_to_string(&cfg).expect("read .git/config");
+    body.push_str(&format!(
+        "\n[remote \"origin\"]\n\turl = {url}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n"
+    ));
+    std::fs::write(&cfg, body).expect("write .git/config");
 }
 
 #[test]
@@ -51,8 +85,6 @@ fn import_nonexistent_path_errors_cleanly() {
         .args(["import", "/definitely/not/a/real/path/shoka-it"])
         .assert()
         .failure();
-    // The error wording is part of the user-visible contract: when
-    // the path doesn't exist or isn't a directory, we say so.
     let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).to_string();
     assert!(
         stderr.contains("not a directory"),
@@ -78,9 +110,6 @@ fn import_regular_file_path_errors_cleanly() {
 
 #[test]
 fn import_empty_dir_succeeds_with_zero_imported_summary() {
-    // Walking an empty directory should succeed cleanly with a
-    // zero-imported summary — not error out. Guards against an
-    // overly-strict "must find at least one repo" check creeping in.
     let (mut cmd, tmp) = cmd_with_isolated_config();
     let empty = tmp.path().join("empty");
     std::fs::create_dir_all(&empty).unwrap();
@@ -92,6 +121,82 @@ fn import_empty_dir_succeeds_with_zero_imported_summary() {
     assert!(
         stdout.contains("0 imported"),
         "expected '0 imported' in stdout, got: {stdout}"
+    );
+}
+
+#[test]
+fn import_finds_repos_and_records_them_on_shelf() {
+    // Deferred from PR #16 (CodeRabbit): exercise the success path
+    // — a real `.git/config` with a parseable remote URL is found,
+    // parsed, and ends up on the shelf.
+    let (mut cmd, tmp) = cmd_with_isolated_config();
+    let source = tmp.path().join("source");
+    init_git_repo_with_remote(
+        &source.join("foo-proj"),
+        "https://github.com/yukimemi/foo-proj.git",
+    );
+    init_git_repo_with_remote(
+        &source.join("nested").join("bar-tool"),
+        "git@github.com:other-owner/bar-tool.git",
+    );
+
+    let assertion = cmd
+        .args(["import", source.to_str().unwrap()])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).to_string();
+    assert!(
+        stdout.contains("2 imported"),
+        "expected '2 imported' in stdout, got: {stdout}"
+    );
+
+    // Verify the shelf got both entries — read state.toml directly so
+    // we catch issues with the on-disk format, not just the in-memory
+    // summary.
+    let state = tmp.path().join("state").join("state.toml");
+    let body = std::fs::read_to_string(&state).expect("state.toml exists");
+    assert!(body.contains("\"yukimemi\""), "missing first owner: {body}");
+    assert!(body.contains("\"foo-proj\""), "missing first name: {body}");
+    assert!(
+        body.contains("\"other-owner\""),
+        "missing second owner: {body}"
+    );
+    assert!(body.contains("\"bar-tool\""), "missing second name: {body}");
+}
+
+#[test]
+fn clone_with_invalid_input_errors_cleanly() {
+    // Single-token input has no shape we accept (not a URL, not an
+    // `owner/name` shorthand). Should surface a clear error before
+    // any network IO.
+    let (mut cmd, _tmp) = cmd_with_isolated_config();
+    let assertion = cmd.args(["clone", "justaname"]).assert().failure();
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("neither a URL"),
+        "expected shape error in stderr, got: {stderr}"
+    );
+}
+
+#[test]
+fn clone_refuses_to_overwrite_a_non_empty_destination() {
+    // Pre-populate the destination path that `clone foo/bar` would
+    // pick. Clone must refuse to clobber it, before any network IO.
+    let (mut cmd, tmp) = cmd_with_isolated_config();
+    let dest = tmp
+        .path()
+        .join("root")
+        .join("github.com")
+        .join("foo")
+        .join("bar");
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::write(dest.join("leftover.txt"), "I was here first\n").unwrap();
+
+    let assertion = cmd.args(["clone", "foo/bar"]).assert().failure();
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("already exists") || stderr.contains("not empty"),
+        "expected occupied-dest error in stderr, got: {stderr}"
     );
 }
 
