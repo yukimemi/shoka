@@ -10,10 +10,9 @@
 //! `ahead` / `behind` / `dirty` glyphs without paying a fresh
 //! `git status` per repo.
 
-use std::collections::HashSet;
-
 use anyhow::Result;
 use owo_colors::OwoColorize;
+use teravars::Engine;
 
 use crate::cli::ListArgs;
 use crate::commands::ShokaContext;
@@ -34,7 +33,12 @@ pub async fn run(ctx: &ShokaContext, args: ListArgs) -> Result<()> {
         return Ok(());
     }
 
-    let filtered = filter_repos(&shelf, &resolved, &args)?;
+    // One Engine per `list` invocation — clone_path_for renders the
+    // layout template for every shown repo, and Engine construction
+    // is the heavy bit (Tera setup).
+    let mut engine = Engine::new();
+
+    let filtered = filter_repos(&shelf, &resolved, &args, &mut engine)?;
     if filtered.is_empty() {
         println!(
             "{} matched the filters ({} on the shelf total)",
@@ -45,7 +49,7 @@ pub async fn run(ctx: &ShokaContext, args: ListArgs) -> Result<()> {
     }
 
     for repo in &filtered {
-        print_repo(repo, &resolved)?;
+        print_repo(repo, &resolved, &mut engine)?;
     }
     if filtered.len() < shelf.len() {
         println!();
@@ -70,16 +74,16 @@ fn filter_repos<'s>(
     shelf: &'s Shelf,
     resolved: &ResolvedConfig,
     args: &ListArgs,
+    engine: &mut Engine,
 ) -> Result<Vec<&'s Repo>> {
-    let wanted_tags: HashSet<&str> = args.tags.iter().map(String::as_str).collect();
     let mut out = Vec::with_capacity(shelf.len());
 
     for repo in &shelf.repos {
-        if !wanted_tags.is_empty() && !has_all_tags(repo, &wanted_tags) {
+        if !args.tags.is_empty() && !has_all_tags(repo, &args.tags) {
             continue;
         }
         if args.has_agents {
-            let path = resolved.clone_path_for(repo)?;
+            let path = resolved.clone_path_for(repo, engine)?;
             if !path.join("AGENTS.md").exists() {
                 continue;
             }
@@ -89,17 +93,23 @@ fn filter_repos<'s>(
     Ok(out)
 }
 
-fn has_all_tags(repo: &Repo, wanted: &HashSet<&str>) -> bool {
-    let owned: HashSet<&str> = repo.tags.iter().map(String::as_str).collect();
-    wanted.is_subset(&owned)
+/// AND-semantics tag check.
+///
+/// Inlined iteration rather than `HashSet`-on-`HashSet`: per-repo
+/// tag counts are tiny (typically <10), so the constant factor of a
+/// hash beats the asymptotic improvement. Avoids the per-call
+/// `HashSet` allocation on every shelf entry — relevant once
+/// `shoka list` runs over hundreds of repos.
+fn has_all_tags(repo: &Repo, wanted: &[String]) -> bool {
+    wanted.iter().all(|w| repo.tags.iter().any(|t| t == w))
 }
 
 /// Render one repo as a slug headline + indented metadata lines.
 /// Quiet by design: only metadata that's set gets a line — we don't
 /// pad empty fields with placeholders.
-fn print_repo(repo: &Repo, resolved: &ResolvedConfig) -> Result<()> {
+fn print_repo(repo: &Repo, resolved: &ResolvedConfig, engine: &mut Engine) -> Result<()> {
     println!("{}", repo.slug().bold());
-    let path = resolved.clone_path_for(repo)?;
+    let path = resolved.clone_path_for(repo, engine)?;
     println!("  {} {}", "path :".dimmed(), path.display());
     if !repo.tags.is_empty() {
         println!("  {} {}", "tags :".dimmed(), repo.tags.join(" "));
@@ -136,7 +146,7 @@ mod tests {
     fn clone_path_for_default_layout_is_ghq_shaped() {
         let r = resolved_default_layout();
         let repo = Repo::new("github.com", "yukimemi", "shoka");
-        let p = r.clone_path_for(&repo).unwrap();
+        let p = r.clone_path_for_one(&repo).unwrap();
         // expand_home absolutises /r → drive-relative on Windows, kept
         // absolute on Unix. Check shape rather than exact equality.
         assert!(p.is_absolute(), "expected absolute, got {p:?}");
@@ -165,7 +175,7 @@ mod tests {
         };
         let resolved = cfg.resolve(None).expect("resolve");
         let p = resolved
-            .clone_path_for(&Repo::new("github.com", "foo", "bar"))
+            .clone_path_for_one(&Repo::new("github.com", "foo", "bar"))
             .unwrap();
         let s = p.to_string_lossy().replace('\\', "/");
         assert!(
@@ -185,7 +195,7 @@ mod tests {
         // someone writes `layout = ".../{{ vcs }}/..."` for whatever
         // reason — the helper must thread the per-repo override
         // through the Tera context.
-        let p = r.clone_path_for(&repo).unwrap();
+        let p = r.clone_path_for_one(&repo).unwrap();
         assert!(p.is_absolute());
     }
 
@@ -193,17 +203,18 @@ mod tests {
     fn has_all_tags_is_and_semantics() {
         let mut repo = Repo::new("github.com", "u", "n");
         repo.tags = vec!["rust".into(), "cli".into()];
-        let want_both: HashSet<&str> = ["rust", "cli"].into_iter().collect();
-        assert!(has_all_tags(&repo, &want_both));
-        let want_extra: HashSet<&str> = ["rust", "cli", "tui"].into_iter().collect();
-        assert!(!has_all_tags(&repo, &want_extra));
-        let want_one: HashSet<&str> = ["rust"].into_iter().collect();
-        assert!(has_all_tags(&repo, &want_one));
-        let want_none: HashSet<&str> = HashSet::new();
-        // Empty filter trivially matches (subset of any set) — caller
-        // is expected to short-circuit on empty rather than rely on
-        // this, but the predicate stays well-defined.
-        assert!(has_all_tags(&repo, &want_none));
+        let both: Vec<String> = vec!["rust".into(), "cli".into()];
+        assert!(has_all_tags(&repo, &both));
+        let extra: Vec<String> = vec!["rust".into(), "cli".into(), "tui".into()];
+        assert!(!has_all_tags(&repo, &extra));
+        let one: Vec<String> = vec!["rust".into()];
+        assert!(has_all_tags(&repo, &one));
+        // Empty filter trivially matches (`all` over an empty iter
+        // is `true`) — caller is expected to short-circuit on empty
+        // rather than rely on this, but the predicate stays
+        // well-defined.
+        let none: Vec<String> = vec![];
+        assert!(has_all_tags(&repo, &none));
     }
 
     #[test]
@@ -220,6 +231,7 @@ mod tests {
         shelf.add(c).unwrap();
 
         let r = resolved_default_layout();
+        let mut engine = Engine::new();
         let filtered = filter_repos(
             &shelf,
             &r,
@@ -227,6 +239,7 @@ mod tests {
                 tags: vec!["rust".into()],
                 has_agents: false,
             },
+            &mut engine,
         )
         .unwrap();
         assert_eq!(filtered.len(), 2);
@@ -240,6 +253,7 @@ mod tests {
                 tags: vec!["rust".into(), "cli".into()],
                 has_agents: false,
             },
+            &mut engine,
         )
         .unwrap();
         assert_eq!(filtered.len(), 1);
@@ -278,6 +292,7 @@ mod tests {
             .unwrap();
         shelf.add(Repo::new("github.com", "u", "plain")).unwrap();
 
+        let mut engine = Engine::new();
         let filtered = filter_repos(
             &shelf,
             &resolved,
@@ -285,6 +300,7 @@ mod tests {
                 tags: vec![],
                 has_agents: true,
             },
+            &mut engine,
         )
         .unwrap();
         assert_eq!(filtered.len(), 1);

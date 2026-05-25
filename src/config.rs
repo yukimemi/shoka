@@ -560,8 +560,20 @@ impl ResolvedConfig {
     /// owns the destination context — same repo can land in different
     /// paths under different routes / profiles, and the layout
     /// template is itself a config-level concern.
-    pub fn clone_path_for(&self, repo: &crate::state::Repo) -> Result<PathBuf> {
-        use teravars::{Context, Engine};
+    /// Render the on-disk clone path for `repo`.
+    ///
+    /// The caller owns the [`Engine`] so multi-repo loops (e.g.
+    /// `shoka list`) can construct it once and reuse it across the
+    /// whole shelf rather than paying the Tera-setup cost per repo.
+    /// For one-off callers the convenience wrapper
+    /// [`clone_path_for_one`](Self::clone_path_for_one) builds and
+    /// discards a fresh engine.
+    pub fn clone_path_for(
+        &self,
+        repo: &crate::state::Repo,
+        engine: &mut teravars::Engine,
+    ) -> Result<PathBuf> {
+        use teravars::Context;
 
         let spec = format!("{}/{}/{}", repo.host, repo.owner, repo.name);
         let target = self.resolve_target(&spec);
@@ -580,18 +592,41 @@ impl ResolvedConfig {
             "profile",
             &self.active_profile.as_deref().unwrap_or("default"),
         );
-        ctx.insert("vcs", &format!("{vcs:?}").to_lowercase());
-        ctx.insert(
-            "protocol",
-            &format!("{:?}", target.default_protocol).to_lowercase(),
-        );
+        // Avoid `format!("{:?}").to_lowercase()` per render: stable
+        // wire names are part of the schema, so a match on the enum
+        // gives us a &'static str at zero alloc cost.
+        ctx.insert("vcs", vcs_str(vcs));
+        ctx.insert("protocol", protocol_str(target.default_protocol));
 
-        let mut engine = Engine::new();
         let rendered = engine
             .render(&target.layout, &ctx)
             .with_context(|| format!("rendering layout `{}` for {spec}", target.layout))?;
 
         Ok(PathBuf::from(rendered))
+    }
+
+    /// Convenience wrapper for callers that resolve exactly one
+    /// repo path — builds a single-use [`Engine`] under the hood.
+    /// Multi-repo callers should use [`clone_path_for`](Self::clone_path_for)
+    /// with their own reusable engine.
+    pub fn clone_path_for_one(&self, repo: &crate::state::Repo) -> Result<PathBuf> {
+        let mut engine = teravars::Engine::new();
+        self.clone_path_for(repo, &mut engine)
+    }
+}
+
+fn vcs_str(v: VcsDefault) -> &'static str {
+    match v {
+        VcsDefault::Auto => "auto",
+        VcsDefault::Git => "git",
+        VcsDefault::Jj => "jj",
+    }
+}
+
+fn protocol_str(p: Protocol) -> &'static str {
+    match p {
+        Protocol::Https => "https",
+        Protocol::Ssh => "ssh",
     }
 }
 
