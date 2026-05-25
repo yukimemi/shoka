@@ -123,15 +123,9 @@ pub async fn run(ctx: &ShokaContext) -> Result<()> {
     // — render what we can, surface load errors inline, don't bail.
     println!();
     println!("{}", "cache".underline());
-    println!(
-        "  threshold        : {}s",
-        r.raw.global.cache.refresh_threshold_secs
-    );
-    println!(
-        "  background_refresh: {}",
-        r.raw.global.cache.background_refresh
-    );
-    println!("  parallel_repos   : {}", r.raw.global.cache.parallel_repos);
+    println!("  threshold        : {}s", r.cache.refresh_threshold_secs);
+    println!("  background_refresh: {}", r.cache.background_refresh);
+    println!("  parallel_repos   : {}", r.cache.parallel_repos);
     match Cache::load(p) {
         Ok(c) if c.is_empty() => println!(
             "  {} (run `shoka cache refresh` to populate)",

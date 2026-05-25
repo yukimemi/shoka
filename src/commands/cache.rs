@@ -21,7 +21,7 @@ use owo_colors::OwoColorize;
 use crate::cache::{Cache, current_unix_secs};
 use crate::cli::CacheCommand;
 use crate::commands::ShokaContext;
-use crate::config::{ResolvedConfig, ShokaConfig};
+use crate::config::ShokaConfig;
 use crate::state::{Repo, Shelf};
 
 pub async fn dispatch(ctx: &ShokaContext, cmd: CacheCommand) -> Result<()> {
@@ -39,7 +39,7 @@ async fn refresh(ctx: &ShokaContext, force: bool, tags: Vec<String>) -> Result<(
     let mut cache = Cache::load(&ctx.paths)?;
 
     let now = current_unix_secs();
-    let threshold = resolved.cache_threshold_secs();
+    let threshold = resolved.cache.refresh_threshold_secs;
 
     let mut refreshed = 0;
     let mut skipped_threshold = 0;
@@ -107,21 +107,6 @@ async fn clear(ctx: &ShokaContext) -> Result<()> {
 
 fn has_all_tags(repo: &Repo, wanted: &[String]) -> bool {
     wanted.iter().all(|w| repo.tags.iter().any(|t| t == w))
-}
-
-/// Convenience extension on [`ResolvedConfig`] so callers in this
-/// module don't have to drill through `raw.global.cache.…` every
-/// time. Lives here rather than on `ResolvedConfig` itself because
-/// it's only the cache module that cares — keeps the public surface
-/// of config.rs from accreting one-shot helpers.
-trait CacheView {
-    fn cache_threshold_secs(&self) -> u64;
-}
-
-impl CacheView for ResolvedConfig {
-    fn cache_threshold_secs(&self) -> u64 {
-        self.raw.global.cache.refresh_threshold_secs
-    }
 }
 
 #[cfg(test)]

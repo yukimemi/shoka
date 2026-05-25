@@ -338,6 +338,10 @@ pub struct ResolvedConfig {
     pub exec_concurrency: usize,
     pub ui: UiConfig,
     pub shell: ShellConfig,
+    /// Resolved `[global.cache]`. `parallel_repos` is floored at 1
+    /// here so the upcoming JoinSet-based refresh can't be handed a
+    /// zero-sized pool (which would deadlock).
+    pub cache: CacheConfig,
     /// Routes compiled at `resolve()` time so per-clone matching
     /// doesn't pay a regex-build cost. Order is preserved from the
     /// source config (first match wins).
@@ -507,6 +511,13 @@ impl ShokaConfig {
             exec_concurrency: prof.exec_concurrency.unwrap_or(g.exec_concurrency).max(1),
             ui: g.ui.clone(),
             shell: g.shell.clone(),
+            // Mirror the exec_concurrency reasoning: a configured
+            // `parallel_repos = 0` would otherwise hand a zero-sized
+            // pool to the background-refresh JoinSet. Floor at 1.
+            cache: CacheConfig {
+                parallel_repos: g.cache.parallel_repos.max(1),
+                ..g.cache.clone()
+            },
             routes,
             git_config: prof.git_config.clone(),
             active_profile,
