@@ -80,14 +80,27 @@ pub async fn run(ctx: &ShokaContext, args: ImportArgs) -> Result<()> {
         match extract_repo(repo_root) {
             Ok(Some(repo)) => {
                 let slug = repo.slug();
-                match shelf.add(repo) {
-                    Ok(()) => {
-                        println!("  {} {slug}", "+".green());
-                        imported += 1;
-                    }
-                    Err(_) => {
-                        // Add failed → triple already on shelf.
-                        skipped_already += 1;
+                // Check existence explicitly rather than catching the
+                // duplicate error from `add`: if `Shelf::add` ever
+                // grows additional validations (invalid characters,
+                // host allow-lists, …), this loop should surface
+                // those as real errors, not silently fold them into
+                // the "already on shelf" counter.
+                if shelf.find(&repo.host, &repo.owner, &repo.name).is_some() {
+                    skipped_already += 1;
+                } else {
+                    match shelf.add(repo) {
+                        Ok(()) => {
+                            println!("  {} {slug}", "+".green());
+                            imported += 1;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "shoka",
+                                "failed to add {slug} to shelf: {e:#}"
+                            );
+                            errors += 1;
+                        }
                     }
                 }
             }
