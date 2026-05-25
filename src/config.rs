@@ -474,21 +474,33 @@ impl ShokaConfig {
 impl ResolvedConfig {
     /// Resolve the clone destination for a `host/owner/name` spec.
     ///
-    /// Precedence (matches the documented design):
+    /// The clone-routing rule is "profile owns this clone fully, or
+    /// not at all":
     ///
-    /// 1. **Active profile's `root`** — if the resolved profile set
-    ///    its own `root`, routes are skipped entirely. The user
-    ///    picked the profile explicitly (CLI / env / default), so
-    ///    that intent wins over auto-routing.
-    /// 2. **First matching `[[routes]]` entry** — iterated in source
-    ///    order; the matched route's `root` / `layout` / `default_vcs`
-    ///    / `default_protocol` overrides take effect (with any fields
-    ///    the route leaves `None` falling through to the resolved
-    ///    `[global]` value).
-    /// 3. **Global fallback** — if no route matches, the resolved
-    ///    `[global]` values apply unchanged.
+    /// 1. **Active profile's `root` is set** → profile claims the
+    ///    clone. All profile-overlaid values apply (`self.root`,
+    ///    `self.layout`, `self.default_vcs`, `self.default_protocol`)
+    ///    and routes are skipped entirely. The user picked the
+    ///    profile explicitly (CLI / env / default), so that intent
+    ///    wins over auto-routing.
+    /// 2. **Active profile didn't pin a `root`** → profile bows out
+    ///    of clone routing. Routes are evaluated against the raw
+    ///    `[global]` baseline; an unset route field falls through to
+    ///    the corresponding `[global]` value (NOT the profile's
+    ///    value — those don't bleed into routes when the profile
+    ///    isn't claiming the clone). First matching route wins.
+    /// 3. **No route matches** → raw `[global]` values, same baseline
+    ///    as the route branch would have used. Consistent with #2:
+    ///    once profile.root isn't pinned, profile values stay out of
+    ///    clone routing.
+    ///
+    /// Profile fields like `git_config` / `exec_concurrency` are
+    /// unaffected — those aren't clone-routing concerns and continue
+    /// to apply via [`ResolvedConfig`] for the lifetime of the
+    /// session.
     pub fn resolve_target(&self, spec: &str) -> CloneTarget {
         if self.profile_provided_root {
+            // Case 1: profile claims the clone.
             return CloneTarget {
                 root: self.root.clone(),
                 layout: self.layout.clone(),
@@ -497,6 +509,11 @@ impl ResolvedConfig {
                 matched_route: None,
             };
         }
+        // Profile didn't pin root → use raw [global] as the baseline
+        // so profile-set fields like `default_vcs` don't silently
+        // bleed into route results. `self.root` here equals
+        // `expand_home(global.root)` because !profile_provided_root.
+        let g = &self.raw.global;
         for (idx, route) in self.routes.iter().enumerate() {
             if route.pattern.matches(spec) {
                 return CloneTarget {
@@ -506,22 +523,19 @@ impl ResolvedConfig {
                         .as_deref()
                         .map(expand_home)
                         .unwrap_or_else(|| self.root.clone()),
-                    layout: route
-                        .raw
-                        .layout
-                        .clone()
-                        .unwrap_or_else(|| self.layout.clone()),
-                    default_vcs: route.raw.default_vcs.unwrap_or(self.default_vcs),
-                    default_protocol: route.raw.default_protocol.unwrap_or(self.default_protocol),
+                    layout: route.raw.layout.clone().unwrap_or_else(|| g.layout.clone()),
+                    default_vcs: route.raw.default_vcs.unwrap_or(g.default_vcs),
+                    default_protocol: route.raw.default_protocol.unwrap_or(g.default_protocol),
                     matched_route: Some(idx),
                 };
             }
         }
+        // Case 3: no route — pure [global] baseline.
         CloneTarget {
             root: self.root.clone(),
-            layout: self.layout.clone(),
-            default_vcs: self.default_vcs,
-            default_protocol: self.default_protocol,
+            layout: g.layout.clone(),
+            default_vcs: g.default_vcs,
+            default_protocol: g.default_protocol,
             matched_route: None,
         }
     }
@@ -973,6 +987,46 @@ root = "{{ vars.repo_root }}"
         let t = r.resolve_target("github.com/foo/bar");
         assert_eq!(t.matched_route, Some(0));
         assert!(t.root.ends_with("routed"));
+        // CodeRabbit semantic: profile's default_vcs must NOT bleed
+        // into the route result. Profile bows out of clone routing
+        // once it didn't pin root, so an unset route field falls
+        // through to raw [global], not the profile's value.
+        assert_eq!(
+            t.default_vcs,
+            VcsDefault::Auto,
+            "profile vcs should not leak into routes when profile.root isn't pinned"
+        );
+    }
+
+    #[test]
+    fn resolve_target_no_match_uses_raw_global_not_profile_overlay() {
+        // Same "profile owns clone or stays out" rule applied to the
+        // no-route-match fallback: if profile has fields but no root,
+        // a clone with no matching route still uses raw [global].
+        let cfg = ShokaConfig {
+            global: GlobalConfig {
+                root: Some("/global".into()),
+                default_vcs: VcsDefault::Auto,
+                ..Default::default()
+            },
+            routes: vec![],
+            profiles: BTreeMap::from([(
+                "vcs-only".into(),
+                ProfileConfig {
+                    default_vcs: Some(VcsDefault::Jj),
+                    ..Default::default()
+                },
+            )]),
+        };
+        let r = cfg.resolve(Some("vcs-only")).expect("resolve");
+        let t = r.resolve_target("github.com/foo/bar");
+        assert!(t.matched_route.is_none());
+        assert!(t.root.ends_with("global"));
+        assert_eq!(
+            t.default_vcs,
+            VcsDefault::Auto,
+            "profile.default_vcs must not apply when profile didn't pin a root"
+        );
     }
 
     #[test]
