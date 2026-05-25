@@ -123,11 +123,18 @@ impl Shelf {
 
     /// Lower-level variant used in tests and by `shoka import`.
     pub fn load_from(path: &Path) -> Result<Self> {
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("reading shelf from {}", path.display()))?;
+        // Attempt the read directly rather than `path.exists()` +
+        // `read_to_string`. The two-step variant is a TOCTOU: another
+        // process can delete (or create) the file between the check
+        // and the read; the single read with a `NotFound` match is
+        // both race-free and the idiomatic Rust shape.
+        let raw = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => {
+                return Err(e).with_context(|| format!("reading shelf from {}", path.display()));
+            }
+        };
         let shelf: Shelf =
             toml::from_str(&raw).with_context(|| format!("parsing shelf at {}", path.display()))?;
         if shelf.version > SHELF_VERSION {
@@ -162,17 +169,22 @@ impl Shelf {
         // case is what makes /tmp → /home risky). Windows MoveFileEx
         // with MOVEFILE_REPLACE_EXISTING (which `std::fs::rename`
         // uses) gives the same guarantee within a volume.
-        let tmp = path.with_extension("toml.tmp");
+        //
+        // PID-suffixed tmp filename so concurrent `shoka` invocations
+        // don't trample each other's in-flight writes.
+        let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
         {
             let mut f = std::fs::File::create(&tmp)
                 .with_context(|| format!("creating temp shelf file {}", tmp.display()))?;
             f.write_all(body.as_bytes())
                 .with_context(|| format!("writing temp shelf file {}", tmp.display()))?;
-            // Best-effort fsync. We don't want shoka to block on slow
-            // disks for a rare hardening; if fsync fails (read-only
-            // filesystem etc.) the subsequent rename will surface the
-            // real error.
-            let _ = f.sync_all();
+            // Propagate sync_all failures so we never rename a
+            // partially-flushed file over a known-good state.toml.
+            // The cost is a stalled save on a degraded filesystem,
+            // but that's the right call when the alternative is
+            // silent corruption of the user's shelf ledger.
+            f.sync_all()
+                .with_context(|| format!("syncing temp shelf file {}", tmp.display()))?;
         }
         std::fs::rename(&tmp, path)
             .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
@@ -314,22 +326,29 @@ mod tests {
     #[test]
     fn save_uses_atomic_temp_file() {
         // We don't observe the temp file mid-write (would race), but
-        // we do verify the post-rename state: target exists, the
-        // sibling `.tmp` does NOT (rename consumed it), and the
-        // content is what we wrote.
+        // we do verify the post-rename state: target exists, no
+        // `.tmp` siblings remain (rename consumed our pid-suffixed
+        // temp file), and the content is what we wrote.
         let tmp = TempDir::new().unwrap();
         let target = tmp.path().join("state.toml");
-        let tmp_sibling = tmp.path().join("state.toml.tmp");
 
         let mut shelf = Shelf::default();
         shelf.add(sample_repo("shoka")).unwrap();
         shelf.save_to(&target).unwrap();
 
         assert!(target.exists());
+
+        let leftover_tmp: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("tmp"))
+            .map(|e| e.file_name())
+            .collect();
         assert!(
-            !tmp_sibling.exists(),
-            "temp file should be gone after rename"
+            leftover_tmp.is_empty(),
+            "no .tmp siblings should remain after rename, found: {leftover_tmp:?}"
         );
+
         let body = fs::read_to_string(&target).unwrap();
         assert!(body.contains("\"shoka\""));
     }
