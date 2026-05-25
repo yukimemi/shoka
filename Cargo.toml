@@ -51,6 +51,24 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 owo-colors = "4.3.0"
 regex = "1.12.3"
 
+# In-process git ops. Same feature set as rvpm to avoid the slow
+# `git` CLI subprocess on Windows (process spawn is the dominant
+# cost there). `default-features = false` keeps the dep lean —
+# only the features shoka actually uses get pulled in.
+gix = { version = "0.83", default-features = false, features = [
+    "sha1",
+    "blocking-network-client",
+    "blocking-http-transport-reqwest-rust-tls",
+    "worktree-mutation",
+    "status",
+    "dirwalk",
+    "revision",
+] }
+
+# Recursive directory walking for `shoka import` (find `.git`
+# subdirs in a ghq-style tree).
+walkdir = "2"
+
 # TUI (phase 2 で本格採用、skeleton 段階では未使用)
 # ratatui = "0.30"
 # crossterm = "0.29"
