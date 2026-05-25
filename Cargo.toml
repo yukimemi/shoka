@@ -62,7 +62,7 @@ regex = "1.12.3"
 [target.'cfg(unix)'.dependencies]
 # setsid() for detached background refresh spawn. Tiny crate,
 # unix-only dep so Windows builds don't pull it.
-libc = "0.2"
+libc = "0.2.186"
 
 [dev-dependencies]
 assert_cmd = "2.2.2"
