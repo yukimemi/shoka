@@ -332,6 +332,142 @@ fn cd_unknown_on_disk_path_errors_cleanly() {
     );
 }
 
+#[test]
+fn exec_with_no_command_errors_cleanly() {
+    let (mut cmd, _tmp) = cmd_with_isolated_config();
+    let assertion = cmd.arg("exec").assert().failure();
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("no command"),
+        "expected missing-command error in stderr, got: {stderr}"
+    );
+}
+
+#[test]
+fn exec_with_empty_shelf_errors_cleanly() {
+    let (mut cmd, _tmp) = cmd_with_isolated_config();
+    // assert_cmd interprets the literal `--` so we have to use args()
+    // rather than the std splitting.
+    let assertion = cmd.args(["exec", "--", "true"]).assert().failure();
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("shelf is empty"),
+        "expected empty-shelf hint in stderr, got: {stderr}"
+    );
+}
+
+#[test]
+fn exec_with_filter_flag_errors_with_phase2_pointer() {
+    // `--filter` parses (forward compat) but currently bails — the
+    // status snapshot it would consult lives in the Phase 2 cache
+    // work. The error message has to point at that, so users
+    // understand it's intentional.
+    let (mut cmd, tmp) = cmd_with_isolated_config();
+    seed_shelf(
+        &tmp.path().join("state"),
+        &[("github.com", "yukimemi", "shoka")],
+    );
+    let assertion = cmd
+        .args(["exec", "--filter", "dirty", "--", "true"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("Phase 2"),
+        "expected phase-2 pointer in stderr, got: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn exec_runs_command_in_each_repo_cwd() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (mut cmd, tmp) = cmd_with_isolated_config();
+    seed_shelf(
+        &tmp.path().join("state"),
+        &[
+            ("github.com", "yukimemi", "repo-a"),
+            ("github.com", "yukimemi", "repo-b"),
+        ],
+    );
+    let dir_a = tmp.path().join("root/github.com/yukimemi/repo-a");
+    let dir_b = tmp.path().join("root/github.com/yukimemi/repo-b");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+
+    // Verify cwd handling via `pwd` — universally available on Unix
+    // shells. Each repo's banner should appear in stdout, and each
+    // captured pwd output should be that repo's clone path.
+    let assertion = cmd.args(["exec", "--", "pwd"]).assert().success();
+    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).to_string();
+    assert!(stdout.contains("repo-a"), "missing repo-a banner: {stdout}");
+    assert!(stdout.contains("repo-b"), "missing repo-b banner: {stdout}");
+    // Path output from pwd: at minimum the leaf dir should show up.
+    assert!(
+        stdout.contains("/repo-a") && stdout.contains("/repo-b"),
+        "pwd output missing one of the repo paths: {stdout}"
+    );
+    // Avoid the unused-import warning when the test binary is built
+    // for an OS without the symbol.
+    let _ = std::fs::Permissions::from_mode;
+}
+
+#[cfg(windows)]
+#[test]
+fn exec_runs_command_in_each_repo_cwd_windows() {
+    let (mut cmd, tmp) = cmd_with_isolated_config();
+    seed_shelf(
+        &tmp.path().join("state"),
+        &[
+            ("github.com", "yukimemi", "repo-a"),
+            ("github.com", "yukimemi", "repo-b"),
+        ],
+    );
+    let dir_a = tmp.path().join("root/github.com/yukimemi/repo-a");
+    let dir_b = tmp.path().join("root/github.com/yukimemi/repo-b");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+
+    // `cmd /c cd` prints the current working directory — `chdir` is
+    // an alias and `cd` without args prints. We invoke it via cmd.exe
+    // since `cd` isn't a standalone .exe on Windows.
+    let assertion = cmd
+        .args(["exec", "--", "cmd", "/c", "cd"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).to_string();
+    assert!(stdout.contains("repo-a"), "missing repo-a banner: {stdout}");
+    assert!(stdout.contains("repo-b"), "missing repo-b banner: {stdout}");
+}
+
+#[test]
+fn exec_propagates_failure_exit_code() {
+    let (mut cmd, tmp) = cmd_with_isolated_config();
+    seed_shelf(
+        &tmp.path().join("state"),
+        &[("github.com", "yukimemi", "shoka")],
+    );
+    let dir = tmp.path().join("root/github.com/yukimemi/shoka");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // `cargo --bogus-flag` exits non-zero on every platform that has
+    // cargo (it's in PATH on rust CI runners). Falling back to any
+    // ubiquitously-failing command isn't really portable, so prefer
+    // a tool we know is there. If cargo isn't on PATH this test
+    // would mis-diagnose (spawn-error path), which is at least a
+    // visible failure rather than silent skip.
+    let assertion = cmd
+        .args(["exec", "--", "cargo", "--this-flag-does-not-exist"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("1 of 1 repo(s) failed") || stderr.contains("failed"),
+        "expected per-repo failure summary in stderr, got: {stderr}"
+    );
+}
+
 /// Smoke test that the binary builds, parses args, and exits cleanly
 /// for `--help`. Catches surface-level clap regressions early without
 /// poking at any specific subcommand.
