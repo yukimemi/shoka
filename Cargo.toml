@@ -95,7 +95,7 @@ tempfile = "3.27.0"
 # the actual call is gated on the *target* OS in build.rs, so the
 # crate's presence on non-Windows hosts is harmless.
 [build-dependencies]
-winresource = "0.1"
+winresource = "0.1.31"
 
 [profile.release]
 lto = true
