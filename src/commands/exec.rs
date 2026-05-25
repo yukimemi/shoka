@@ -19,11 +19,17 @@
 //! currently errors out with a pointer to the cache work.
 //!
 //! Output policy: each repo's stdout + stderr are captured into a
-//! single buffer and printed as a banner-headed block when the
-//! process exits. Phase 1 batches like this so parallel output from
-//! many repos doesn't interleave into nonsense; a future
-//! `--stream`-style flag could opt into inherited stdio for
-//! real-time long-running commands.
+//! single buffer (line-interleaved via concurrent reads so the
+//! arrival order survives — see [`interleave_pipes`]) and printed
+//! as a banner-headed block when the process exits. Phase 1
+//! batches like this so parallel output from many repos doesn't
+//! interleave into nonsense; a future `--stream`-style flag could
+//! opt into inherited stdio for real-time long-running commands.
+//!
+//! Child stdin is nulled. Running N processes in parallel that all
+//! want to read the same TTY would race and corrupt the terminal —
+//! the predictable failure (clean EOF) beats a frozen shell
+//! waiting for input the user can't see anyone is asking for.
 //!
 //! Exit code: shoka itself exits non-zero (1) when any repo's
 //! command failed. Individual exit codes are reported per-repo so
@@ -36,6 +42,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use owo_colors::OwoColorize;
 use teravars::Engine;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -172,10 +179,12 @@ fn has_all_tags(repo: &Repo, wanted: &[String]) -> bool {
     wanted.iter().all(|w| repo.tags.iter().any(|t| t == w))
 }
 
-/// Run the command in one repo. Captures combined stdout + stderr —
-/// we don't separate them because the user typically wants to see
-/// the failure context in order, and a separate stream pair would
-/// have to be re-interleaved by line for that to make sense.
+/// Run the command in one repo. Captures stdout + stderr into a
+/// single buffer, preserving arrival order at line granularity by
+/// reading both pipes concurrently via `tokio::select!` — a naive
+/// `stdout ++ stderr` concat (what `Command::output` returns)
+/// would group all stdout then all stderr, breaking the temporal
+/// interleave the user actually wants to read.
 async fn run_one(target: Target, prog: &str, argv: &[String]) -> Outcome {
     if !target.path.is_dir() {
         return Outcome::with_setup_error(
@@ -186,27 +195,90 @@ async fn run_one(target: Target, prog: &str, argv: &[String]) -> Outcome {
     let mut cmd = Command::new(prog);
     cmd.args(argv)
         .current_dir(&target.path)
-        // Inherit stdin so commands that prompt (rare in exec, but
-        // possible) at least *can* read; we'd need a TTY allocation
-        // to actually be useful, but inheriting beats /dev/null.
-        .stdin(Stdio::inherit())
+        // Null stdin so multiple parallel processes don't race over a
+        // shared TTY — a command that wanted input fails fast (clean
+        // EOF) instead of hanging while the user's shell looks
+        // mysteriously frozen.
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let output = match cmd.output().await {
-        Ok(o) => o,
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return Outcome::with_setup_error(target, &format!("spawn failed: {e}")),
+    };
+
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let combined = match interleave_pipes(stdout, stderr).await {
+        Ok(buf) => buf,
         Err(e) => {
-            return Outcome::with_setup_error(target, &format!("spawn failed: {e}"));
+            // Don't abandon the child just because we couldn't read its
+            // pipes — wait it out so we don't leave a zombie. Surface
+            // the IO error as the setup-error path.
+            let _ = child.wait().await;
+            return Outcome::with_setup_error(target, &format!("reading pipes: {e}"));
         }
     };
 
-    let mut combined = output.stdout;
-    combined.extend_from_slice(&output.stderr);
+    let status = match child.wait().await {
+        Ok(s) => s,
+        Err(e) => return Outcome::with_setup_error(target, &format!("waiting on child: {e}")),
+    };
+
     Outcome {
         target,
-        exit_code: output.status.code(),
+        exit_code: status.code(),
         combined,
         setup_error: None,
+    }
+}
+
+/// Read `stdout` and `stderr` line-by-line concurrently, appending
+/// to a single `Vec<u8>` in arrival order. Within one line the
+/// streams are still distinguishable by what the program wrote, but
+/// across lines they're interleaved in real time — close enough to
+/// OS-level pipe merging without dipping into platform-specific
+/// `dup2` / `SetStdHandle`.
+async fn interleave_pipes<R1, R2>(stdout: R1, stderr: R2) -> std::io::Result<Vec<u8>>
+where
+    R1: tokio::io::AsyncRead + Unpin,
+    R2: tokio::io::AsyncRead + Unpin,
+{
+    let mut out = BufReader::new(stdout);
+    let mut err = BufReader::new(stderr);
+    let mut out_buf = Vec::new();
+    let mut err_buf = Vec::new();
+    let mut out_done = false;
+    let mut err_done = false;
+    let mut combined = Vec::new();
+
+    loop {
+        if out_done && err_done {
+            return Ok(combined);
+        }
+        tokio::select! {
+            // `biased` keeps stdout slightly higher priority than
+            // stderr — neither is strictly correct for "OS arrival
+            // order" (which we can only approximate at line
+            // granularity anyway), so a deterministic tiebreaker is
+            // easier to reason about than a random one.
+            biased;
+            res = out.read_until(b'\n', &mut out_buf), if !out_done => match res? {
+                0 => out_done = true,
+                _ => {
+                    combined.extend_from_slice(&out_buf);
+                    out_buf.clear();
+                }
+            },
+            res = err.read_until(b'\n', &mut err_buf), if !err_done => match res? {
+                0 => err_done = true,
+                _ => {
+                    combined.extend_from_slice(&err_buf);
+                    err_buf.clear();
+                }
+            },
+        }
     }
 }
 
@@ -257,7 +329,10 @@ fn print_outcome(o: &Outcome) {
     // anchor the user is most likely to search for.
     println!("{} {} [{}]", "───".dimmed(), o.target.slug.bold(), status);
     if let Some(err) = &o.setup_error {
-        eprintln!("  {} {}", "!".red(), err);
+        // stdout (not stderr) so `shoka exec ... > log.txt` captures
+        // the whole per-repo report cohesively — banner + body +
+        // setup errors stay in one stream.
+        println!("  {} {}", "!".red(), err);
         return;
     }
     if !o.combined.is_empty() {
@@ -345,6 +420,46 @@ mod tests {
         )
         .unwrap();
         assert_eq!(targets.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn interleave_pipes_preserves_per_stream_ordering() {
+        // Each pipe is itself a Vec<u8> via `io::Cursor`. We can't
+        // simulate real arrival-order timing inside a unit test (no
+        // actual process), but we *can* verify the function: doesn't
+        // drop bytes, doesn't double-include, terminates cleanly when
+        // both streams hit EOF, and preserves the per-stream line
+        // order (within a single stream, the original sequence is
+        // intact). Cross-stream interleave isn't asserted here — that
+        // depends on tokio's runtime scheduling decisions.
+        use std::io::Cursor;
+        let out_data: Vec<u8> = b"out-1\nout-2\n".to_vec();
+        let err_data: Vec<u8> = b"err-1\nerr-2\n".to_vec();
+        let combined = interleave_pipes(Cursor::new(out_data), Cursor::new(err_data))
+            .await
+            .unwrap();
+        let s = String::from_utf8(combined).unwrap();
+        // Both halves of each stream survive, in their original order.
+        let i_out1 = s.find("out-1").unwrap();
+        let i_out2 = s.find("out-2").unwrap();
+        let i_err1 = s.find("err-1").unwrap();
+        let i_err2 = s.find("err-2").unwrap();
+        assert!(i_out1 < i_out2, "stdout order broken: {s}");
+        assert!(i_err1 < i_err2, "stderr order broken: {s}");
+        // No bytes lost: total length equals the two input buffers.
+        assert_eq!(s.len(), "out-1\nout-2\nerr-1\nerr-2\n".len());
+    }
+
+    #[tokio::test]
+    async fn interleave_pipes_handles_partial_final_line() {
+        // A common case: a process writes its last line without a
+        // trailing newline. `read_until` returns the leftover bytes
+        // on EOF, so they should still land in the combined buffer.
+        use std::io::Cursor;
+        let combined = interleave_pipes(Cursor::new(b"no-nl".to_vec()), Cursor::new(b"".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(combined, b"no-nl");
     }
 
     #[test]
