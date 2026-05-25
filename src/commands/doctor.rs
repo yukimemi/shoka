@@ -12,6 +12,7 @@
 use anyhow::Result;
 use owo_colors::OwoColorize;
 
+use crate::cache::Cache;
 use crate::commands::ShokaContext;
 use crate::config::ShokaConfig;
 use crate::state::Shelf;
@@ -116,6 +117,45 @@ pub async fn run(ctx: &ShokaContext) -> Result<()> {
         ),
         Ok(s) => println!("  {} repos on the shelf (schema v{})", s.len(), s.version),
         Err(e) => println!("  {} {e:#}", "shelf load failed:".red()),
+    }
+
+    // Cache summary. Same informational stance as the shelf section
+    // — render what we can, surface load errors inline, don't bail.
+    println!();
+    println!("{}", "cache".underline());
+    println!(
+        "  threshold        : {}s",
+        r.raw.global.cache.refresh_threshold_secs
+    );
+    println!(
+        "  background_refresh: {}",
+        r.raw.global.cache.background_refresh
+    );
+    println!("  parallel_repos   : {}", r.raw.global.cache.parallel_repos);
+    match Cache::load(p) {
+        Ok(c) if c.is_empty() => println!(
+            "  {} (run `shoka cache refresh` to populate)",
+            "0 entries".dimmed()
+        ),
+        Ok(c) => {
+            let (oldest, newest) = c
+                .repos
+                .iter()
+                .filter_map(|r| r.last_refreshed)
+                .fold((u64::MAX, 0u64), |(o, n), ts| (o.min(ts), n.max(ts)));
+            print!("  {} entries (schema v{})", c.len(), c.version);
+            if newest > 0 {
+                let now = crate::cache::current_unix_secs();
+                println!(
+                    " — freshest {}s ago, oldest {}s ago",
+                    now.saturating_sub(newest),
+                    now.saturating_sub(oldest)
+                );
+            } else {
+                println!(" (none refreshed yet)");
+            }
+        }
+        Err(e) => println!("  {} {e:#}", "cache load failed:".red()),
     }
 
     Ok(())

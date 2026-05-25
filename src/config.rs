@@ -69,6 +69,7 @@ pub struct GlobalConfig {
     pub exec_concurrency: usize,
     pub ui: UiConfig,
     pub shell: ShellConfig,
+    pub cache: CacheConfig,
 }
 
 impl Default for GlobalConfig {
@@ -83,6 +84,7 @@ impl Default for GlobalConfig {
             exec_concurrency: 8,
             ui: UiConfig::default(),
             shell: ShellConfig::default(),
+            cache: CacheConfig::default(),
         }
     }
 }
@@ -131,6 +133,40 @@ impl Default for ShellConfig {
     fn default() -> Self {
         Self {
             cd_command_name: "s".into(),
+        }
+    }
+}
+
+/// `[global.cache]` — controls per-repo cache refresh behaviour.
+///
+/// Refresh runs explicitly via `shoka cache refresh` and (once the
+/// background-refresh PR lands) implicitly at the tail of other
+/// subcommands. `background_refresh = false` disables the implicit
+/// path entirely for users who don't want their shell sessions
+/// spawning detached refresh processes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CacheConfig {
+    /// Spawn a detached background refresh after each command. When
+    /// `false`, only `shoka cache refresh` updates the cache.
+    pub background_refresh: bool,
+
+    /// Skip the per-repo refresh if `last_refreshed` is within this
+    /// many seconds of "now". `shoka cache refresh --force` bypasses
+    /// the check.
+    pub refresh_threshold_secs: u64,
+
+    /// Cap on concurrent per-repo refresh tasks. Floored at 1 by
+    /// the loader (same reasoning as `exec_concurrency`).
+    pub parallel_repos: usize,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            background_refresh: true,
+            refresh_threshold_secs: 60,
+            parallel_repos: 8,
         }
     }
 }
