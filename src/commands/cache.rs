@@ -265,9 +265,14 @@ fn has_all_tags(repo: &Repo, wanted: &[String]) -> bool {
 /// - Unix: `setsid(2)` in `pre_exec` so the child becomes its own
 ///   session leader (no controlling terminal, immune to SIGHUP when
 ///   the parent shell exits).
-/// - Windows: `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` so the
-///   child doesn't share the parent's console and survives the
-///   parent's exit.
+/// - Windows: `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP` so the
+///   child runs without a console window at all (no black flash
+///   at the tail of every command) and survives the parent's exit.
+///   `DETACHED_PROCESS` alone wasn't enough — it stops the child
+///   from inheriting the parent's console, but a console-subsystem
+///   exe (which `shoka` is) still gets its *own* fresh window
+///   conjured up by the OS, which is exactly what we don't want.
+///   `CREATE_NO_WINDOW` skips that window allocation entirely.
 ///
 /// `SHOKA_CONFIG` and `SHOKA_PROFILE` are propagated via env so the
 /// child sees the same config file and active profile the parent
@@ -326,9 +331,14 @@ fn spawn_detached(exe: &Path, config_file: &Path, profile: Option<&str>) -> Resu
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        // CREATE_NO_WINDOW (instead of DETACHED_PROCESS): suppresses
+        // the child's console window so users don't see a black flash
+        // at the end of every shoka command. CREATE_NEW_PROCESS_GROUP
+        // is still needed so the child has its own group (survives
+        // parent shell's Ctrl-C / exit and gets its own group ID).
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
     }
 
     cmd.spawn()
