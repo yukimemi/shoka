@@ -77,6 +77,22 @@ pub enum Command {
     /// Per-repo volatile cache management (refresh / show / clear).
     #[command(subcommand)]
     Cache(CacheCommand),
+
+    /// Update the shoka binary itself to the latest GitHub release.
+    SelfUpdate(SelfUpdateArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SelfUpdateArgs {
+    /// Skip the confirmation prompt and install immediately.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+
+    /// Print availability and exit without installing — useful in
+    /// scripts that want to surface "an upgrade is available" without
+    /// performing it.
+    #[arg(long)]
+    pub check: bool,
 }
 
 #[derive(Debug, Subcommand)]

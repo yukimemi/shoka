@@ -69,6 +69,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Completion(a) => completion::run(a).await,
         Command::InitShell(a) => init_shell::run(a).await,
         Command::Cache(c) => cache::dispatch(&ctx, c).await,
+        Command::SelfUpdate(a) => crate::updater::run_self_update(a.yes, a.check).await,
     };
 
     if bg_eligible {
@@ -96,6 +97,10 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
 /// - `tui` — long-running; the TUI owns its own refresh strategy
 ///   (will land with the dashboard PR). Firing a one-off refresh
 ///   at start would compete with that.
+/// - `self-update` — the binary just got swapped under us. Spawning
+///   `<old-path> cache refresh --background` against the now-
+///   replaced executable is at best wasted work and at worst hits
+///   "text file busy" or weird OS-loader edge cases on Windows.
 ///
 /// Doctor is *not* excluded: it doesn't write state but it's a
 /// natural "are things OK" checkpoint, and freshening the cache
@@ -103,7 +108,11 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
 fn bg_refresh_eligible(cmd: &Command) -> bool {
     !matches!(
         cmd,
-        Command::Cache(_) | Command::Completion(_) | Command::InitShell(_) | Command::Tui(_)
+        Command::Cache(_)
+            | Command::Completion(_)
+            | Command::InitShell(_)
+            | Command::Tui(_)
+            | Command::SelfUpdate(_)
     )
 }
 
@@ -111,8 +120,8 @@ fn bg_refresh_eligible(cmd: &Command) -> bool {
 mod tests {
     use super::*;
     use crate::cli::{
-        CacheCommand, CdArgs, CloneArgs, CompletionArgs, InitShellArgs, ListArgs, SupportedShell,
-        TuiArgs,
+        CacheCommand, CdArgs, CloneArgs, CompletionArgs, InitShellArgs, ListArgs, SelfUpdateArgs,
+        SupportedShell, TuiArgs,
     };
 
     fn cache_refresh() -> Command {
@@ -137,6 +146,13 @@ mod tests {
         })));
         assert!(!bg_refresh_eligible(&Command::Tui(TuiArgs {
             tags: vec![],
+        })));
+        // self-update swaps the binary; spawning a refresh from the
+        // now-replaced executable is wasted work at best and a
+        // platform-dependent gotcha at worst.
+        assert!(!bg_refresh_eligible(&Command::SelfUpdate(SelfUpdateArgs {
+            yes: false,
+            check: false,
         })));
     }
 

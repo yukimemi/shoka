@@ -571,7 +571,7 @@ fn help_prints_subcommands_and_exits_zero() {
     let mut cmd = Command::new(bin);
     let assertion = cmd.arg("--help").assert().success();
     let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).to_string();
-    for expected in ["clone", "list", "import", "cache", "doctor"] {
+    for expected in ["clone", "list", "import", "cache", "doctor", "self-update"] {
         assert!(
             stdout.contains(expected),
             "--help should mention `{expected}` subcommand, got: {stdout}"
