@@ -1,10 +1,14 @@
 # shoka demo — README GIF
 # Usage:
 #   Native (Linux / macOS): cd vhs && vhs demo.tape
-#   Docker (recommended on Windows — native vhs hangs on Set Theme):
-#     cd vhs && docker build -t shoka-vhs . && \
-#       docker run --rm -v "$PWD:/vhs" -e GITHUB_TOKEN shoka-vhs demo.tape
-#     (or just `bash regen.sh` from this directory.)
+#   Docker (recommended — and required on Windows where native vhs
+#   hangs on Set Theme):
+#     cd vhs && docker build -t shoka-vhs . && bash regen.sh
+#   regen.sh handles GITHUB_TOKEN forwarding conditionally — passing
+#   `-e GITHUB_TOKEN=""` to a raw `docker run` would define the var
+#   as an empty string inside the container, which is subtly
+#   different from "unset"; the helper script avoids that pitfall.
+#   Or via cargo-make: `cargo make vhs-regen` (wraps the same flow).
 #
 # Sandbox: SHOKA_CONFIG / SHOKA_STATE_DIR / SHOKA_CACHE_DIR all point
 # at /tmp/shoka-demo so the tape never touches the host's real shoka

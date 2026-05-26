@@ -49,9 +49,11 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 # shoka — pinned to the version this Dockerfile was tested against.
-# Bump in lockstep with the release tag so old images don't silently lag
-# behind the GIF's apparent state.
-ARG SHOKA_VERSION=0.6.0
+# Bump in lockstep with the release tag so old images don't silently
+# lag behind the GIF's apparent state. Override with
+# `--build-arg SHOKA_VERSION=X.Y.Z` when re-recording against an
+# unreleased branch.
+ARG SHOKA_VERSION=0.5.0
 RUN cargo install shoka --version "${SHOKA_VERSION}" --locked
 
 # Sandbox layout. The tape exports SHOKA_CONFIG / SHOKA_STATE_DIR /
