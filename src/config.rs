@@ -622,6 +622,17 @@ impl ResolvedConfig {
     ) -> Result<PathBuf> {
         use teravars::Context;
 
+        // Per-repo `path` override wins over everything. Set by
+        // `shoka import` for local-only / jj-only repos that the
+        // user wants left in place (we record the absolute path
+        // and refuse to second-guess it via layout). Layout / route
+        // / profile resolution is skipped entirely — those concepts
+        // don't apply when the repo's location was given to us
+        // directly.
+        if let Some(p) = &repo.path {
+            return Ok(p.clone());
+        }
+
         let spec = repo.slug();
         let target = self.resolve_target(&spec);
 

@@ -28,11 +28,15 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use std::path::PathBuf;
+
 use crate::config::VcsDefault;
 use crate::paths::ShokaPaths;
 
-/// Current on-disk schema version. Bump on a breaking shape change.
-pub const SHELF_VERSION: u32 = 1;
+/// Current on-disk schema version. Bumped to **2** when the per-repo
+/// `path` override field landed. Readers with the old version on disk
+/// see the new optional field as default-`None` and keep working.
+pub const SHELF_VERSION: u32 = 2;
 
 /// Top-level state on disk.
 ///
@@ -87,6 +91,19 @@ pub struct Repo {
     /// `note` for the user's own bookkeeping.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+
+    /// Absolute on-disk path override. `None` means "compute the
+    /// path from the configured layout + `(host, owner, name)`"
+    /// (the normal cloned-by-shoka case); `Some(p)` pins this repo
+    /// to `p` regardless of layout (used by `shoka import` for
+    /// local-only repos that were never cloned via shoka, so they
+    /// stay where the user already has them on disk).
+    ///
+    /// Treated as opaque by shoka — no expansion, no canonicalisation
+    /// at save time. Callers that resolve relative paths or `~/`
+    /// should do so before constructing the [`Repo`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
 }
 
 impl Repo {
@@ -100,7 +117,21 @@ impl Repo {
             vcs: None,
             tags: Vec::new(),
             note: None,
+            path: None,
         }
+    }
+
+    /// Builder-style override: pin this repo to an explicit on-disk
+    /// path, bypassing the `[global].layout` template. Used by
+    /// [`shoka import`] for local-only / jj-only repos that don't
+    /// have a remote URL to derive a `host/owner/name` triple from,
+    /// and that the user wants to leave in place rather than move
+    /// under the configured `root`.
+    ///
+    /// [`shoka import`]: crate::commands::import
+    pub fn with_path(mut self, path: PathBuf) -> Self {
+        self.path = Some(path);
+        self
     }
 
     /// `host/owner/name` slug used in CLI output and error messages.

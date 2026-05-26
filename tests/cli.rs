@@ -179,6 +179,79 @@ fn import_finds_repos_and_records_them_on_shelf() {
 }
 
 #[test]
+fn import_picks_up_local_only_git_and_jj_repos() {
+    // Three fixtures under one source dir:
+    //   - `with-remote/`: .git/config with a real remote URL →
+    //     normal (host/owner/name) entry.
+    //   - `local-git/`:   .git/ but no [remote "origin"] →
+    //     synthesised local identity + path override.
+    //   - `local-jj/`:    .jj/ only (no .git) → same local
+    //     synthesis path.
+    let (mut cmd, tmp) = cmd_with_isolated_config();
+    let source = tmp.path().join("source");
+
+    init_git_repo_with_remote(
+        &source.join("with-remote"),
+        "https://github.com/yukimemi/foo.git",
+    );
+
+    // .git/ but no remote: gix::init alone leaves the repo without
+    // an origin, which is exactly the local-only case we want to
+    // exercise.
+    let local_git = source.join("local-git");
+    std::fs::create_dir_all(&local_git).unwrap();
+    gix::init(&local_git).expect("gix init for local-only");
+
+    // .jj/-only: walkdir needs to find the marker even when no
+    // `.git/` sibling exists. We don't need an actual jj workspace
+    // — shoka just looks at the marker dir.
+    let local_jj = source.join("local-jj");
+    std::fs::create_dir_all(local_jj.join(".jj")).unwrap();
+
+    let assertion = cmd
+        .args(["import", source.to_str().unwrap()])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).to_string();
+    assert!(
+        stdout.contains("3 imported"),
+        "expected '3 imported' in stdout, got: {stdout}"
+    );
+
+    let state = tmp.path().join("state").join("state.toml");
+    let body = std::fs::read_to_string(&state).expect("state.toml exists");
+
+    // Remote-bearing entry: identity from URL, no path override.
+    assert!(
+        body.contains("\"github.com\""),
+        "remote host missing: {body}"
+    );
+    assert!(body.contains("\"foo\""), "remote name missing: {body}");
+
+    // Local entries: host=local + path override referencing the
+    // original on-disk location.
+    assert!(
+        body.contains("host = \"local\""),
+        "local host marker missing: {body}"
+    );
+    assert!(
+        body.contains("\"local-git\""),
+        "local-git name missing: {body}"
+    );
+    assert!(
+        body.contains("\"local-jj\""),
+        "local-jj name missing: {body}"
+    );
+    // Path override is the headline new behaviour — the entry must
+    // pin the absolute path so `cd` / `tui` reach the right place
+    // without going through layout.
+    assert!(
+        body.contains("path = "),
+        "expected `path = ...` override on at least one local entry: {body}"
+    );
+}
+
+#[test]
 fn clone_with_invalid_input_errors_cleanly() {
     // Single-token input has no shape we accept (not a URL, not an
     // `owner/name` shorthand). Should surface a clear error before
