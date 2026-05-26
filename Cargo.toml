@@ -78,7 +78,7 @@ ratatui = "0.30"
 crossterm = "0.29"
 nucleo = "0.5"
 octocrab = "0.51.0"
-kaishin = "0.2.4"
+kaishin = "0.3.0"
 
 # gh integration (phase 1 後半 / phase 2 で octocrab 追加)
 # octocrab = "0.45"
