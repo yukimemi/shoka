@@ -1,0 +1,5 @@
+# Only the Dockerfile actually needs to be in the build context —
+# regen.sh + demo.tape + demo.gif are all consumed at run time via
+# the bind mount, not baked in.
+*
+!Dockerfile

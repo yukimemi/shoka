@@ -185,3 +185,37 @@ description = "Wired to renri's [[hooks.post_create]] — runs in a freshly crea
 # moved — see yukimemi/pj-base#8 for the companion change in
 # `renri.toml.base`.
 dependencies = ["apm-install", "vcs-fetch"]
+
+# ─── vhs / demo GIF regeneration ───────────────────────────────────────
+# Native vhs on Windows hangs on `Set Theme`, so we ship a Docker image
+# (vhs + shoka + the four fixture clones) and drive it from cargo-make.
+#
+# Windows prerequisites: Docker Engine inside WSL2 (Docker Desktop is
+# not required); these tasks shell out via `wsl -- docker ...`. To
+# forward GITHUB_TOKEN from PowerShell into WSL — so the dashboard's
+# PR / CI columns populate in the GIF — add this to your $PROFILE
+# once:
+#   $env:WSLENV += ":GITHUB_TOKEN/u"
+# Linux / macOS: a real `docker` on PATH is enough; the host's
+# GITHUB_TOKEN env var is forwarded directly.
+
+[tasks.vhs-build]
+description = "Build the shoka-vhs Docker image (~5 min first time, cached after)"
+cwd = "vhs"
+command = "docker"
+args = ["build", "-t", "shoka-vhs", "."]
+
+[tasks.vhs-build.windows]
+command = "wsl"
+args = ["--", "docker", "build", "-t", "shoka-vhs", "."]
+
+[tasks.vhs-regen]
+description = "Regenerate vhs/demo.gif (or another tape via `cargo make vhs-regen <tape>`)"
+dependencies = ["vhs-build"]
+cwd = "vhs"
+command = "bash"
+args = ["regen.sh", "${@}"]
+
+[tasks.vhs-regen.windows]
+command = "wsl"
+args = ["--", "bash", "regen.sh", "${@}"]
