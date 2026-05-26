@@ -265,9 +265,16 @@ fn has_all_tags(repo: &Repo, wanted: &[String]) -> bool {
 /// - Unix: `setsid(2)` in `pre_exec` so the child becomes its own
 ///   session leader (no controlling terminal, immune to SIGHUP when
 ///   the parent shell exits).
-/// - Windows: `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` so the
-///   child doesn't share the parent's console and survives the
-///   parent's exit.
+/// - Windows: `DETACHED_PROCESS | CREATE_NO_WINDOW |
+///   CREATE_NEW_PROCESS_GROUP`. See [`bg_refresh_creation_flags`]
+///   for the rationale of each flag — short version is
+///   `DETACHED_PROCESS` decouples from the parent's console
+///   lifetime (so closing the terminal doesn't kill the child),
+///   `CREATE_NO_WINDOW` skips the new-console window allocation
+///   that Windows otherwise does for a console-subsystem exe (no
+///   black flash at the tail of every shoka command), and
+///   `CREATE_NEW_PROCESS_GROUP` gives the child its own group so
+///   it ignores Ctrl-C sent to the parent shell.
 ///
 /// `SHOKA_CONFIG` and `SHOKA_PROFILE` are propagated via env so the
 /// child sees the same config file and active profile the parent
@@ -326,14 +333,37 @@ fn spawn_detached(exe: &Path, config_file: &Path, profile: Option<&str>) -> Resu
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        cmd.creation_flags(bg_refresh_creation_flags());
     }
 
     cmd.spawn()
         .with_context(|| format!("spawning {} cache refresh --background", exe.display()))?;
     Ok(())
+}
+
+/// Windows `CreateProcess` creation flags for the detached background
+/// refresh subprocess. Pulled out of `spawn_detached` so the
+/// composition can be unit-tested without spawning anything.
+///
+/// All three flags are necessary; dropping any one breaks behaviour:
+///
+/// - `DETACHED_PROCESS` — child doesn't inherit the parent's console
+///   and is decoupled from the parent's console lifetime. Without
+///   this, closing the terminal window (or the parent shell exiting)
+///   sends a console-close signal that kills the child too.
+/// - `CREATE_NO_WINDOW` — suppresses the *new* console window that
+///   Windows would otherwise allocate for the child (shoka is a
+///   console-subsystem binary, so it'd get its own console even
+///   when detached). Without this, every shoka command tail flashes
+///   a black window for an instant.
+/// - `CREATE_NEW_PROCESS_GROUP` — child has its own process group,
+///   immune to Ctrl-C sent to the parent shell's group.
+#[cfg(windows)]
+pub(crate) const fn bg_refresh_creation_flags() -> u32 {
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
 }
 
 #[cfg(test)]
@@ -445,5 +475,29 @@ background_refresh = false
         // exercise under `cargo test`, so we don't construct the
         // "enabled" counterpart here.
         try_spawn_bg_refresh(&ctx).expect("opt-out path returns Ok");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bg_refresh_creation_flags_compose_all_three() {
+        // Regression for the Windows console-flash fix: each of the
+        // three Win32 creation flags carries distinct, non-overlapping
+        // bits; dropping any one re-introduces a visible bug (terminal-
+        // close kills the child, black-flash, or Ctrl-C kills the child
+        // with the parent). Assert the constant directly so a future
+        // edit that "simplifies" the composition trips this test.
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let flags = bg_refresh_creation_flags();
+        assert_eq!(flags & DETACHED_PROCESS, DETACHED_PROCESS);
+        assert_eq!(flags & CREATE_NEW_PROCESS_GROUP, CREATE_NEW_PROCESS_GROUP);
+        assert_eq!(flags & CREATE_NO_WINDOW, CREATE_NO_WINDOW);
+        // No stray bits — keep the surface minimal so a future
+        // contributor doesn't inherit a flag they didn't intend.
+        assert_eq!(
+            flags,
+            DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+        );
     }
 }
