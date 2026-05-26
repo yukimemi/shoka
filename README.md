@@ -85,7 +85,7 @@ shoka exec --tag rust -- cargo check
 | `shoka doctor` | Diagnose environment + config. |
 | `shoka init-shell <shell>` | Print the shell wrapper for `cd` (see below). |
 | `shoka completion <shell>` | Print a shell-completion script. |
-| `shoka tui` | TUI dashboard. **Phase 2** — not yet implemented. |
+| `shoka tui` | TUI dashboard — branch / ↑↓ / dirty / PR / CI columns from the cached snapshot; j/k navigation, `/` for nucleo filter, Enter exits and emits the chosen repo's path so the shell wrapper can `cd` to it. |
 
 `shoka exec` is the transparent escape hatch: shoka never
 interprets the command. `shoka exec -- git fetch`, `shoka exec --
