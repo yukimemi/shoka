@@ -43,7 +43,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Row, Table, TableState};
 use ratatui::{Terminal, prelude::Backend};
 use teravars::Engine;
 
@@ -174,6 +174,11 @@ struct App {
     /// 0 when `matches` is empty (and the selection is just "none").
     cursor: usize,
     mode: Mode,
+    /// `?` help popup overlay state. Orthogonal to [`Mode`] so the
+    /// popup can be opened (or closed) from either Normal or Filter
+    /// without leaking modal state between the two. Toggled by `?`
+    /// or F1 and dismissed by `Esc`, `q`, or `?` again.
+    show_help: bool,
     table_state: TableState,
     matcher: Matcher,
 }
@@ -189,6 +194,7 @@ impl App {
             matches,
             cursor: 0,
             mode: Mode::Normal,
+            show_help: false,
             table_state,
             matcher: Matcher::default(),
         }
@@ -313,6 +319,34 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<O
             continue;
         }
 
+        // Help popup intercepts everything except its own dismissal
+        // keys + Ctrl-C. Keep this check outside `match app.mode` so
+        // the popup can be opened from Filter mode too — but only
+        // Normal-mode keys (specifically `?` / F1) open it; while in
+        // Filter, `?` is still a literal character to type.
+        if app.show_help {
+            // Ctrl-C is the "I want out, no matter what" key. Honour
+            // it even with the popup open — making the user dismiss
+            // the popup first before they can quit is a UX trap
+            // (especially if a stuck render somehow strands the
+            // popup), and Ctrl-C is the only key reliably reachable
+            // when other dismissals don't.
+            if key.code == KeyCode::Char('c')
+                && key
+                    .modifiers
+                    .contains(crossterm::event::KeyModifiers::CONTROL)
+            {
+                return Ok(None);
+            }
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::F(1) => {
+                    app.show_help = false;
+                }
+                _ => {}
+            }
+            continue;
+        }
+
         match app.mode {
             Mode::Normal => match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => return Ok(None),
@@ -322,6 +356,9 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<O
                         .contains(crossterm::event::KeyModifiers::CONTROL) =>
                 {
                     return Ok(None);
+                }
+                KeyCode::Char('?') | KeyCode::F(1) => {
+                    app.show_help = true;
                 }
                 KeyCode::Char('j') | KeyCode::Down => app.move_down(),
                 KeyCode::Char('k') | KeyCode::Up => app.move_up(),
@@ -381,6 +418,13 @@ fn ui(f: &mut Frame, app: &mut App) {
     render_header(f, chunks[0], app);
     render_table(f, chunks[1], app);
     render_footer(f, chunks[2], app);
+
+    // Help popup is drawn last so it overlays everything else. The
+    // ratatui `Clear` widget zeroes the popup's region before we
+    // paint so the table's text doesn't bleed through.
+    if app.show_help {
+        render_help(f, f.area());
+    }
 }
 
 fn render_header(f: &mut Frame, area: Rect, app: &App) {
@@ -506,13 +550,105 @@ fn status_cells(status: Option<&GitStatusSnapshot>) -> (String, String, String) 
 
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     let hint = match app.mode {
-        Mode::Normal => "j/k=move  g/G=top/bot  /=filter  enter=cd  q=quit",
+        Mode::Normal => "j/k=move  /=filter  enter=cd  ?=help  q=quit",
         Mode::Filter => "type to filter  ⌫=delete  enter=accept  esc=clear",
     };
     f.render_widget(
         Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)),
         area,
     );
+}
+
+/// Render the help popup. Centered in the terminal, sized to fit
+/// the keybind table comfortably without flexing per frame. Clears
+/// its rect first so the underlying table doesn't bleed through.
+///
+/// Kept colocated with the dashboard widgets so the legend stays in
+/// lockstep with what `event_loop` actually handles — if a key is
+/// added or renamed there, this list is the one place to update
+/// alongside it.
+fn render_help(f: &mut Frame, area: Rect) {
+    let popup = centered_rect(60, 70, area);
+
+    // List entries chosen for screen-readability: the key column is
+    // right-aligned in a fixed width so the descriptions line up.
+    let entries: [(&str, &str); 9] = [
+        ("j / ↓", "move down"),
+        ("k / ↑", "move up"),
+        ("g", "jump to top"),
+        ("G", "jump to bottom"),
+        ("/", "filter — type to narrow, esc to clear"),
+        ("Enter", "select (emit path for the shell wrapper to cd)"),
+        ("? / F1", "toggle this help"),
+        ("q / Esc", "quit"),
+        ("Ctrl-C", "quit"),
+    ];
+
+    // `chars().count()` rather than `.len()`: the latter is byte
+    // length, which for entries like `j / ↓` overcounts by two bytes
+    // per arrow (UTF-8 encoding of `↓` is 3 bytes vs. 1 char). That
+    // would push every other row out of alignment in the popup.
+    let key_width = entries
+        .iter()
+        .map(|(k, _)| k.chars().count())
+        .max()
+        .unwrap_or(8);
+    let body: Vec<Line> = entries
+        .iter()
+        .map(|(key, desc)| {
+            Line::from(vec![
+                ratatui::text::Span::styled(
+                    format!("  {key:>w$}  ", w = key_width),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                ratatui::text::Span::raw(*desc),
+            ])
+        })
+        .collect();
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(" shoka — keybinds ")
+        .title_style(Style::default().add_modifier(Modifier::BOLD));
+
+    let para = Paragraph::new(body).block(block);
+
+    f.render_widget(Clear, popup);
+    f.render_widget(para, popup);
+}
+
+/// Build a centered popup rect taking `pct_x` × `pct_y` of `area`.
+/// Standard `Layout` split — two vertical splits then two horizontal
+/// splits — so the popup is genuinely centered on any terminal
+/// size, not just the dev's.
+///
+/// Percentages are clamped to `[0, 100]` so a caller-bug like
+/// `pct_x = 120` doesn't underflow `100 - pct_x` and panic in
+/// debug builds. The current call site is hard-coded to safe
+/// values, but defensive clamping makes the helper reusable
+/// without surprising the next caller.
+fn centered_rect(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
+    let pct_x = pct_x.min(100);
+    let pct_y = pct_y.min(100);
+    let vert = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - pct_y) / 2),
+            Constraint::Percentage(pct_y),
+            Constraint::Percentage((100 - pct_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - pct_x) / 2),
+            Constraint::Percentage(pct_x),
+            Constraint::Percentage((100 - pct_x) / 2),
+        ])
+        .split(vert[1])[1]
 }
 
 #[cfg(test)]
