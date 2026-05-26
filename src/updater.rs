@@ -17,12 +17,21 @@
 //! [rvpm]: https://github.com/yukimemi/rvpm
 //! [renri]: https://github.com/yukimemi/renri
 
+use std::io::IsTerminal;
+
 use anyhow::Result;
 
 /// Run the self-update flow.
 ///
 /// - `yes`: skip the "install vX.Y.Z?" confirmation prompt.
 /// - `check_only`: print availability and exit without downloading.
+///
+/// `non_interactive` is auto-detected from `stdin().is_terminal()`:
+/// when stdin isn't a TTY (cron, CI runner, piped invocation) the
+/// updater is told to skip the prompt step entirely, so it errors
+/// out cleanly instead of hanging on an unread `[y/N]` it can never
+/// satisfy. Users running `shoka self-update` from a real terminal
+/// keep getting the prompt unless they pass `-y` explicitly.
 pub async fn run_self_update(yes: bool, check_only: bool) -> Result<()> {
     let opts = kaishin::KaishinOptions::new(
         // owner / repo / bin-name / current-version.
@@ -34,14 +43,11 @@ pub async fn run_self_update(yes: bool, check_only: bool) -> Result<()> {
         env!("CARGO_PKG_NAME"),
         env!("CARGO_PKG_VERSION"),
     );
+    let non_interactive = !std::io::stdin().is_terminal();
     let upd_opts = kaishin::UpdateOptions::new()
         .yes(yes)
         .check_only(check_only)
-        // shoka doesn't have a global `--non-interactive` flag yet
-        // (renri's `CmdCtx` does). Default to interactive — the
-        // prompt is the safety net for accidental `self-update`
-        // invocations; users who want it scripted pass `-y`.
-        .non_interactive(false);
+        .non_interactive(non_interactive);
 
     kaishin::run_self_update(&opts, upd_opts).await
 }
