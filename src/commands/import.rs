@@ -25,6 +25,7 @@
 //! `~/dev`, …) that actually exist on disk. If none exist, the
 //! command errors out asking for an explicit path.
 
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
@@ -58,6 +59,15 @@ pub async fn run(ctx: &ShokaContext, args: ImportArgs) -> Result<()> {
     let mut imported = 0usize;
     let mut skipped_already = 0usize;
     let mut errors = 0usize;
+    // Repo roots already imported in this run, keyed by the parent
+    // directory of the marker (`.git` / `.jj`). Used to dedupe
+    // colocated checkouts: the first marker yielded (`.git` by
+    // walkdir's alphabetical ordering) records the root here, and
+    // the sibling `.jj` is then skipped. `skip_current_dir()` only
+    // prunes *descendants* of the yielded entry — it has no effect
+    // on siblings — so an explicit set is the only reliable way to
+    // avoid double-importing the same repo.
+    let mut imported_roots: HashSet<PathBuf> = HashSet::new();
 
     println!(
         "{} scanning {} for git / jj repos…",
@@ -65,10 +75,12 @@ pub async fn run(ctx: &ShokaContext, args: ImportArgs) -> Result<()> {
         source.display()
     );
 
-    // Explicit iterator so `skip_current_dir` can prune the walk the
-    // moment we recognise a repo root — without that, walkdir would
-    // happily descend into `.git/objects` / `.jj/op_store` and yield
-    // tens of thousands of dead-end entries per shelf.
+    // Explicit iterator so we can call `skip_current_dir()` to keep
+    // the walk from descending into `.git/objects` / `.jj/op_store`
+    // etc. — tens of thousands of dead-end entries otherwise. The
+    // method *only* prunes descendants of the just-yielded entry,
+    // not siblings; colocated-checkout dedup is done via
+    // `imported_roots` below.
     let mut it = WalkDir::new(&source).follow_links(false).into_iter();
     while let Some(entry) = it.next() {
         let entry = match entry {
@@ -81,34 +93,39 @@ pub async fn run(ctx: &ShokaContext, args: ImportArgs) -> Result<()> {
         };
 
         // We recognise EITHER `.git` or `.jj` as a repo marker.
-        // walkdir yields directory contents alphabetically, so for a
-        // colocated jj+git checkout `.git` is yielded first; calling
-        // `skip_current_dir` after the first hit prunes the *parent*
-        // dir's remaining children (including the `.jj` sibling) plus
-        // the just-yielded entry's own contents. That gives us a
-        // single import per repo even when both markers exist.
         let fname = entry.file_name();
         let is_marker =
             (fname == OsStr::new(".git") || fname == OsStr::new(".jj")) && entry.path().is_dir();
         if !is_marker {
             continue;
         }
+        // Prune the walk into the marker dir's contents. Siblings in
+        // the parent dir (e.g. a `.jj` next to a `.git`) are NOT
+        // pruned by this call — that's what `imported_roots` is for.
         it.skip_current_dir();
 
         let repo_root = match entry.path().parent() {
-            Some(p) => p,
+            Some(p) => p.to_path_buf(),
             None => continue,
         };
+
+        // Colocated `.git` + `.jj`: walkdir yields `.git` first
+        // (alphabetical), records the root, then yields `.jj` —
+        // here we recognise the duplicate and skip it. Single
+        // import per repo even with two markers present.
+        if !imported_roots.insert(repo_root.clone()) {
+            continue;
+        }
 
         let result = match fname {
             // `.git` marker: try the remote URL path first, fall
             // back to synthesised local identity when no remote
             // exists. Both cases keep the repo in place.
-            f if f == OsStr::new(".git") => extract_git_repo(repo_root),
+            f if f == OsStr::new(".git") => extract_git_repo(&repo_root),
             // `.jj` marker (no colocated `.git` got there first):
             // jj has no concept of a single "default remote URL"
             // shoka could parse, so always synthesise local.
-            _ => Ok(synthesise_local(repo_root)),
+            _ => Ok(synthesise_local(&repo_root)),
         };
 
         match result {
@@ -199,19 +216,32 @@ fn prompt_for_source() -> Result<PathBuf> {
 ///
 /// Tries the remote-URL path first — that's the historic
 /// ghq-compatible behaviour. Falls back to [`synthesise_local`]
-/// when the repo has no remote / no fetch URL / unparseable URL.
-/// Real I/O / corruption errors propagate.
+/// when the repo simply has no remote / no fetch URL. Genuine
+/// config-load or repo-corruption errors propagate as `Err` so the
+/// caller logs + counts them rather than masking them as "no remote".
 fn extract_git_repo(repo_root: &Path) -> Result<Repo> {
     let repo = gix::open(repo_root)
         .with_context(|| format!("opening {} as a git repo", repo_root.display()))?;
 
-    // The chain of "things that mean we have no usable remote URL"
-    // is a few `Option<...>`s deep. Squash to "got URL or didn't" and
-    // synthesise local in the latter case.
-    let maybe_url = repo
+    // `find_default_remote` returns `Option<Result<Remote>>`:
+    //   - outer `None`  → no remote configured (legitimate local-only).
+    //   - outer `Some(Err)` → genuine resolution error worth surfacing.
+    //   - outer `Some(Ok(Remote))` → the configured default remote.
+    //
+    // `.transpose()?` turns the inner `Result` into a `?`-able error
+    // so config / corruption issues propagate properly, instead of
+    // being silently downgraded to a `None` URL and hidden behind
+    // the synthesise-local fallback.
+    let remote = repo
         .find_default_remote(gix::remote::Direction::Fetch)
-        .and_then(|r| r.ok())
-        .and_then(|r| r.url(gix::remote::Direction::Fetch).cloned());
+        .transpose()
+        .with_context(|| {
+            format!(
+                "reading default remote configuration for {}",
+                repo_root.display()
+            )
+        })?;
+    let maybe_url = remote.and_then(|r| r.url(gix::remote::Direction::Fetch).cloned());
 
     let Some(url) = maybe_url else {
         return Ok(synthesise_local(repo_root));
