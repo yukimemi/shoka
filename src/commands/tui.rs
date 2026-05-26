@@ -320,11 +320,24 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<O
         }
 
         // Help popup intercepts everything except its own dismissal
-        // keys. Keep this check outside `match app.mode` so the popup
-        // can be opened from Filter mode too — but only Normal-mode
-        // keys (specifically `?` / F1) open it; while in Filter, `?`
-        // is still a literal character to type.
+        // keys + Ctrl-C. Keep this check outside `match app.mode` so
+        // the popup can be opened from Filter mode too — but only
+        // Normal-mode keys (specifically `?` / F1) open it; while in
+        // Filter, `?` is still a literal character to type.
         if app.show_help {
+            // Ctrl-C is the "I want out, no matter what" key. Honour
+            // it even with the popup open — making the user dismiss
+            // the popup first before they can quit is a UX trap
+            // (especially if a stuck render somehow strands the
+            // popup), and Ctrl-C is the only key reliably reachable
+            // when other dismissals don't.
+            if key.code == KeyCode::Char('c')
+                && key
+                    .modifiers
+                    .contains(crossterm::event::KeyModifiers::CONTROL)
+            {
+                return Ok(None);
+            }
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::F(1) => {
                     app.show_help = false;
@@ -571,7 +584,15 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("Ctrl-C", "quit"),
     ];
 
-    let key_width = entries.iter().map(|(k, _)| k.len()).max().unwrap_or(8);
+    // `chars().count()` rather than `.len()`: the latter is byte
+    // length, which for entries like `j / ↓` overcounts by two bytes
+    // per arrow (UTF-8 encoding of `↓` is 3 bytes vs. 1 char). That
+    // would push every other row out of alignment in the popup.
+    let key_width = entries
+        .iter()
+        .map(|(k, _)| k.chars().count())
+        .max()
+        .unwrap_or(8);
     let body: Vec<Line> = entries
         .iter()
         .map(|(key, desc)| {
@@ -603,7 +624,15 @@ fn render_help(f: &mut Frame, area: Rect) {
 /// Standard `Layout` split — two vertical splits then two horizontal
 /// splits — so the popup is genuinely centered on any terminal
 /// size, not just the dev's.
+///
+/// Percentages are clamped to `[0, 100]` so a caller-bug like
+/// `pct_x = 120` doesn't underflow `100 - pct_x` and panic in
+/// debug builds. The current call site is hard-coded to safe
+/// values, but defensive clamping makes the helper reusable
+/// without surprising the next caller.
 fn centered_rect(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
+    let pct_x = pct_x.min(100);
+    let pct_y = pct_y.min(100);
     let vert = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
