@@ -9,4 +9,5 @@ pub mod git_status;
 pub mod paths;
 pub mod remote;
 pub mod state;
+pub mod updater;
 pub mod vcs;
