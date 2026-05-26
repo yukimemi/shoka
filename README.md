@@ -19,12 +19,12 @@ written in Rust — a modern, jj-aware successor to
 [`rhq`](https://github.com/ubnt-intrepid/rhq). It clones repos into
 a flat `<root>/<host>/<owner>/<name>` layout, lets you fuzzy-`cd`
 between them, runs commands in parallel across the whole shelf, and
-(coming next) surfaces every repo's working state at a glance via a
-TUI dashboard.
+surfaces every repo's working state at a glance via a TUI
+dashboard.
 
-> **Status:** Phase 1 (CLI MVP) is shippable: `clone`, `import`,
-> `list`, `cd`, `exec`, `prune`, `cache`. Phase 2 (the TUI
-> dashboard) is the next milestone.
+<p align="center">
+  <img src="vhs/demo.gif" alt="shoka demo — import, list, cache refresh, and the TUI dashboard" />
+</p>
 
 ## Why another one
 
@@ -85,7 +85,7 @@ shoka exec --tag rust -- cargo check
 | `shoka doctor` | Diagnose environment + config. |
 | `shoka init-shell <shell>` | Print the shell wrapper for `cd` (see below). |
 | `shoka completion <shell>` | Print a shell-completion script. |
-| `shoka tui` | TUI dashboard. **Phase 2** — not yet implemented. |
+| `shoka tui` | TUI dashboard — branch / ↑↓ / dirty / PR / CI columns from the cached snapshot; j/k navigation, `/` for nucleo filter, Enter exits and emits the chosen repo's path so the shell wrapper can `cd` to it. |
 
 `shoka exec` is the transparent escape hatch: shoka never
 interprets the command. `shoka exec -- git fetch`, `shoka exec --
@@ -179,11 +179,12 @@ flow through [`teravars`](https://github.com/yukimemi/teravars) so
 
 - **Phase 1 — CLI MVP** ✅ `clone` / `import` / `list` / `cd` /
   `exec` / `prune` / `cache`, shell integration, completion. Done.
-- **Phase 2 — TUI dashboard.** `ratatui` + `crossterm` + `nucleo`
-  fuzzy. Per-repo cached status (branch / ahead-behind / dirty),
-  `gh` integration for open PRs / CI / contribution graph.
+- **Phase 2 — TUI dashboard** ✅ `ratatui` + `crossterm` + `nucleo`
+  fuzzy. Per-repo cached status (branch / ahead-behind / dirty)
+  from `gix`, open PR count + CI status from `octocrab`. Done.
 - **Phase 3 — Polish.** Per-profile route overrides, scaffolding
-  via `shoka new`, bulk org-move follow, OSC 7 cwd hint.
+  via `shoka new`, bulk org-move follow, OSC 7 cwd hint,
+  contribution-graph column.
 
 ## Development
 
