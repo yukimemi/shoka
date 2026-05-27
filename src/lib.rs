@@ -1,5 +1,6 @@
 //! shoka — your repository bookshelf.
 
+pub(crate) mod actions;
 pub mod cache;
 pub mod cli;
 pub mod commands;
