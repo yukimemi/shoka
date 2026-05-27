@@ -43,10 +43,11 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{Terminal, prelude::Backend};
 use teravars::Engine;
 
+use crate::actions::{ActionKind, ActionOutcome, run_action};
 use crate::cache::Cache;
 use crate::cli::TuiArgs;
 use crate::commands::ShokaContext;
@@ -185,8 +186,26 @@ struct App {
     /// active, mirroring `show_help`. See [`Picker`] for the
     /// per-item state.
     picker: Option<Picker>,
+    /// Fetch / push action result overlay. `Some` after `f` / `P`
+    /// finishes (or fails). Any keystroke dismisses it. Intercepts
+    /// input ahead of normal navigation so a stray `j` doesn't move
+    /// the cursor while the user is still reading the result.
+    action_popup: Option<ActionPopup>,
     table_state: TableState,
     matcher: Matcher,
+}
+
+/// Result of an `f` / `P` keystroke. Holds the captured stdout +
+/// stderr so the popup can show what git/jj said without the user
+/// having to drop back to a shell. `outcome` is `None` for the
+/// no-VCS-detected branch (where the action never ran).
+#[derive(Debug, Clone)]
+struct ActionPopup {
+    kind: ActionKind,
+    repo_label: String,
+    outcome: Option<ActionOutcome>,
+    /// Error message when [`outcome`] is `None`. Empty otherwise.
+    error: String,
 }
 
 /// What the picker is showing — drives the title + the fetcher
@@ -326,6 +345,7 @@ impl App {
             mode: Mode::Normal,
             show_help: false,
             picker: None,
+            action_popup: None,
             table_state,
             matcher: Matcher::default(),
         }
@@ -450,6 +470,23 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<O
             continue;
         }
 
+        // Action popup intercepts everything — it's the latest
+        // modal and the user is reading the captured git/jj output.
+        // Any keystroke (other than Ctrl-C, which always quits)
+        // dismisses it, matching the "press any key to continue"
+        // convention.
+        if app.action_popup.is_some() {
+            if key.code == KeyCode::Char('c')
+                && key
+                    .modifiers
+                    .contains(crossterm::event::KeyModifiers::CONTROL)
+            {
+                return Ok(None);
+            }
+            app.action_popup = None;
+            continue;
+        }
+
         // Picker overlay intercepts input first — it's the most
         // recently opened modal, so dismissal there takes priority
         // over the help popup or normal navigation.
@@ -509,6 +546,8 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<O
                 }
                 KeyCode::Char('i') => open_picker(app, PickerKind::Issues),
                 KeyCode::Char('p') => open_picker(app, PickerKind::Prs),
+                KeyCode::Char('f') => run_action_for_selected(app, ActionKind::Fetch),
+                KeyCode::Char('P') => run_action_for_selected(app, ActionKind::Push),
                 KeyCode::Char('j') | KeyCode::Down => app.move_down(),
                 KeyCode::Char('k') | KeyCode::Up => app.move_up(),
                 KeyCode::Char('g') => {
@@ -578,6 +617,9 @@ fn ui(f: &mut Frame, app: &mut App) {
     }
     if let Some(picker) = &app.picker {
         render_picker(f, f.area(), picker);
+    }
+    if let Some(popup) = &app.action_popup {
+        render_action_popup(f, f.area(), popup);
     }
 }
 
@@ -704,7 +746,9 @@ fn status_cells(status: Option<&GitStatusSnapshot>) -> (String, String, String) 
 
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     let hint = match app.mode {
-        Mode::Normal => "j/k=move  /=filter  enter=cd  i=issues  p=PRs  ?=help  q=quit",
+        Mode::Normal => {
+            "j/k=move  /=filter  enter=cd  i=issues  p=PRs  f=fetch  P=push  ?=help  q=quit"
+        }
         Mode::Filter => "type to filter  ⌫=delete  enter=accept  esc=clear",
     };
     f.render_widget(
@@ -726,7 +770,7 @@ fn render_help(f: &mut Frame, area: Rect) {
 
     // List entries chosen for screen-readability: the key column is
     // right-aligned in a fixed width so the descriptions line up.
-    let entries: [(&str, &str); 11] = [
+    let entries: [(&str, &str); 13] = [
         ("j / ↓", "move down"),
         ("k / ↑", "move up"),
         ("g", "jump to top"),
@@ -735,6 +779,8 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("Enter", "select (emit path for the shell wrapper to cd)"),
         ("i", "open Issues for this repo in a fuzzy picker"),
         ("p", "open Pull Requests for this repo in a fuzzy picker"),
+        ("f", "fetch this repo (jj git fetch / git fetch)"),
+        ("P", "push this repo (jj git push / git push)"),
         ("? / F1", "toggle this help"),
         ("q / Esc", "quit"),
         ("Ctrl-C", "quit"),
@@ -916,6 +962,143 @@ fn handle_picker_key(app: &mut App, key: crossterm::event::KeyEvent) {
         }
         _ => {}
     }
+}
+
+/// Run a fetch or push on the currently-selected row. Like
+/// `open_picker`, this blocks on tokio under `block_in_place` so the
+/// existing sync TUI loop doesn't need restructuring. The captured
+/// stdout / stderr land in an `ActionPopup` the next frame draws —
+/// the UI freeze during the action is the cost of v1 simplicity,
+/// matched to the freeze pickers already accept.
+fn run_action_for_selected(app: &mut App, kind: ActionKind) {
+    let Some(row_idx) = app.selected_row() else {
+        return;
+    };
+    let row = &app.rows[row_idx];
+    let repo_label = row.slug.clone();
+    let path = row.path.clone();
+
+    let result = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(run_action(&path, kind))
+    });
+
+    app.action_popup = Some(match result {
+        Ok(outcome) => ActionPopup {
+            kind,
+            repo_label,
+            outcome: Some(outcome),
+            error: String::new(),
+        },
+        Err(e) => ActionPopup {
+            kind,
+            repo_label,
+            outcome: None,
+            error: format!("{e:#}"),
+        },
+    });
+}
+
+/// Render the action result popup. Two modes — error (no VCS
+/// detected, spawn failed) shows a red banner + dismiss hint;
+/// outcome (subprocess ran) shows the command, exit status, and
+/// captured stdout/stderr. Either mode is dismissed by any key.
+fn render_action_popup(f: &mut Frame, area: Rect, popup: &ActionPopup) {
+    let rect = centered_rect(80, 60, area);
+    f.render_widget(Clear, rect);
+
+    let title = format!(" {} — {} ", popup.kind.label(), popup.repo_label);
+    let border_color = match &popup.outcome {
+        Some(o) if o.success => Color::Green,
+        Some(_) => Color::Red,
+        None => Color::Red,
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .title(title)
+        .title_style(Style::default().add_modifier(Modifier::BOLD));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(outcome) = &popup.outcome {
+        let status = if outcome.success {
+            "✓ success"
+        } else {
+            "✗ failed"
+        };
+        let status_color = if outcome.success {
+            Color::Green
+        } else {
+            Color::Red
+        };
+        lines.push(Line::from(vec![
+            ratatui::text::Span::styled(
+                format!("  {} ", outcome.vcs.label()),
+                Style::default().fg(Color::Yellow),
+            ),
+            ratatui::text::Span::styled(
+                format!("$ {}", outcome.command),
+                Style::default().fg(Color::White),
+            ),
+        ]));
+        lines.push(Line::from(ratatui::text::Span::styled(
+            format!("  {status}"),
+            Style::default()
+                .fg(status_color)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+        if !outcome.stdout.trim().is_empty() {
+            lines.push(Line::from(ratatui::text::Span::styled(
+                "  stdout:",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            for line in outcome.stdout.lines() {
+                lines.push(Line::from(format!("    {line}")));
+            }
+        }
+        if !outcome.stderr.trim().is_empty() {
+            if !outcome.stdout.trim().is_empty() {
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::from(ratatui::text::Span::styled(
+                "  stderr:",
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            for line in outcome.stderr.lines() {
+                lines.push(Line::from(format!("    {line}")));
+            }
+        }
+        if outcome.stdout.trim().is_empty() && outcome.stderr.trim().is_empty() {
+            lines.push(Line::from(ratatui::text::Span::styled(
+                "  (no output)",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    } else {
+        lines.push(Line::from(""));
+        lines.push(Line::from(ratatui::text::Span::styled(
+            format!("  ⚠  {}", popup.error),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(ratatui::text::Span::styled(
+        "  press any key to close",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    // Wrap long lines instead of truncating them at the popup edge —
+    // git / jj can emit very long URLs, error messages, and progress
+    // strings that would otherwise be silently clipped (no horizontal
+    // scrollbar exists in ratatui). `trim: false` keeps leading indent
+    // so the `    stdout:` / `    stderr:` indent stays readable.
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 /// Render the picker overlay. Always centered, always full-bleed
@@ -1457,5 +1640,50 @@ mod tests {
         handle_picker_key(&mut app, key(KeyCode::Backspace));
         let picker = app.picker.as_ref().unwrap();
         assert_eq!(picker.filter, "a");
+    }
+
+    #[test]
+    fn run_action_for_selected_noop_when_no_selection() {
+        // Empty shelf → `selected_row()` is `None`, the action
+        // function early-returns without spawning a subprocess
+        // (which would be wrong: there's no row to act on) and
+        // crucially without installing a popup. The dashboard stays
+        // exactly as it was.
+        let mut app = App::new(rows(&[]));
+        run_action_for_selected(&mut app, ActionKind::Fetch);
+        assert!(
+            app.action_popup.is_none(),
+            "no row selected → no popup should be set"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_action_for_selected_records_error_when_no_vcs() {
+        // Real path that has neither `.jj/` nor `.git/`. `run_action`
+        // returns `Err`, which `run_action_for_selected` should fold
+        // into a popup with `outcome: None` + a non-empty error
+        // message — never panic, never silently swallow.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().to_path_buf();
+        let row = DashRow {
+            slug: "local/test/repo".into(),
+            path,
+            tags_display: String::new(),
+            status: None,
+            gh: None,
+        };
+        let mut app = App::new(vec![row]);
+        run_action_for_selected(&mut app, ActionKind::Fetch);
+        let popup = app.action_popup.as_ref().expect("popup installed");
+        assert!(
+            popup.outcome.is_none(),
+            "no-VCS branch should leave `outcome` None to drive the error styling"
+        );
+        assert!(
+            !popup.error.is_empty(),
+            "error message must be populated so the user sees why the action failed"
+        );
+        assert_eq!(popup.kind, ActionKind::Fetch);
+        assert_eq!(popup.repo_label, "local/test/repo");
     }
 }
