@@ -1331,4 +1331,131 @@ mod tests {
         assert!(key.contains("bug"), "label missing: {key}");
         assert!(key.contains("p1"), "label missing: {key}");
     }
+
+    /// Helper: construct an `App` whose first row carries the given
+    /// slug, so `open_picker`'s row-resolution path runs against a
+    /// known input. The non-slug fields don't matter for the early-
+    /// return branches we're testing.
+    fn app_with_single_slug(slug: &str) -> App {
+        App::new(rows(&[slug]))
+    }
+
+    fn key(code: KeyCode) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn open_picker_short_circuits_on_malformed_slug() {
+        // A slug missing the host/owner/name shape should land us in
+        // the error popup with a message that includes the bad slug,
+        // not the live-fetch path (which would need network).
+        let mut app = app_with_single_slug("no-slashes-here");
+        open_picker(&mut app, PickerKind::Issues);
+        let picker = app.picker.as_ref().expect("error picker installed");
+        let err = picker.error.as_ref().expect("error message set");
+        assert!(
+            err.contains("no-slashes-here"),
+            "malformed-slug error should mention the slug, got: {err}"
+        );
+    }
+
+    #[test]
+    fn open_picker_short_circuits_on_non_github_host() {
+        // `host = local` (from `shoka import` for a local-only repo)
+        // and `host = gitlab.com` / etc. should all hit the same
+        // "github only" branch before any network call. Pointing at
+        // a clearly-distinct host keeps the assertion robust against
+        // future tweaks to the message text.
+        let mut app = app_with_single_slug("gitlab.com/some/proj");
+        open_picker(&mut app, PickerKind::Prs);
+        let picker = app.picker.as_ref().expect("error picker installed");
+        let err = picker.error.as_ref().expect("error message set");
+        assert!(
+            err.contains("github.com") && err.contains("gitlab.com"),
+            "non-github error should mention both the requirement and the actual host, got: {err}"
+        );
+        assert!(
+            err.contains(PickerKind::Prs.title()),
+            "error should name the kind so the user knows what they tried to open, got: {err}"
+        );
+    }
+
+    #[test]
+    fn handle_picker_key_esc_closes_picker() {
+        let mut app = App::new(rows(&[]));
+        app.picker = Some(Picker::loaded(
+            PickerKind::Issues,
+            "github.com/x/y".into(),
+            picker_items(&[(1, "alpha", &[])]),
+        ));
+        handle_picker_key(&mut app, key(KeyCode::Esc));
+        assert!(app.picker.is_none(), "Esc should close the picker");
+    }
+
+    #[test]
+    fn handle_picker_key_q_closes_picker() {
+        let mut app = App::new(rows(&[]));
+        app.picker = Some(Picker::loaded(
+            PickerKind::Issues,
+            "github.com/x/y".into(),
+            picker_items(&[(1, "alpha", &[])]),
+        ));
+        handle_picker_key(&mut app, key(KeyCode::Char('q')));
+        assert!(app.picker.is_none(), "q should close the picker");
+    }
+
+    #[test]
+    fn handle_picker_key_enter_on_empty_items_closes_without_browser_launch() {
+        // Enter with no `selected()` skips the `open::that` call
+        // entirely (no subprocess fired) and still closes the popup.
+        // Tests run in CI where launching a browser would be
+        // useless at best and flaky at worst, so the empty-list path
+        // is the right hook to assert "Enter does close" without
+        // collateral effects.
+        let mut app = App::new(rows(&[]));
+        app.picker = Some(Picker::loaded(
+            PickerKind::Issues,
+            "github.com/x/y".into(),
+            vec![],
+        ));
+        handle_picker_key(&mut app, key(KeyCode::Enter));
+        assert!(
+            app.picker.is_none(),
+            "Enter should close the picker even with nothing to open"
+        );
+    }
+
+    #[test]
+    fn handle_picker_key_char_appends_to_filter_and_refilters() {
+        let mut app = App::new(rows(&[]));
+        app.picker = Some(Picker::loaded(
+            PickerKind::Issues,
+            "github.com/x/y".into(),
+            picker_items(&[(1, "alpha", &[]), (2, "zeta", &[])]),
+        ));
+        handle_picker_key(&mut app, key(KeyCode::Char('a')));
+        let picker = app.picker.as_ref().unwrap();
+        assert_eq!(picker.filter, "a");
+        // Both items contain `a` (`alpha` literally, `zeta` ends with
+        // it), so matches is non-empty — the real assertion is just
+        // that typing went through and refilter ran. Stronger orderings
+        // belong in the dedicated refilter tests above.
+        assert!(!picker.matches.is_empty());
+    }
+
+    #[test]
+    fn handle_picker_key_backspace_pops_and_refilters() {
+        let mut app = App::new(rows(&[]));
+        let mut p = Picker::loaded(
+            PickerKind::Issues,
+            "github.com/x/y".into(),
+            picker_items(&[(1, "alpha", &[])]),
+        );
+        p.filter = "ab".into();
+        p.refilter();
+        app.picker = Some(p);
+        handle_picker_key(&mut app, key(KeyCode::Backspace));
+        let picker = app.picker.as_ref().unwrap();
+        assert_eq!(picker.filter, "a");
+    }
 }
