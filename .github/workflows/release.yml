@@ -39,6 +39,18 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --target ${{ matrix.target }}
+      # Run the `smoke` example on the same runner that produced the
+      # binary, against the actual rustls TLS stack. `cargo test` runs
+      # only library code and missed v0.10.0's `CryptoProvider` panic
+      # (caught only by users running `shoka cache refresh`); this
+      # step would have blocked that release before crates.io publish.
+      # `GITHUB_TOKEN` lets octocrab share the runner's per-repo
+      # budget instead of the anonymous limit, which is per-IP and
+      # routinely 403s on shared Actions infrastructure.
+      - name: smoke
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo run --release --target ${{ matrix.target }} --example smoke
       - name: package (unix)
         if: runner.os != 'Windows'
         run: |
