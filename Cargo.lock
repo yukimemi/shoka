@@ -4359,6 +4359,7 @@ dependencies = [
  "predicates",
  "ratatui",
  "regex",
+ "rustls",
  "serde",
  "tempfile",
  "teravars",
