@@ -191,6 +191,12 @@ struct App {
     /// input ahead of normal navigation so a stray `j` doesn't move
     /// the cursor while the user is still reading the result.
     action_popup: Option<ActionPopup>,
+    /// Transient status banner shown in the footer after `y` / `o`
+    /// (and other light, non-popup actions). Cleared on the next
+    /// non-status-producing keystroke so the user always sees the
+    /// outcome of their most recent action without it sticking
+    /// around as visual noise.
+    status_message: Option<String>,
     table_state: TableState,
     matcher: Matcher,
 }
@@ -346,6 +352,7 @@ impl App {
             show_help: false,
             picker: None,
             action_popup: None,
+            status_message: None,
             table_state,
             matcher: Matcher::default(),
         }
@@ -532,42 +539,52 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<O
         }
 
         match app.mode {
-            Mode::Normal => match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => return Ok(None),
-                KeyCode::Char('c')
-                    if key
-                        .modifiers
-                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
-                {
-                    return Ok(None);
-                }
-                KeyCode::Char('?') | KeyCode::F(1) => {
-                    app.show_help = true;
-                }
-                KeyCode::Char('i') => open_picker(app, PickerKind::Issues),
-                KeyCode::Char('p') => open_picker(app, PickerKind::Prs),
-                KeyCode::Char('f') => run_action_for_selected(app, ActionKind::Fetch),
-                KeyCode::Char('P') => run_action_for_selected(app, ActionKind::Push),
-                KeyCode::Char('j') | KeyCode::Down => app.move_down(),
-                KeyCode::Char('k') | KeyCode::Up => app.move_up(),
-                KeyCode::Char('g') => {
-                    app.cursor = 0;
-                    if !app.matches.is_empty() {
-                        app.table_state.select(Some(0));
+            Mode::Normal => {
+                // Any keystroke in normal mode wipes the last
+                // status banner (y / o being the only setters
+                // today). y / o set it again inside their handlers
+                // below, so repeating either keeps the message
+                // visible until a *different* key arrives.
+                app.status_message = None;
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => return Ok(None),
+                    KeyCode::Char('c')
+                        if key
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                    {
+                        return Ok(None);
                     }
+                    KeyCode::Char('?') | KeyCode::F(1) => {
+                        app.show_help = true;
+                    }
+                    KeyCode::Char('i') => open_picker(app, PickerKind::Issues),
+                    KeyCode::Char('p') => open_picker(app, PickerKind::Prs),
+                    KeyCode::Char('f') => run_action_for_selected(app, ActionKind::Fetch),
+                    KeyCode::Char('P') => run_action_for_selected(app, ActionKind::Push),
+                    KeyCode::Char('y') => yank_selected_slug(app),
+                    KeyCode::Char('o') => open_selected_repo_home(app),
+                    KeyCode::Char('j') | KeyCode::Down => app.move_down(),
+                    KeyCode::Char('k') | KeyCode::Up => app.move_up(),
+                    KeyCode::Char('g') => {
+                        app.cursor = 0;
+                        if !app.matches.is_empty() {
+                            app.table_state.select(Some(0));
+                        }
+                    }
+                    KeyCode::Char('G') if !app.matches.is_empty() => {
+                        app.cursor = app.matches.len() - 1;
+                        app.table_state.select(Some(app.cursor));
+                    }
+                    KeyCode::Char('/') => {
+                        app.mode = Mode::Filter;
+                    }
+                    KeyCode::Enter => {
+                        return Ok(app.selected_row());
+                    }
+                    _ => {}
                 }
-                KeyCode::Char('G') if !app.matches.is_empty() => {
-                    app.cursor = app.matches.len() - 1;
-                    app.table_state.select(Some(app.cursor));
-                }
-                KeyCode::Char('/') => {
-                    app.mode = Mode::Filter;
-                }
-                KeyCode::Enter => {
-                    return Ok(app.selected_row());
-                }
-                _ => {}
-            },
+            }
             Mode::Filter => match key.code {
                 KeyCode::Esc => {
                     app.filter.clear();
@@ -745,9 +762,20 @@ fn status_cells(status: Option<&GitStatusSnapshot>) -> (String, String, String) 
 }
 
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
+    // A status message (set by y / o) preempts the mode hint so the
+    // user immediately sees what their last action did. Styled
+    // brighter than the hint (cyan vs dark gray) so it visibly reads
+    // as a fresh result, not a permanent legend.
+    if let Some(msg) = &app.status_message {
+        f.render_widget(
+            Paragraph::new(msg.clone()).style(Style::default().fg(Color::Cyan)),
+            area,
+        );
+        return;
+    }
     let hint = match app.mode {
         Mode::Normal => {
-            "j/k=move  /=filter  enter=cd  i=issues  p=PRs  f=fetch  P=push  ?=help  q=quit"
+            "j/k=move  /=filter  enter=cd  i=iss  p=PR  f=fetch  P=push  y=yank  o=open  ?=help  q=quit"
         }
         Mode::Filter => "type to filter  ⌫=delete  enter=accept  esc=clear",
     };
@@ -770,7 +798,7 @@ fn render_help(f: &mut Frame, area: Rect) {
 
     // List entries chosen for screen-readability: the key column is
     // right-aligned in a fixed width so the descriptions line up.
-    let entries: [(&str, &str); 13] = [
+    let entries: [(&str, &str); 15] = [
         ("j / ↓", "move down"),
         ("k / ↑", "move up"),
         ("g", "jump to top"),
@@ -781,6 +809,8 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("p", "open Pull Requests for this repo in a fuzzy picker"),
         ("f", "fetch this repo (jj git fetch / git fetch)"),
         ("P", "push this repo (jj git push / git push)"),
+        ("y", "yank slug to clipboard"),
+        ("o", "open repo home in browser"),
         ("? / F1", "toggle this help"),
         ("q / Esc", "quit"),
         ("Ctrl-C", "quit"),
@@ -996,6 +1026,52 @@ fn run_action_for_selected(app: &mut App, kind: ActionKind) {
             error: format!("{e:#}"),
         },
     });
+}
+
+/// Copy the selected row's slug (e.g. `github.com/owner/name`) to
+/// the system clipboard. Failures surface as a status banner rather
+/// than a popup — yanking is meant to be invisible-on-success, and
+/// a wall of red on a missing clipboard daemon would just be noise.
+fn yank_selected_slug(app: &mut App) {
+    let Some(row_idx) = app.selected_row() else {
+        return;
+    };
+    let slug = app.rows[row_idx].slug.clone();
+    match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(slug.clone())) {
+        Ok(()) => {
+            app.status_message = Some(format!("yanked: {slug}"));
+        }
+        Err(e) => {
+            app.status_message = Some(format!("yank failed: {e}"));
+        }
+    }
+}
+
+/// Open the selected row's repo home page in the user's default
+/// browser. `host/owner/name` slugs translate directly to
+/// `https://host/owner/name`, which is what every real host
+/// (github.com, gitlab.com, codeberg.org…) serves. The synthetic
+/// `local/...` host that `shoka import` mints for repos without a
+/// remote has no web home, so short-circuit with a status note
+/// rather than launch an inevitably-404 browser tab.
+fn open_selected_repo_home(app: &mut App) {
+    let Some(row_idx) = app.selected_row() else {
+        return;
+    };
+    let slug = app.rows[row_idx].slug.clone();
+    if slug.starts_with("local/") {
+        app.status_message = Some("no repo home: local-only repo".into());
+        return;
+    }
+    let url = format!("https://{slug}");
+    match open::that(&url) {
+        Ok(()) => {
+            app.status_message = Some(format!("opened: {url}"));
+        }
+        Err(e) => {
+            app.status_message = Some(format!("open failed: {e}"));
+        }
+    }
 }
 
 /// Render the action result popup. Two modes — error (no VCS
@@ -1685,5 +1761,53 @@ mod tests {
         );
         assert_eq!(popup.kind, ActionKind::Fetch);
         assert_eq!(popup.repo_label, "local/test/repo");
+    }
+
+    #[test]
+    fn yank_selected_slug_noop_when_no_selection() {
+        // Empty shelf → no row, so the clipboard is never touched and
+        // no status banner is set. Important because arboard's
+        // `Clipboard::new()` can fail on headless CI runners, and we
+        // don't want a stray `y` keystroke (e.g. while debugging an
+        // empty shelf) to surface a confusing error message.
+        let mut app = App::new(rows(&[]));
+        yank_selected_slug(&mut app);
+        assert!(
+            app.status_message.is_none(),
+            "no row selected → no status message should be set"
+        );
+    }
+
+    #[test]
+    fn open_selected_repo_home_short_circuits_on_local_host() {
+        // `host = local` is the synthetic slug shoka mints for
+        // jj-only / no-remote repos via `shoka import`. There's no
+        // web home for these, so the open helper must surface a
+        // status note instead of spawning a browser to
+        // `https://local/...` (which would 404 — annoying, not
+        // dangerous, but pointless).
+        let mut app = app_with_single_slug("local/scratch/notes");
+        open_selected_repo_home(&mut app);
+        let msg = app
+            .status_message
+            .as_ref()
+            .expect("status banner installed");
+        assert!(
+            msg.contains("local-only"),
+            "local-host status banner should mention the cause, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn open_selected_repo_home_noop_when_no_selection() {
+        // Empty shelf → no row, so neither the browser nor the
+        // status banner should fire. Defensive: a stray `o` on an
+        // empty dashboard shouldn't open a `https:///` tab.
+        let mut app = App::new(rows(&[]));
+        open_selected_repo_home(&mut app);
+        assert!(
+            app.status_message.is_none(),
+            "no row selected → no status message should be set"
+        );
     }
 }
