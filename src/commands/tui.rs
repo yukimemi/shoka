@@ -179,8 +179,130 @@ struct App {
     /// without leaking modal state between the two. Toggled by `?`
     /// or F1 and dismissed by `Esc`, `q`, or `?` again.
     show_help: bool,
+    /// Issue / PR Telescope-style picker overlay. `Some` when an
+    /// `i` / `p` keystroke fetched a list (or hit an error worth
+    /// displaying); `None` otherwise. Intercepts all input while
+    /// active, mirroring `show_help`. See [`Picker`] for the
+    /// per-item state.
+    picker: Option<Picker>,
     table_state: TableState,
     matcher: Matcher,
+}
+
+/// What the picker is showing — drives the title + the fetcher
+/// chosen by `open_picker`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PickerKind {
+    Issues,
+    Prs,
+}
+
+impl PickerKind {
+    fn title(self) -> &'static str {
+        match self {
+            PickerKind::Issues => "Issues",
+            PickerKind::Prs => "Pull Requests",
+        }
+    }
+}
+
+/// Picker overlay state. Either showing live data ([`Self::loaded`])
+/// or a single-line failure message ([`Self::error`]) — both render
+/// in the same popup so the user always sees *something* explaining
+/// why they pressed the key.
+struct Picker {
+    kind: PickerKind,
+    /// Display label for the repo the picker was opened on, e.g.
+    /// `github.com/yukimemi/shoka`. Shown in the popup title so
+    /// the user can tell which row they triggered against.
+    repo_label: String,
+    /// Items fetched from gh. Empty when `error` is `Some` or when
+    /// the repo legitimately has no open issues / PRs.
+    items: Vec<crate::gh::PickerItem>,
+    /// Live filter query.
+    filter: String,
+    /// Indices into `items`, score-sorted (highest first).
+    matches: Vec<usize>,
+    /// Position within `matches` of the highlighted row.
+    cursor: usize,
+    /// When `Some`, the popup renders just the message (no list,
+    /// no filter). Drives the "no token" / "non-github host" /
+    /// "fetch errored" branches.
+    error: Option<String>,
+    matcher: Matcher,
+}
+
+impl Picker {
+    fn loaded(kind: PickerKind, repo_label: String, items: Vec<crate::gh::PickerItem>) -> Self {
+        let matches = (0..items.len()).collect();
+        Self {
+            kind,
+            repo_label,
+            items,
+            filter: String::new(),
+            matches,
+            cursor: 0,
+            error: None,
+            matcher: Matcher::default(),
+        }
+    }
+
+    fn error(kind: PickerKind, repo_label: String, msg: impl Into<String>) -> Self {
+        Self {
+            kind,
+            repo_label,
+            items: Vec::new(),
+            filter: String::new(),
+            matches: Vec::new(),
+            cursor: 0,
+            error: Some(msg.into()),
+            matcher: Matcher::default(),
+        }
+    }
+
+    /// Re-rank items against the current filter. Empty filter =
+    /// identity order (as returned by the gh API, which is
+    /// most-recently-updated first); a non-empty filter scores each
+    /// item's `search_key` via nucleo and keeps positive-score
+    /// matches sorted descending.
+    fn refilter(&mut self) {
+        if self.filter.is_empty() {
+            self.matches = (0..self.items.len()).collect();
+        } else {
+            let pattern = Pattern::parse(&self.filter, CaseMatching::Smart, Normalization::Smart);
+            let mut scored: Vec<(usize, u32)> = Vec::new();
+            let mut buf: Vec<char> = Vec::new();
+            for (idx, item) in self.items.iter().enumerate() {
+                buf.clear();
+                let key = item.search_key();
+                let haystack = nucleo::Utf32Str::new(&key, &mut buf);
+                if let Some(score) = pattern.score(haystack, &mut self.matcher) {
+                    scored.push((idx, score));
+                }
+            }
+            scored.sort_by_key(|&(_, score)| std::cmp::Reverse(score));
+            self.matches = scored.into_iter().map(|(idx, _)| idx).collect();
+        }
+        self.cursor = 0;
+    }
+
+    fn move_down(&mut self) {
+        if self.matches.is_empty() {
+            return;
+        }
+        self.cursor = (self.cursor + 1).min(self.matches.len() - 1);
+    }
+
+    fn move_up(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    /// The currently-highlighted item, if any. `None` when the
+    /// list is empty (no matches, no fetched items, or error mode).
+    fn selected(&self) -> Option<&crate::gh::PickerItem> {
+        let idx = *self.matches.get(self.cursor)?;
+        self.items.get(idx)
+    }
 }
 
 impl App {
@@ -195,6 +317,7 @@ impl App {
             cursor: 0,
             mode: Mode::Normal,
             show_help: false,
+            picker: None,
             table_state,
             matcher: Matcher::default(),
         }
@@ -319,6 +442,22 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<O
             continue;
         }
 
+        // Picker overlay intercepts input first — it's the most
+        // recently opened modal, so dismissal there takes priority
+        // over the help popup or normal navigation.
+        if app.picker.is_some() {
+            // Ctrl-C escape hatch (same reasoning as the help popup).
+            if key.code == KeyCode::Char('c')
+                && key
+                    .modifiers
+                    .contains(crossterm::event::KeyModifiers::CONTROL)
+            {
+                return Ok(None);
+            }
+            handle_picker_key(app, key);
+            continue;
+        }
+
         // Help popup intercepts everything except its own dismissal
         // keys + Ctrl-C. Keep this check outside `match app.mode` so
         // the popup can be opened from Filter mode too — but only
@@ -360,6 +499,8 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<O
                 KeyCode::Char('?') | KeyCode::F(1) => {
                     app.show_help = true;
                 }
+                KeyCode::Char('i') => open_picker(app, PickerKind::Issues),
+                KeyCode::Char('p') => open_picker(app, PickerKind::Prs),
                 KeyCode::Char('j') | KeyCode::Down => app.move_down(),
                 KeyCode::Char('k') | KeyCode::Up => app.move_up(),
                 KeyCode::Char('g') => {
@@ -419,11 +560,16 @@ fn ui(f: &mut Frame, app: &mut App) {
     render_table(f, chunks[1], app);
     render_footer(f, chunks[2], app);
 
-    // Help popup is drawn last so it overlays everything else. The
-    // ratatui `Clear` widget zeroes the popup's region before we
-    // paint so the table's text doesn't bleed through.
+    // Help popup is drawn over the dashboard; the picker is drawn
+    // *over the help popup* — both use `Clear` to wipe their rect
+    // first, so the lower layers don't bleed through. Order matters:
+    // we draw picker last so it visually wins when both flags are
+    // set (shouldn't happen via UI flow, but defensive).
     if app.show_help {
         render_help(f, f.area());
+    }
+    if let Some(picker) = &app.picker {
+        render_picker(f, f.area(), picker);
     }
 }
 
@@ -550,7 +696,7 @@ fn status_cells(status: Option<&GitStatusSnapshot>) -> (String, String, String) 
 
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     let hint = match app.mode {
-        Mode::Normal => "j/k=move  /=filter  enter=cd  ?=help  q=quit",
+        Mode::Normal => "j/k=move  /=filter  enter=cd  i=issues  p=PRs  ?=help  q=quit",
         Mode::Filter => "type to filter  ⌫=delete  enter=accept  esc=clear",
     };
     f.render_widget(
@@ -572,13 +718,15 @@ fn render_help(f: &mut Frame, area: Rect) {
 
     // List entries chosen for screen-readability: the key column is
     // right-aligned in a fixed width so the descriptions line up.
-    let entries: [(&str, &str); 9] = [
+    let entries: [(&str, &str); 11] = [
         ("j / ↓", "move down"),
         ("k / ↑", "move up"),
         ("g", "jump to top"),
         ("G", "jump to bottom"),
         ("/", "filter — type to narrow, esc to clear"),
         ("Enter", "select (emit path for the shell wrapper to cd)"),
+        ("i", "open Issues for this repo in a fuzzy picker"),
+        ("p", "open Pull Requests for this repo in a fuzzy picker"),
         ("? / F1", "toggle this help"),
         ("q / Esc", "quit"),
         ("Ctrl-C", "quit"),
@@ -649,6 +797,227 @@ fn centered_rect(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - pct_x) / 2),
         ])
         .split(vert[1])[1]
+}
+
+/// Resolve the current row → octocrab client → list_open_issues /
+/// list_open_prs (synchronous: `block_on` inside `block_in_place`,
+/// safe under the multi-threaded tokio runtime shoka's `main` uses).
+/// All failure modes (no selected row, non-github host, missing
+/// token, gh client build error, API error) collapse to a single
+/// `Picker::error(...)` so the user always gets a popup that
+/// explains what happened instead of a silently-stuck keystroke.
+///
+/// Blocking the runtime here makes the UI freeze briefly during the
+/// fetch — acceptable for a v1 picker, since the call is bounded by
+/// `per_page(100)` plus normal network RTT. A future polish PR can
+/// move this to a background tokio task + spinner without
+/// restructuring callers.
+fn open_picker(app: &mut App, kind: PickerKind) {
+    let Some(row_idx) = app.selected_row() else {
+        return;
+    };
+    let row = &app.rows[row_idx];
+
+    // Slug is `<host>/<owner>/<name>`. Anything else means a malformed
+    // shelf entry — short-circuit with a message rather than panic.
+    let parts: Vec<&str> = row.slug.splitn(3, '/').collect();
+    let &[host, owner, name] = parts.as_slice() else {
+        app.picker = Some(Picker::error(
+            kind,
+            row.slug.clone(),
+            format!("can't parse slug `{}`", row.slug),
+        ));
+        return;
+    };
+    let repo_label = format!("{host}/{owner}/{name}");
+
+    if host != "github.com" {
+        app.picker = Some(Picker::error(
+            kind,
+            repo_label,
+            format!(
+                "{} are only available on github.com (this repo is on `{host}`)",
+                kind.title()
+            ),
+        ));
+        return;
+    }
+
+    // Resolve token + build client + fetch, all under one block_on
+    // so we don't fragment the runtime stack. block_in_place lets
+    // the multi-threaded scheduler reuse this worker thread while
+    // we block, rather than stalling other tasks.
+    let fetched = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async move {
+            let Some(token) = crate::gh::resolve_token().await else {
+                return Err(anyhow::anyhow!(
+                    "no GITHUB_TOKEN — set the env var or run `gh auth login`"
+                ));
+            };
+            let client = crate::gh::build_client(&token)
+                .map_err(|e| anyhow::anyhow!("gh client init failed: {e:#}"))?;
+            match kind {
+                PickerKind::Issues => crate::gh::list_open_issues(&client, owner, name).await,
+                PickerKind::Prs => crate::gh::list_open_prs(&client, owner, name).await,
+            }
+        })
+    });
+
+    let picker = match fetched {
+        Ok(items) => Picker::loaded(kind, repo_label, items),
+        Err(e) => Picker::error(kind, repo_label, format!("{e:#}")),
+    };
+    app.picker = Some(picker);
+}
+
+/// Dispatch a keystroke while the picker overlay is open. Mutates
+/// `app.picker` (close on Esc/q, refilter on typing, move cursor,
+/// hand off to `open::that` on Enter).
+fn handle_picker_key(app: &mut App, key: crossterm::event::KeyEvent) {
+    let Some(picker) = app.picker.as_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.picker = None;
+        }
+        KeyCode::Char('j') | KeyCode::Down => picker.move_down(),
+        KeyCode::Char('k') | KeyCode::Up => picker.move_up(),
+        KeyCode::Enter => {
+            if let Some(item) = picker.selected() {
+                let url = item.html_url.clone();
+                // `open::that` blocks until the OS handler launches
+                // (xdg-open / open / start), but those are fast and
+                // detach immediately, so the UI freeze is sub-100ms.
+                if let Err(e) = open::that(&url) {
+                    tracing::warn!(
+                        target: "shoka",
+                        "failed to open {url} in browser: {e:#}"
+                    );
+                }
+            }
+            app.picker = None;
+        }
+        KeyCode::Backspace => {
+            picker.filter.pop();
+            picker.refilter();
+        }
+        KeyCode::Char(c) => {
+            picker.filter.push(c);
+            picker.refilter();
+        }
+        _ => {}
+    }
+}
+
+/// Render the picker overlay. Always centered, always full-bleed
+/// over the dashboard. Three modes — error (single line + dismiss
+/// hint), empty list (no items match the current filter), populated
+/// list (filter line + scrollable items).
+fn render_picker(f: &mut Frame, area: Rect, picker: &Picker) {
+    let popup = centered_rect(80, 80, area);
+    f.render_widget(Clear, popup);
+
+    let title = format!(" {} — {} ", picker.kind.title(), picker.repo_label);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(title)
+        .title_style(Style::default().add_modifier(Modifier::BOLD));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    // Single-line error mode: render the message and a dismiss hint,
+    // skip the list entirely. Keeps the visual weight matched to
+    // what the user can act on.
+    if let Some(err) = &picker.error {
+        let body = vec![
+            Line::from(""),
+            Line::from(ratatui::text::Span::styled(
+                format!("  ⚠  {err}"),
+                Style::default().fg(Color::Red),
+            )),
+            Line::from(""),
+            Line::from(ratatui::text::Span::styled(
+                "  esc / q to close",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+        f.render_widget(Paragraph::new(body), inner);
+        return;
+    }
+
+    // Layout: filter row (1 line) + list (rest minus 1) + footer (1).
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    // Filter row — cursor `_` glyph indicates this is a live input.
+    let filter_line = Line::from(vec![
+        ratatui::text::Span::styled(
+            "  / ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        ratatui::text::Span::raw(picker.filter.clone()),
+        ratatui::text::Span::styled("_", Style::default().fg(Color::Yellow)),
+    ]);
+    f.render_widget(Paragraph::new(filter_line), chunks[0]);
+
+    // List — show `cursor` highlight + truncate items past visible area.
+    // We don't paginate; if a repo has 100+ items the user just narrows
+    // with the filter (that's the whole point of the popup).
+    let visible_h = chunks[1].height as usize;
+    let total = picker.matches.len();
+    let scroll_top = picker.cursor.saturating_sub(visible_h.saturating_sub(1));
+
+    let mut lines: Vec<Line> = Vec::with_capacity(total.min(visible_h));
+    for (visual_idx, &item_idx) in picker
+        .matches
+        .iter()
+        .enumerate()
+        .skip(scroll_top)
+        .take(visible_h)
+    {
+        let item = &picker.items[item_idx];
+        let is_cursor = visual_idx == picker.cursor;
+        let prefix = if is_cursor { "▶ " } else { "  " };
+        let labels = if item.labels.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", item.labels.join(","))
+        };
+        let row_text = format!("{prefix}#{:<5}  {}{}", item.number, item.title, labels);
+        let style = if is_cursor {
+            Style::default()
+                .bg(Color::Blue)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(ratatui::text::Span::styled(row_text, style)));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(ratatui::text::Span::styled(
+            "  (no matches)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    f.render_widget(Paragraph::new(lines), chunks[1]);
+
+    // Footer.
+    let footer = Line::from(ratatui::text::Span::styled(
+        "  j/k=move  type=filter  enter=open in browser  esc=close",
+        Style::default().fg(Color::DarkGray),
+    ));
+    f.render_widget(Paragraph::new(footer), chunks[2]);
 }
 
 #[cfg(test)]
@@ -875,5 +1244,83 @@ mod tests {
         app.refilter();
         // After filtering only "aaa" remains, mapping to shelf idx 1.
         assert_eq!(app.selected_row(), Some(1));
+    }
+
+    fn picker_items(items: &[(u64, &str, &[&str])]) -> Vec<crate::gh::PickerItem> {
+        items
+            .iter()
+            .map(|(n, t, ls)| crate::gh::PickerItem {
+                number: *n,
+                title: (*t).into(),
+                html_url: format!("https://github.com/x/y/issues/{n}"),
+                labels: ls.iter().map(|s| (*s).into()).collect(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn picker_refilter_empty_query_keeps_identity_order() {
+        let mut p = Picker::loaded(
+            PickerKind::Issues,
+            "x/y/z".into(),
+            picker_items(&[(1, "alpha", &[]), (2, "beta", &[]), (3, "gamma", &[])]),
+        );
+        p.refilter();
+        assert_eq!(p.matches, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn picker_refilter_narrows_against_title_and_labels() {
+        let mut p = Picker::loaded(
+            PickerKind::Issues,
+            "x/y/z".into(),
+            picker_items(&[
+                (1, "broken thing", &["bug"]),
+                (2, "happy path", &["enhancement"]),
+                (3, "another bug-fix", &[]),
+            ]),
+        );
+        p.filter = "bug".into();
+        p.refilter();
+        // Items 1 and 3 should match (1 via label, 3 via title);
+        // item 2 should not. Order is nucleo's call (score desc).
+        let matched: Vec<u64> = p.matches.iter().map(|&i| p.items[i].number).collect();
+        assert!(
+            matched.contains(&1) && matched.contains(&3),
+            "expected items 1 + 3 to match, got: {matched:?}"
+        );
+        assert!(
+            !matched.contains(&2),
+            "item 2 should not match `bug`, got: {matched:?}"
+        );
+    }
+
+    #[test]
+    fn picker_error_renders_with_no_items() {
+        // Error-mode picker has an empty items list and a non-None
+        // error field. `selected()` returns None — render_picker
+        // takes the error branch and never reaches the list code.
+        let p = Picker::error(PickerKind::Prs, "github.com/x/y".into(), "no GITHUB_TOKEN");
+        assert!(p.items.is_empty());
+        assert_eq!(p.error.as_deref(), Some("no GITHUB_TOKEN"));
+        assert!(p.selected().is_none());
+    }
+
+    #[test]
+    fn picker_search_key_includes_number_title_and_labels() {
+        // The key is what nucleo scores against, so it has to mention
+        // every searchable surface. A regression here would silently
+        // make label / number queries miss.
+        let item = crate::gh::PickerItem {
+            number: 42,
+            title: "fix the thing".into(),
+            html_url: "https://github.com/x/y/issues/42".into(),
+            labels: vec!["bug".into(), "p1".into()],
+        };
+        let key = item.search_key();
+        assert!(key.contains("42"), "number missing: {key}");
+        assert!(key.contains("fix the thing"), "title missing: {key}");
+        assert!(key.contains("bug"), "label missing: {key}");
+        assert!(key.contains("p1"), "label missing: {key}");
     }
 }

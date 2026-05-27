@@ -179,6 +179,96 @@ fn classify_ci(run: &octocrab::models::workflows::Run) -> CiStatus {
     }
 }
 
+/// One Issue or PR as the TUI picker needs to render and act on it.
+/// Same shape for both because the TUI treats them identically —
+/// number + title + URL + labels. PRs only show up in the issue
+/// listing on GitHub as a special-case (`pull_request` field set),
+/// so `list_open_issues` is the only place that filters them out
+/// to avoid double-counting in the issues picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PickerItem {
+    pub number: u64,
+    pub title: String,
+    pub html_url: String,
+    pub labels: Vec<String>,
+}
+
+impl PickerItem {
+    /// Single line used by the picker's fuzzy index. Combining
+    /// number + title + labels means a query like "bug 42" matches
+    /// either the title text or the label `bug`, which is what users
+    /// expect from a Telescope-style picker.
+    pub fn search_key(&self) -> String {
+        if self.labels.is_empty() {
+            format!("#{} {}", self.number, self.title)
+        } else {
+            format!(
+                "#{} {} [{}]",
+                self.number,
+                self.title,
+                self.labels.join(",")
+            )
+        }
+    }
+}
+
+/// List open issues for `owner/name`. Filters out pull requests —
+/// GitHub's REST API folds PRs into the `/issues` listing with a
+/// `pull_request` field set, and showing them twice (once in `i`
+/// and once in `p`) is the kind of thing nobody asks for but
+/// everybody notices.
+pub async fn list_open_issues(
+    client: &Octocrab,
+    owner: &str,
+    name: &str,
+) -> Result<Vec<PickerItem>> {
+    let page = client
+        .issues(owner, name)
+        .list()
+        .state(octocrab::params::State::Open)
+        .per_page(100)
+        .send()
+        .await?;
+    Ok(page
+        .items
+        .into_iter()
+        .filter(|i| i.pull_request.is_none())
+        .map(|i| PickerItem {
+            number: i.number,
+            title: i.title,
+            html_url: i.html_url.to_string(),
+            labels: i.labels.into_iter().map(|l| l.name).collect(),
+        })
+        .collect())
+}
+
+/// List open pull requests for `owner/name`. octocrab's pulls API
+/// already returns *only* PRs (no issue cross-contamination), so no
+/// extra filtering needed.
+pub async fn list_open_prs(client: &Octocrab, owner: &str, name: &str) -> Result<Vec<PickerItem>> {
+    let page = client
+        .pulls(owner, name)
+        .list()
+        .state(octocrab::params::State::Open)
+        .per_page(100)
+        .send()
+        .await?;
+    Ok(page
+        .items
+        .into_iter()
+        .map(|pr| PickerItem {
+            number: pr.number,
+            // octocrab's `title` / `html_url` / `labels` are all
+            // non-optional on PullRequest as of 0.45, so no fallback
+            // needed. Kept explicit in case of a future schema bump
+            // that re-introduces Option<…> wrappers.
+            title: pr.title,
+            html_url: pr.html_url.to_string(),
+            labels: pr.labels.into_iter().map(|l| l.name).collect(),
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
