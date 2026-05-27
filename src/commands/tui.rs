@@ -219,6 +219,12 @@ struct Picker {
     /// Items fetched from gh. Empty when `error` is `Some` or when
     /// the repo legitimately has no open issues / PRs.
     items: Vec<crate::gh::PickerItem>,
+    /// Precomputed [`crate::gh::PickerItem::search_key`] per item.
+    /// Built once at construction so the hot path in [`refilter`]
+    /// (one nucleo scoring round per item per keystroke) doesn't
+    /// reallocate a `String` for every entry every time the user
+    /// types a character.
+    search_keys: Vec<String>,
     /// Live filter query.
     filter: String,
     /// Indices into `items`, score-sorted (highest first).
@@ -235,10 +241,12 @@ struct Picker {
 impl Picker {
     fn loaded(kind: PickerKind, repo_label: String, items: Vec<crate::gh::PickerItem>) -> Self {
         let matches = (0..items.len()).collect();
+        let search_keys = items.iter().map(|i| i.search_key()).collect();
         Self {
             kind,
             repo_label,
             items,
+            search_keys,
             filter: String::new(),
             matches,
             cursor: 0,
@@ -252,6 +260,7 @@ impl Picker {
             kind,
             repo_label,
             items: Vec::new(),
+            search_keys: Vec::new(),
             filter: String::new(),
             matches: Vec::new(),
             cursor: 0,
@@ -263,8 +272,8 @@ impl Picker {
     /// Re-rank items against the current filter. Empty filter =
     /// identity order (as returned by the gh API, which is
     /// most-recently-updated first); a non-empty filter scores each
-    /// item's `search_key` via nucleo and keeps positive-score
-    /// matches sorted descending.
+    /// item's precomputed `search_keys` entry via nucleo and keeps
+    /// positive-score matches sorted descending.
     fn refilter(&mut self) {
         if self.filter.is_empty() {
             self.matches = (0..self.items.len()).collect();
@@ -272,10 +281,9 @@ impl Picker {
             let pattern = Pattern::parse(&self.filter, CaseMatching::Smart, Normalization::Smart);
             let mut scored: Vec<(usize, u32)> = Vec::new();
             let mut buf: Vec<char> = Vec::new();
-            for (idx, item) in self.items.iter().enumerate() {
+            for (idx, key) in self.search_keys.iter().enumerate() {
                 buf.clear();
-                let key = item.search_key();
-                let haystack = nucleo::Utf32Str::new(&key, &mut buf);
+                let haystack = nucleo::Utf32Str::new(key, &mut buf);
                 if let Some(score) = pattern.score(haystack, &mut self.matcher) {
                     scored.push((idx, score));
                 }
