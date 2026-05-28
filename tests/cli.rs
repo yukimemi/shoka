@@ -235,7 +235,11 @@ fn import_picks_up_local_only_git_and_jj_repos() {
     let state = tmp.path().join("state").join("state.toml");
     let body = std::fs::read_to_string(&state).expect("state.toml exists");
 
-    // Remote-bearing entry: identity from URL, no path override.
+    // Remote-bearing entry: identity from URL (host/name come from
+    // the parsed remote, not the on-disk dir name `with-remote`).
+    // Path is pinned too — every imported entry gets a `path` override
+    // so layout drift / clone-with-other-name / local rename never
+    // strand the entry.
     assert!(
         body.contains("\"github.com\""),
         "remote host missing: {body}"
@@ -269,6 +273,198 @@ fn import_picks_up_local_only_git_and_jj_repos() {
     assert!(
         body.contains("path = "),
         "expected `path = ...` override on at least one local entry: {body}"
+    );
+}
+
+#[test]
+fn import_pins_path_when_dirname_differs_from_remote_slug() {
+    // Regression for the `git clone <url> <other-name>` / local
+    // rename case: the working tree's dirname (`DeviceManagement`)
+    // intentionally differs from the URL-derived `name`
+    // (`admintask`). The shelf entry must take its identity from
+    // the URL but its `path` from the actual on-disk location, or
+    // `shoka cd admintask` lands in the layout-derived path that
+    // doesn't exist.
+    let (mut cmd, tmp) = cmd_with_isolated_config();
+    let source = tmp.path().join("source");
+    let repo_dir = source.join("DeviceManagement");
+    init_git_repo_with_remote(&repo_dir, "https://github.com/yukimemi/admintask.git");
+
+    cmd.args(["import", source.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let state = tmp.path().join("state").join("state.toml");
+    let body = std::fs::read_to_string(&state).expect("state.toml exists");
+    assert!(
+        body.contains("\"admintask\""),
+        "URL-derived name missing: {body}"
+    );
+    assert!(
+        body.contains("path = "),
+        "expected `path = ...` override pinning the on-disk dir: {body}"
+    );
+    // The literal dirname must appear in the path override so
+    // downstream `cd`/`tui` resolve to the real location, not the
+    // layout-derived `<root>/github.com/yukimemi/admintask`.
+    assert!(
+        body.contains("DeviceManagement"),
+        "expected on-disk dirname `DeviceManagement` in the path override: {body}"
+    );
+}
+
+#[test]
+fn import_refreshes_stale_path_on_re_import() {
+    // Re-running `shoka import` over a tree whose entries are
+    // already on the shelf is an upsert: when the on-disk location
+    // differs from what's recorded (stale path, or no path at all
+    // from a pre-always-pin shelf), the existing entry's `path` is
+    // refreshed to the current location. User-owned metadata
+    // (`tags`, `note`, `vcs`) is preserved across the refresh.
+    let (mut cmd, tmp) = cmd_with_isolated_config();
+    let source = tmp.path().join("source");
+    let repo_dir = source.join("hello");
+    init_git_repo_with_remote(&repo_dir, "https://github.com/yukimemi/hello.git");
+
+    // Pre-populate the shelf with the `hello` entry as if it came
+    // from a pre-always-pin import: no `path` override, plus some
+    // metadata that re-import must NOT clobber.
+    let state = tmp.path().join("state").join("state.toml");
+    std::fs::create_dir_all(state.parent().unwrap()).unwrap();
+    std::fs::write(
+        &state,
+        r#"version = 2
+
+[[repos]]
+host = "github.com"
+owner = "yukimemi"
+name = "hello"
+tags = ["pinned"]
+note = "preserve me"
+"#,
+    )
+    .unwrap();
+
+    let assertion = cmd
+        .args(["import", source.to_str().unwrap()])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).to_string();
+    assert!(
+        stdout.contains("path refreshed"),
+        "expected `path refreshed` in stdout, got: {stdout}"
+    );
+
+    let body = std::fs::read_to_string(&state).expect("state.toml exists");
+    // Path is now pinned to the on-disk location.
+    assert!(
+        body.contains("path = "),
+        "expected `path = ...` after re-import: {body}"
+    );
+    assert!(body.contains("hello"), "name preserved: {body}");
+    // Metadata survived the upsert.
+    assert!(
+        body.contains("\"pinned\""),
+        "tag must survive upsert: {body}"
+    );
+    assert!(
+        body.contains("\"preserve me\""),
+        "note must survive upsert: {body}"
+    );
+}
+
+#[test]
+fn import_keeps_multiple_clones_of_same_remote_as_distinct_entries() {
+    // The headline multi-clone case: two working trees under
+    // different dir names point at the **same** remote URL
+    // (`github.com/yukimemi/admintask.git`). Both must land on the
+    // shelf as separate entries — same triple, different `path` —
+    // so `shoka cd` / `tui` can pick between them.
+    let (mut cmd, tmp) = cmd_with_isolated_config();
+    let source = tmp.path().join("source");
+    let dev = source.join("DeviceManagement");
+    let backup = source.join("admintask-backup");
+    init_git_repo_with_remote(&dev, "https://github.com/yukimemi/admintask.git");
+    init_git_repo_with_remote(&backup, "https://github.com/yukimemi/admintask.git");
+
+    let assertion = cmd
+        .args(["import", source.to_str().unwrap()])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).to_string();
+    assert!(
+        stdout.contains("2 imported"),
+        "expected '2 imported' in stdout, got: {stdout}"
+    );
+
+    let state = tmp.path().join("state").join("state.toml");
+    let body = std::fs::read_to_string(&state).expect("state.toml exists");
+    // Both checkouts produce a `[[repos]]` block with the same
+    // `name = "admintask"` — count occurrences of the line to
+    // verify the shelf grew by exactly two rows for this triple.
+    let admintask_rows = body.matches("name = \"admintask\"").count();
+    assert_eq!(
+        admintask_rows, 2,
+        "expected 2 `name = \"admintask\"` rows, got {admintask_rows} in:\n{body}"
+    );
+    assert!(
+        body.contains("DeviceManagement"),
+        "first checkout's dir name missing: {body}"
+    );
+    assert!(
+        body.contains("admintask-backup"),
+        "second checkout's dir name missing: {body}"
+    );
+}
+
+#[test]
+fn import_does_not_create_duplicate_when_path_pinned_entry_already_matches() {
+    // Re-running `shoka import` over the **same** path-pinned entry
+    // is a no-op: the (triple, path) identity is exact-equal, so
+    // it falls into the "already on shelf" branch, not the
+    // path-fill self-heal or a duplicate add.
+    let (mut cmd, tmp) = cmd_with_isolated_config();
+    let source = tmp.path().join("source");
+    let repo_dir = source.join("admintask-here");
+    init_git_repo_with_remote(&repo_dir, "https://github.com/yukimemi/admintask.git");
+
+    // First import: adds the entry.
+    cmd.args(["import", source.to_str().unwrap()])
+        .assert()
+        .success();
+
+    // Second import: should report 0 imported and 1 already on
+    // shelf, not duplicate the row.
+    let (mut cmd2, _) = cmd_with_isolated_config();
+    // We need the SAME state dir as the first run so the shelf
+    // persists between invocations — rebuild the command manually
+    // with the original tmp's paths.
+    let cfg = tmp.path().join("config.toml");
+    let state_dir = tmp.path().join("state");
+    let cache_dir = tmp.path().join("cache");
+    cmd2.env("SHOKA_CONFIG", &cfg)
+        .env("SHOKA_STATE_DIR", &state_dir)
+        .env("SHOKA_CACHE_DIR", &cache_dir)
+        .env_remove("SHOKA_PROFILE");
+    let assertion = cmd2
+        .args(["import", source.to_str().unwrap()])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).to_string();
+    assert!(
+        stdout.contains("0 imported"),
+        "second import must report 0 new, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("already on shelf"),
+        "second import must report `already on shelf`, got: {stdout}"
+    );
+
+    let body = std::fs::read_to_string(state_dir.join("state.toml")).expect("state.toml");
+    let admintask_rows = body.matches("name = \"admintask\"").count();
+    assert_eq!(
+        admintask_rows, 1,
+        "no duplicate row after re-import: {body}"
     );
 }
 

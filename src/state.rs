@@ -222,7 +222,11 @@ impl Shelf {
         Ok(())
     }
 
-    /// Look up a repo by `(host, owner, name)`.
+    /// Look up a repo by `(host, owner, name)`. Returns the first
+    /// match — when the shelf has multiple checkouts of the same
+    /// remote (e.g. `git clone <url> <other-name>`), only one is
+    /// returned here. Callers that need to disambiguate by on-disk
+    /// path should use [`find_by_path`](Self::find_by_path).
     pub fn find(&self, host: &str, owner: &str, name: &str) -> Option<&Repo> {
         self.repos
             .iter()
@@ -230,19 +234,70 @@ impl Shelf {
     }
 
     /// Mutable variant for callers that want to update metadata
-    /// (tags, vcs override, note) in place.
+    /// (tags, vcs override, note) in place. First-match semantics
+    /// match [`find`](Self::find).
     pub fn find_mut(&mut self, host: &str, owner: &str, name: &str) -> Option<&mut Repo> {
         self.repos
             .iter_mut()
             .find(|r| r.host == host && r.owner == owner && r.name == name)
     }
 
-    /// Insert a new repo. Errors out if one with the same identity
-    /// triple is already on the shelf — callers that want
-    /// upsert-style behaviour should `find_mut` first.
+    /// Look up by the full `(host, owner, name, path)` identity. Used
+    /// by `shoka import` to upsert exactly the entry it just walked
+    /// to on disk, even when the shelf already carries other clones
+    /// of the same remote.
+    ///
+    /// Matching rule:
+    ///
+    /// - `path = Some(p)` matches an entry with `path = Some(p)`.
+    /// - `path = None` matches an entry with `path = None` (the
+    ///   "shoka-clone laid this out, no override" case).
+    ///
+    /// A mismatched path / None never collapses to "close enough" —
+    /// that's exactly the disambiguation we need to keep multiple
+    /// clones of the same remote as distinct shelf entries.
+    pub fn find_by_path(
+        &self,
+        host: &str,
+        owner: &str,
+        name: &str,
+        path: Option<&Path>,
+    ) -> Option<&Repo> {
+        self.repos.iter().find(|r| {
+            r.host == host && r.owner == owner && r.name == name && r.path.as_deref() == path
+        })
+    }
+
+    /// Mutable variant of [`find_by_path`](Self::find_by_path).
+    pub fn find_mut_by_path(
+        &mut self,
+        host: &str,
+        owner: &str,
+        name: &str,
+        path: Option<&Path>,
+    ) -> Option<&mut Repo> {
+        self.repos.iter_mut().find(|r| {
+            r.host == host && r.owner == owner && r.name == name && r.path.as_deref() == path
+        })
+    }
+
+    /// Insert a new repo. Errors out only if a row with the **full**
+    /// `(host, owner, name, path)` identity already exists — same
+    /// triple with a different `path` is allowed (and exactly the
+    /// case `shoka import` needs when one remote is checked out
+    /// under multiple local dir names). Callers that want
+    /// upsert-style behaviour for the same path should
+    /// `find_mut_by_path` first.
     pub fn add(&mut self, repo: Repo) -> Result<()> {
-        if self.find(&repo.host, &repo.owner, &repo.name).is_some() {
-            bail!("repo {} already on the shelf", repo.slug());
+        if self
+            .find_by_path(&repo.host, &repo.owner, &repo.name, repo.path.as_deref())
+            .is_some()
+        {
+            let where_clause = match &repo.path {
+                Some(p) => format!(" at {}", p.display()),
+                None => String::new(),
+            };
+            bail!("repo {}{where_clause} already on the shelf", repo.slug());
         }
         self.repos.push(repo);
         Ok(())
@@ -400,7 +455,11 @@ mod tests {
     }
 
     #[test]
-    fn add_rejects_duplicate_triple() {
+    fn add_rejects_duplicate_identity_without_path() {
+        // Two entries with the same triple AND no path override
+        // collide — that's the "shoka clone laid this out" case
+        // where the layout-derived destination is by definition
+        // unique per triple.
         let mut shelf = Shelf::default();
         shelf.add(sample_repo("shoka")).unwrap();
         let err = shelf.add(sample_repo("shoka")).unwrap_err();
@@ -409,6 +468,73 @@ mod tests {
             "error should mention duplicate: {err}"
         );
         assert_eq!(shelf.len(), 1, "duplicate add must not mutate");
+    }
+
+    #[test]
+    fn add_allows_same_triple_with_different_paths() {
+        // `git clone <url> <other-name>` (or a local rename) lands
+        // multiple checkouts under the same remote. They must coexist
+        // on the shelf as distinct entries — that's the whole point
+        // of moving from a triple-only identity to triple + path.
+        let mut shelf = Shelf::default();
+        let mut a = sample_repo("admintask");
+        a.path = Some(PathBuf::from(
+            "/home/u/src/github.com/yukimemi/DeviceManagement",
+        ));
+        let mut b = sample_repo("admintask");
+        b.path = Some(PathBuf::from("/home/u/src/old/admintask-backup"));
+        shelf.add(a).expect("first path-pinned admintask");
+        shelf
+            .add(b)
+            .expect("second path-pinned admintask must coexist");
+        assert_eq!(shelf.len(), 2);
+    }
+
+    #[test]
+    fn add_rejects_duplicate_triple_and_path() {
+        // Exact (triple, path) duplicate is still a no-op — the
+        // path-aware identity is the new uniqueness contract.
+        let mut shelf = Shelf::default();
+        let path = PathBuf::from("/home/u/src/github.com/yukimemi/shoka");
+        let mut a = sample_repo("shoka");
+        a.path = Some(path.clone());
+        let mut b = sample_repo("shoka");
+        b.path = Some(path);
+        shelf.add(a).unwrap();
+        let err = shelf.add(b).unwrap_err();
+        assert!(
+            err.to_string().contains("already on the shelf"),
+            "error should mention duplicate: {err}"
+        );
+        assert_eq!(shelf.len(), 1);
+    }
+
+    #[test]
+    fn find_by_path_distinguishes_clones_of_same_remote() {
+        let mut shelf = Shelf::default();
+        let mut a = sample_repo("admintask");
+        let pa = PathBuf::from("/a/DeviceManagement");
+        a.path = Some(pa.clone());
+        let mut b = sample_repo("admintask");
+        let pb = PathBuf::from("/b/admintask-backup");
+        b.path = Some(pb.clone());
+        shelf.add(a).unwrap();
+        shelf.add(b).unwrap();
+
+        let found_a = shelf.find_by_path("github.com", "yukimemi", "admintask", Some(&pa));
+        assert_eq!(found_a.unwrap().path.as_deref(), Some(pa.as_path()));
+
+        let found_b = shelf.find_by_path("github.com", "yukimemi", "admintask", Some(&pb));
+        assert_eq!(found_b.unwrap().path.as_deref(), Some(pb.as_path()));
+
+        // path-less lookup against an all-pinned set returns None,
+        // even though the triple is present — exactly the property
+        // the importer's upsert relies on (no accidental match).
+        assert!(
+            shelf
+                .find_by_path("github.com", "yukimemi", "admintask", None)
+                .is_none()
+        );
     }
 
     #[test]
