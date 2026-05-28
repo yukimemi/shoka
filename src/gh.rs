@@ -87,11 +87,18 @@ pub async fn resolve_token() -> Option<String> {
 /// `None` — the caller treats that the same as "no token".
 async fn gh_cli_token() -> Option<String> {
     let gh = which::which("gh").ok()?;
-    let output = tokio::process::Command::new(gh)
-        .args(["auth", "token"])
-        .output()
-        .await
-        .ok()?;
+    let mut cmd = tokio::process::Command::new(gh);
+    cmd.args(["auth", "token"]);
+    // Windows: suppress the new-console-window allocation. The
+    // background cache refresh runs detached (no console), so any
+    // child spawned from inside it would otherwise get a fresh
+    // console allocated by Windows — surfacing as a black-window
+    // flash on every `shoka <cmd>` tail. CREATE_NO_WINDOW is a
+    // no-op when the parent already has a console (foreground
+    // calls inherit it as usual).
+    #[cfg(windows)]
+    cmd.creation_flags(crate::silent_creation_flags());
+    let output = cmd.output().await.ok()?;
     if !output.status.success() {
         return None;
     }

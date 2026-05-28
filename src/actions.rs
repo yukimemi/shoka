@@ -105,8 +105,8 @@ pub async fn run_action(path: &Path, kind: ActionKind) -> Result<ActionOutcome> 
     let (program, args) = command_for(vcs, kind);
     let display_command = format!("{program} {}", args.join(" "));
 
-    let child = Command::new(program)
-        .args(args)
+    let mut cmd = Command::new(program);
+    cmd.args(args)
         .current_dir(path)
         // Closing stdin makes credential prompts fail fast instead
         // of hanging the TUI thread forever. Real auth should be
@@ -120,7 +120,15 @@ pub async fn run_action(path: &Path, kind: ActionKind) -> Result<ActionOutcome> 
         // signal. Without this the child would linger as an orphan
         // (still holding the network handle, still writing to a now-
         // dead pipe) after we've already moved on.
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    // See `crate::silent_creation_flags` for the rationale. The TUI
+    // owns a console while it's running, so the foreground f/P
+    // keypress doesn't usually flash — but applying the flag
+    // uniformly keeps the spawn pattern consistent with the rest
+    // of the codebase.
+    #[cfg(windows)]
+    cmd.creation_flags(crate::silent_creation_flags());
+    let child = cmd
         .spawn()
         .map_err(|e| anyhow!("failed to spawn `{display_command}`: {e}"))?;
 
