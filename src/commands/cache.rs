@@ -401,7 +401,7 @@ mod tests {
         assert_eq!(cache.len(), 2);
         assert_eq!(
             cache
-                .find("github.com", "yukimemi", "shoka")
+                .find("github.com", "yukimemi", "shoka", None)
                 .unwrap()
                 .last_refreshed,
             Some(now)
@@ -414,9 +414,13 @@ mod tests {
         let repo = sample("shoka");
         cache.upsert(&repo).last_refreshed = Some(1_700_000_000);
 
-        let entry = cache.find_mut("github.com", "yukimemi", "shoka").unwrap();
+        let entry = cache
+            .find_mut("github.com", "yukimemi", "shoka", None)
+            .unwrap();
         assert!(!entry.is_stale(60, 1_700_000_010));
-        let entry = cache.find_mut("github.com", "yukimemi", "shoka").unwrap();
+        let entry = cache
+            .find_mut("github.com", "yukimemi", "shoka", None)
+            .unwrap();
         assert!(entry.is_stale(60, 1_700_000_120));
     }
 
