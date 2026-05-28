@@ -194,10 +194,18 @@ fn fuzzy_pick<'a>(candidates: &[&'a Repo], prompt: &str) -> Result<&'a Repo> {
 /// to the verbatim path string if home can't be resolved or if `p`
 /// doesn't start under it — the worst case is "the path shows in
 /// full", which is still readable, just longer.
+///
+/// The home-dir lookup is cached in a `OnceLock` because the picker
+/// formatter calls this once per candidate per repaint, and
+/// `BaseDirs::new()` does a system / env query under the hood. One
+/// resolution per process is plenty — `$HOME` doesn't change at
+/// runtime.
 fn tilde_shorten(p: &Path) -> String {
-    let home = directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf());
+    static HOME: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    let home =
+        HOME.get_or_init(|| directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf()));
     match home {
-        Some(h) => match p.strip_prefix(&h) {
+        Some(h) => match p.strip_prefix(h) {
             Ok(rest) => {
                 let sep = std::path::MAIN_SEPARATOR;
                 if rest.as_os_str().is_empty() {

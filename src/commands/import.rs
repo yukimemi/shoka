@@ -245,17 +245,17 @@ fn upsert_into_shelf(shelf: &mut Shelf, repo: Repo) -> Outcome {
     // path-less entry is by definition the *single* layout-derived
     // checkout for that triple, so it's safe to refine in place.
     //
-    // Crucially, we only do this when the new entry has `Some(path)`
-    // — never when both are `None` (that case is the exact-duplicate
-    // branch above) and never when the existing entry is already
-    // path-pinned (treating that as a different checkout is the
-    // entire point of the multi-clone story).
-    if repo.path.is_some()
-        && let Some(existing) = shelf.find_mut(&repo.host, &repo.owner, &repo.name)
-        && existing.path.is_none()
-    {
-        existing.path = repo.path;
-        return Outcome::PathFilled;
+    // We look up the path-less twin directly via `find_mut_by_path`
+    // with `None` — not `find_mut` (triple-only) — because a shelf
+    // with multiple checkouts of the same remote might place a
+    // path-pinned row first, and `find_mut` would return *that* row
+    // and then fail the `path.is_none()` check, missing the
+    // path-less twin that actually needs healing.
+    if repo.path.is_some() {
+        if let Some(existing) = shelf.find_mut_by_path(&repo.host, &repo.owner, &repo.name, None) {
+            existing.path = repo.path;
+            return Outcome::PathFilled;
+        }
     }
 
     match shelf.add(repo) {
@@ -401,6 +401,53 @@ fn path_component_string(component: Option<&OsStr>) -> Option<String> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn upsert_self_heals_path_less_twin_even_when_path_pinned_row_is_first() {
+        // Regression for the Gemini Code Assist finding on PR #59:
+        // the original `find_mut` was triple-only and returned the
+        // first match. If a path-pinned row preceded the path-less
+        // row for the same triple, the importer would land on the
+        // pinned row, fail the `is_none()` check, and miss healing
+        // the actual path-less twin. Switching to
+        // `find_mut_by_path(..., None)` lets us go straight to the
+        // path-less row regardless of insertion order.
+        let mut shelf = Shelf::default();
+        // Insertion order matters: pinned first, path-less second.
+        let mut pinned = Repo::new("github.com", "yukimemi", "admintask");
+        pinned.path = Some(PathBuf::from("/elsewhere/admintask"));
+        shelf.add(pinned).unwrap();
+        shelf
+            .add(Repo::new("github.com", "yukimemi", "admintask"))
+            .unwrap();
+        assert_eq!(shelf.len(), 2, "fixture must start with both rows");
+
+        // A new import lands at /here/admintask with the same
+        // triple — the path-less twin should get healed, not a
+        // third row added.
+        let mut incoming = Repo::new("github.com", "yukimemi", "admintask");
+        incoming.path = Some(PathBuf::from("/here/admintask"));
+        let outcome = upsert_into_shelf(&mut shelf, incoming);
+        assert!(
+            matches!(outcome, Outcome::PathFilled),
+            "expected PathFilled, got something else"
+        );
+        assert_eq!(shelf.len(), 2, "no new row should be added");
+        // The originally-pinned row is untouched.
+        let still_pinned = shelf
+            .repos
+            .iter()
+            .find(|r| r.path.as_deref() == Some(Path::new("/elsewhere/admintask")))
+            .expect("original pinned row preserved");
+        assert_eq!(still_pinned.name, "admintask");
+        // The healed row now carries the imported path.
+        let healed = shelf
+            .repos
+            .iter()
+            .find(|r| r.path.as_deref() == Some(Path::new("/here/admintask")))
+            .expect("path-less row healed to incoming path");
+        assert_eq!(healed.name, "admintask");
+    }
 
     #[test]
     fn synthesise_local_uses_parent_and_repo_dir_names() {
