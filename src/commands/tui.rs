@@ -41,7 +41,7 @@ use nucleo::pattern::{CaseMatching, Normalization, Pattern};
 use ratatui::Frame;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{Terminal, prelude::Backend};
@@ -50,6 +50,39 @@ use teravars::Engine;
 use crate::actions::{ActionKind, ActionOutcome, run_action};
 use crate::cache::Cache;
 use crate::cli::TuiArgs;
+
+/// Catppuccin Mocha palette, kept as `Color::Rgb` so the dashboard
+/// reads the same on every true-color terminal — falling back to
+/// indexed colors would lose the soft pastel feel that's the whole
+/// point of the theme. The roles below match the upstream palette
+/// names so a future refresh can swap in Frappé / Macchiato /
+/// Latte by retargeting these constants only.
+mod theme {
+    use ratatui::style::Color;
+
+    // Background ramp (deepest → lightest).
+    pub const MANTLE: Color = Color::Rgb(0x18, 0x18, 0x25);
+    pub const BASE: Color = Color::Rgb(0x1e, 0x1e, 0x2e);
+    pub const SURFACE0: Color = Color::Rgb(0x31, 0x32, 0x44);
+    pub const SURFACE1: Color = Color::Rgb(0x45, 0x47, 0x5a);
+    pub const OVERLAY: Color = Color::Rgb(0x6c, 0x70, 0x86);
+
+    // Text ramp.
+    pub const SUBTEXT: Color = Color::Rgb(0xba, 0xc2, 0xde);
+    pub const TEXT: Color = Color::Rgb(0xcd, 0xd6, 0xf4);
+
+    // Accents. Picked from Catppuccin's named roles so the meaning
+    // (success / warning / etc.) is portable across the file.
+    pub const LAVENDER: Color = Color::Rgb(0xb4, 0xbe, 0xfe);
+    pub const SKY: Color = Color::Rgb(0x89, 0xdc, 0xeb);
+    pub const TEAL: Color = Color::Rgb(0x94, 0xe2, 0xd5);
+    pub const GREEN: Color = Color::Rgb(0xa6, 0xe3, 0xa1);
+    pub const YELLOW: Color = Color::Rgb(0xf9, 0xe2, 0xaf);
+    pub const PEACH: Color = Color::Rgb(0xfa, 0xb3, 0x87);
+    pub const RED: Color = Color::Rgb(0xf3, 0x8b, 0xa8);
+    pub const MAUVE: Color = Color::Rgb(0xcb, 0xa6, 0xf7);
+    pub const PINK: Color = Color::Rgb(0xf5, 0xc2, 0xe7);
+}
 use crate::commands::ShokaContext;
 use crate::commands::cd::emit_path;
 use crate::config::{ResolvedConfig, ShokaConfig};
@@ -664,45 +697,124 @@ fn ui(f: &mut Frame, app: &mut App) {
 }
 
 fn render_header(f: &mut Frame, area: Rect, app: &App) {
+    use ratatui::text::Span;
+
     let total = app.rows.len();
     let shown = app.matches.len();
-    let filter_part = if app.filter.is_empty() {
-        String::new()
-    } else {
-        format!("  /{}", app.filter)
-    };
-    let line = Line::from(format!("shoka — {shown}/{total} repo(s){filter_part}"))
-        .style(Style::default().add_modifier(Modifier::BOLD));
-    f.render_widget(Paragraph::new(line), area);
+
+    // ✦ marker + bold "shoka" + version pulled from cargo so the
+    // banner stays in lockstep with the release the user is running.
+    let mut spans = vec![
+        Span::styled(" ✦ ", Style::default().fg(theme::MAUVE)),
+        Span::styled(
+            "shoka",
+            Style::default()
+                .fg(theme::LAVENDER)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" v{}", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(theme::OVERLAY),
+        ),
+        Span::styled("  📚 ", Style::default().fg(theme::PEACH)),
+        Span::styled(
+            shown.to_string(),
+            Style::default()
+                .fg(theme::GREEN)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" / {total} repo(s)"),
+            Style::default().fg(theme::SUBTEXT),
+        ),
+    ];
+    if !app.filter.is_empty() {
+        spans.push(Span::styled(
+            "  ◇ /",
+            Style::default()
+                .fg(theme::PEACH)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            &app.filter,
+            Style::default()
+                .fg(theme::YELLOW)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::MANTLE)),
+        area,
+    );
 }
 
 fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
+    use ratatui::text::Span;
+    use ratatui::widgets::Cell;
+
     let header_row = Row::new(vec![
-        "repo", "branch", "↑↓", "✓", "PR", "CI", "path", "tags",
+        Cell::from("  repo "),
+        Cell::from(" branch "),
+        Cell::from(" ↑↓ "),
+        Cell::from(" ✓ "),
+        Cell::from(" PR "),
+        Cell::from(" CI "),
+        Cell::from(" path "),
+        Cell::from(" tags "),
     ])
     .style(
         Style::default()
             .add_modifier(Modifier::BOLD)
-            .fg(Color::Yellow),
-    );
+            .fg(theme::PINK)
+            .bg(theme::SURFACE0),
+    )
+    .height(1);
 
     let rows: Vec<Row> = app
         .matches
         .iter()
-        .map(|&idx| {
-            let row = &app.rows[idx];
+        .enumerate()
+        .map(|(visible_idx, &row_idx)| {
+            let row = &app.rows[row_idx];
             let (branch, ahead_behind, dirty) = status_cells(row.status.as_ref());
             let (pr, ci) = gh_cells(row.gh.as_ref());
+
+            // Alternating row tint — subtle stripe that makes
+            // long shelves easier to scan without competing with
+            // the selection highlight (which gets full LAVENDER).
+            let row_bg = if visible_idx % 2 == 0 {
+                theme::BASE
+            } else {
+                theme::MANTLE
+            };
+            let base_style = Style::default().fg(theme::TEXT).bg(row_bg);
+
+            // The selection highlight (LAVENDER bg) bleeds into
+            // its cells via `row_highlight_style`, so cell-level
+            // styling is the *unselected* look — the highlight
+            // overrides only `bg` and `fg`, leaving span colors
+            // for non-current rows intact.
             Row::new(vec![
-                row.slug.clone(),
-                branch,
-                ahead_behind,
-                dirty,
-                pr,
-                ci,
-                row.path.display().to_string(),
-                row.tags_display.clone(),
+                Cell::from(Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(&row.slug, Style::default().fg(theme::TEXT)),
+                ])),
+                Cell::from(Span::styled(branch, Style::default().fg(theme::SKY))),
+                Cell::from(style_ahead_behind(&ahead_behind)),
+                Cell::from(style_dirty(&dirty)),
+                Cell::from(style_pr(&pr)),
+                Cell::from(style_ci(&ci)),
+                Cell::from(Span::styled(
+                    row.path.to_string_lossy(),
+                    Style::default().fg(theme::OVERLAY),
+                )),
+                Cell::from(Span::styled(
+                    &row.tags_display,
+                    Style::default().fg(theme::TEAL),
+                )),
             ])
+            .style(base_style)
         })
         .collect();
 
@@ -720,14 +832,16 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
         .header(header_row)
         .row_highlight_style(
             Style::default()
-                .bg(Color::Blue)
-                .fg(Color::White)
+                .bg(theme::LAVENDER)
+                .fg(theme::MANTLE)
                 .add_modifier(Modifier::BOLD),
         )
+        .highlight_symbol(" ▶ ")
         .block(
             Block::default()
-                .borders(Borders::TOP)
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme::OVERLAY))
+                .style(Style::default().bg(theme::BASE)),
         );
 
     // Pass the real `TableState` by `&mut` so the scroll offset
@@ -736,6 +850,74 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
     // Cloning here would discard those mutations and break long-
     // shelf scrolling.
     f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+/// Style the ahead/behind cell by its shape. `=` (in sync) reads
+/// dim green so it doesn't compete with the actually-interesting
+/// rows; `↑N` (ahead, pushable) is bright green; `↓N` (behind,
+/// needs pull) is yellow; mixed `↑N ↓M` is mauve (action-required
+/// but ambiguous direction). Unknown / no-upstream falls back to
+/// overlay so it visibly recedes.
+fn style_ahead_behind(s: &str) -> ratatui::text::Span<'static> {
+    use ratatui::text::Span;
+    let color = if s == "=" {
+        theme::OVERLAY
+    } else if s.starts_with('↑') && s.contains('↓') {
+        theme::MAUVE
+    } else if s.starts_with('↑') {
+        theme::GREEN
+    } else if s.starts_with('↓') {
+        theme::YELLOW
+    } else {
+        theme::OVERLAY
+    };
+    Span::styled(s.to_string(), Style::default().fg(color))
+}
+
+/// Dirty glyph: clean `✓` reads dim green, dirty `●` pops peach so
+/// the user's eye immediately catches "this row has uncommitted
+/// changes" without parsing text. `?` (never refreshed) stays
+/// overlay-grey for the same don't-distract reason as `=` in
+/// ahead/behind.
+fn style_dirty(s: &str) -> ratatui::text::Span<'static> {
+    use ratatui::text::Span;
+    let color = match s {
+        "✓" => theme::GREEN,
+        "●" => theme::PEACH,
+        _ => theme::OVERLAY,
+    };
+    Span::styled(s.to_string(), Style::default().fg(color))
+}
+
+/// PR cell: any non-zero, non-dash count is pink+bold so a busy
+/// mono-repo visibly stands out. Zero / `-` reads overlay so it
+/// recedes — the dashboard's job is to highlight *what to act on*.
+fn style_pr(s: &str) -> ratatui::text::Span<'static> {
+    use ratatui::text::Span;
+    let style = if s == "0" || s == "-" {
+        Style::default().fg(theme::OVERLAY)
+    } else {
+        Style::default()
+            .fg(theme::PINK)
+            .add_modifier(Modifier::BOLD)
+    };
+    Span::styled(s.to_string(), style)
+}
+
+/// CI glyph: green check / red cross / yellow pending / overlay
+/// skipped — the standard traffic-light reading. `!` (unknown
+/// conclusion) reads red since "we don't know if this passed" is
+/// closer to "broken" than to "fine".
+fn style_ci(s: &str) -> ratatui::text::Span<'static> {
+    use ratatui::text::Span;
+    let color = match s {
+        "✓" => theme::GREEN,
+        "✗" | "!" => theme::RED,
+        "◐" => theme::YELLOW,
+        "○" => theme::OVERLAY,
+        _ => theme::OVERLAY,
+    };
+    Span::styled(s.to_string(), Style::default().fg(color))
 }
 
 /// Format the two gh cells (open PR count + CI glyph). `(-, -)`
@@ -785,27 +967,87 @@ fn status_cells(status: Option<&GitStatusSnapshot>) -> (String, String, String) 
 }
 
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
+    use ratatui::text::Span;
+
     // A status message (set by y / o) preempts the mode hint so the
     // user immediately sees what their last action did. Styled
-    // brighter than the hint (cyan vs dark gray) so it visibly reads
-    // as a fresh result, not a permanent legend.
+    // brighter than the hint (teal vs subtext) so it reads as a
+    // fresh result, not a permanent legend.
     if let Some(msg) = &app.status_message {
+        let line = Line::from(vec![
+            Span::styled(
+                " ✦ ",
+                Style::default()
+                    .fg(theme::TEAL)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                msg,
+                Style::default()
+                    .fg(theme::TEAL)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]);
         f.render_widget(
-            Paragraph::new(msg.clone()).style(Style::default().fg(Color::Cyan)),
+            Paragraph::new(line).style(Style::default().bg(theme::MANTLE)),
             area,
         );
         return;
     }
-    let hint = match app.mode {
-        Mode::Normal => {
-            "j/k=move  /=filter  enter=cd  i=iss  p=PR  f=fetch  P=push  y=yank  o=open  ?=help  q=quit"
-        }
-        Mode::Filter => "type to filter  ⌫=delete  enter=accept  esc=clear",
+
+    let line = match app.mode {
+        Mode::Normal => Line::from(footer_pills(&[
+            ("j/k", "move"),
+            ("/", "filter"),
+            ("⏎", "cd"),
+            ("i", "iss"),
+            ("p", "PR"),
+            ("f", "fetch"),
+            ("P", "push"),
+            ("y", "yank"),
+            ("o", "open"),
+            ("?", "help"),
+            ("q", "quit"),
+        ])),
+        Mode::Filter => Line::from(footer_pills(&[
+            ("type", "filter"),
+            ("⌫", "del"),
+            ("⏎", "accept"),
+            ("esc", "clear"),
+        ])),
     };
     f.render_widget(
-        Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(line).style(Style::default().bg(theme::MANTLE)),
         area,
     );
+}
+
+/// Build the styled spans for the footer's keybind pills. Each
+/// `(key, label)` pair renders as `[key]label` with the key bracketed
+/// in mauve+bold and the label dim subtext. A space separator before
+/// every pill keeps the gap consistent (a trailing one before the
+/// first pill is fine — it doubles as the left-edge padding the
+/// terminal would otherwise eat).
+///
+/// Labels are `&'static str` so the per-frame render path skips
+/// the per-pill `String` allocation that an owned label would
+/// require; the bracketed key still allocates (one `String` per
+/// pill per frame) but that's bounded by the small pill count and
+/// keeps the API ergonomic.
+fn footer_pills(pairs: &[(&'static str, &'static str)]) -> Vec<ratatui::text::Span<'static>> {
+    use ratatui::text::Span;
+    let mut out: Vec<Span<'static>> = Vec::with_capacity(pairs.len() * 4);
+    for (key, label) in pairs {
+        out.push(Span::raw(" "));
+        out.push(Span::styled(
+            format!("[{key}]"),
+            Style::default()
+                .fg(theme::MAUVE)
+                .add_modifier(Modifier::BOLD),
+        ));
+        out.push(Span::styled(*label, Style::default().fg(theme::SUBTEXT)));
+    }
+    out
 }
 
 /// Render the help popup. Centered in the terminal, sized to fit
@@ -817,57 +1059,95 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
 /// added or renamed there, this list is the one place to update
 /// alongside it.
 fn render_help(f: &mut Frame, area: Rect) {
-    let popup = centered_rect(60, 70, area);
+    use ratatui::text::Span;
 
-    // List entries chosen for screen-readability: the key column is
-    // right-aligned in a fixed width so the descriptions line up.
-    let entries: [(&str, &str); 15] = [
-        ("j / ↓", "move down"),
-        ("k / ↑", "move up"),
-        ("g", "jump to top"),
-        ("G", "jump to bottom"),
-        ("/", "filter — type to narrow, esc to clear"),
-        ("Enter", "select (emit path for the shell wrapper to cd)"),
-        ("i", "open Issues for this repo in a fuzzy picker"),
-        ("p", "open Pull Requests for this repo in a fuzzy picker"),
-        ("f", "fetch this repo (jj git fetch / git fetch)"),
-        ("P", "push this repo (jj git push / git push)"),
-        ("y", "yank slug to clipboard"),
-        ("o", "open repo home in browser"),
-        ("? / F1", "toggle this help"),
-        ("q / Esc", "quit"),
-        ("Ctrl-C", "quit"),
+    let popup = centered_rect(62, 78, area);
+
+    // Sectioned layout so related keys cluster visually instead of
+    // dissolving into a flat 15-row list. Sections render with a
+    // mauve header line; entries inside line up by widest-key
+    // padding *within each section* so each block is locally tidy.
+    let sections: [(&str, &[(&str, &str)]); 4] = [
+        (
+            "Navigation",
+            &[
+                ("j / ↓", "move down"),
+                ("k / ↑", "move up"),
+                ("g", "jump to top"),
+                ("G", "jump to bottom"),
+                ("/", "filter — type to narrow, esc to clear"),
+                ("Enter", "select (emit path for the shell wrapper to cd)"),
+            ],
+        ),
+        (
+            "Pickers & Browser",
+            &[
+                ("i", "open Issues for this repo in a fuzzy picker"),
+                ("p", "open Pull Requests for this repo in a fuzzy picker"),
+                ("o", "open repo home in browser"),
+                ("y", "yank slug to clipboard"),
+            ],
+        ),
+        (
+            "Repo actions",
+            &[
+                ("f", "fetch (jj git fetch / git fetch)"),
+                ("P", "push (jj git push / git push)"),
+            ],
+        ),
+        (
+            "Quit",
+            &[
+                ("? / F1", "toggle this help"),
+                ("q / Esc", "quit"),
+                ("Ctrl-C", "quit"),
+            ],
+        ),
     ];
 
     // `chars().count()` rather than `.len()`: the latter is byte
     // length, which for entries like `j / ↓` overcounts by two bytes
     // per arrow (UTF-8 encoding of `↓` is 3 bytes vs. 1 char). That
     // would push every other row out of alignment in the popup.
-    let key_width = entries
-        .iter()
-        .map(|(k, _)| k.chars().count())
-        .max()
-        .unwrap_or(8);
-    let body: Vec<Line> = entries
-        .iter()
-        .map(|(key, desc)| {
-            Line::from(vec![
-                ratatui::text::Span::styled(
-                    format!("  {key:>w$}  ", w = key_width),
+    let mut body: Vec<Line> = Vec::new();
+    for (i, (heading, entries)) in sections.iter().enumerate() {
+        if i > 0 {
+            body.push(Line::from(""));
+        }
+        body.push(Line::from(Span::styled(
+            format!("  ✦ {heading}"),
+            Style::default()
+                .fg(theme::MAUVE)
+                .add_modifier(Modifier::BOLD),
+        )));
+        let key_width = entries
+            .iter()
+            .map(|(k, _)| k.chars().count())
+            .max()
+            .unwrap_or(6);
+        for (key, desc) in entries.iter() {
+            body.push(Line::from(vec![
+                Span::styled(
+                    format!("    {key:>w$}  ", w = key_width),
                     Style::default()
-                        .fg(Color::Yellow)
+                        .fg(theme::YELLOW)
                         .add_modifier(Modifier::BOLD),
                 ),
-                ratatui::text::Span::raw(*desc),
-            ])
-        })
-        .collect();
+                Span::styled(*desc, Style::default().fg(theme::SUBTEXT)),
+            ]));
+        }
+    }
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
-        .title(" shoka — keybinds ")
-        .title_style(Style::default().add_modifier(Modifier::BOLD));
+        .border_style(Style::default().fg(theme::MAUVE))
+        .title(Span::styled(
+            " 📚 shoka — keybinds ",
+            Style::default()
+                .fg(theme::LAVENDER)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(theme::BASE));
 
     let para = Paragraph::new(body).block(block);
 
@@ -1105,17 +1385,22 @@ fn render_action_popup(f: &mut Frame, area: Rect, popup: &ActionPopup) {
     let rect = centered_rect(80, 60, area);
     f.render_widget(Clear, rect);
 
-    let title = format!(" {} — {} ", popup.kind.label(), popup.repo_label);
+    let title = format!(" ⚙  {} — {} ", popup.kind.label(), popup.repo_label);
     let border_color = match &popup.outcome {
-        Some(o) if o.success => Color::Green,
-        Some(_) => Color::Red,
-        None => Color::Red,
+        Some(o) if o.success => theme::GREEN,
+        Some(_) => theme::RED,
+        None => theme::RED,
     };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color))
-        .title(title)
-        .title_style(Style::default().add_modifier(Modifier::BOLD));
+        .title(ratatui::text::Span::styled(
+            title,
+            Style::default()
+                .fg(theme::LAVENDER)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(theme::BASE));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
@@ -1127,18 +1412,20 @@ fn render_action_popup(f: &mut Frame, area: Rect, popup: &ActionPopup) {
             "✗ failed"
         };
         let status_color = if outcome.success {
-            Color::Green
+            theme::GREEN
         } else {
-            Color::Red
+            theme::RED
         };
         lines.push(Line::from(vec![
             ratatui::text::Span::styled(
                 format!("  {} ", outcome.vcs.label()),
-                Style::default().fg(Color::Yellow),
+                Style::default()
+                    .fg(theme::MAUVE)
+                    .add_modifier(Modifier::BOLD),
             ),
             ratatui::text::Span::styled(
                 format!("$ {}", outcome.command),
-                Style::default().fg(Color::White),
+                Style::default().fg(theme::TEXT),
             ),
         ]));
         lines.push(Line::from(ratatui::text::Span::styled(
@@ -1151,12 +1438,13 @@ fn render_action_popup(f: &mut Frame, area: Rect, popup: &ActionPopup) {
         if !outcome.stdout.trim().is_empty() {
             lines.push(Line::from(ratatui::text::Span::styled(
                 "  stdout:",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(theme::SKY).add_modifier(Modifier::BOLD),
             )));
             for line in outcome.stdout.lines() {
-                lines.push(Line::from(format!("    {line}")));
+                lines.push(Line::from(ratatui::text::Span::styled(
+                    format!("    {line}"),
+                    Style::default().fg(theme::SUBTEXT),
+                )));
             }
         }
         if !outcome.stderr.trim().is_empty() {
@@ -1166,30 +1454,33 @@ fn render_action_popup(f: &mut Frame, area: Rect, popup: &ActionPopup) {
             lines.push(Line::from(ratatui::text::Span::styled(
                 "  stderr:",
                 Style::default()
-                    .fg(Color::Magenta)
+                    .fg(theme::PINK)
                     .add_modifier(Modifier::BOLD),
             )));
             for line in outcome.stderr.lines() {
-                lines.push(Line::from(format!("    {line}")));
+                lines.push(Line::from(ratatui::text::Span::styled(
+                    format!("    {line}"),
+                    Style::default().fg(theme::SUBTEXT),
+                )));
             }
         }
         if outcome.stdout.trim().is_empty() && outcome.stderr.trim().is_empty() {
             lines.push(Line::from(ratatui::text::Span::styled(
                 "  (no output)",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme::OVERLAY),
             )));
         }
     } else {
         lines.push(Line::from(""));
         lines.push(Line::from(ratatui::text::Span::styled(
             format!("  ⚠  {}", popup.error),
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme::RED),
         )));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(ratatui::text::Span::styled(
         "  press any key to close",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(theme::OVERLAY),
     )));
 
     // Wrap long lines instead of truncating them at the popup edge —
@@ -1208,12 +1499,25 @@ fn render_picker(f: &mut Frame, area: Rect, picker: &Picker) {
     let popup = centered_rect(80, 80, area);
     f.render_widget(Clear, popup);
 
-    let title = format!(" {} — {} ", picker.kind.title(), picker.repo_label);
+    let title_glyph = match picker.kind {
+        PickerKind::Issues => "🐛",
+        PickerKind::Prs => "🔀",
+    };
+    let title = format!(
+        " {title_glyph}  {} — {} ",
+        picker.kind.title(),
+        picker.repo_label
+    );
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
-        .title(title)
-        .title_style(Style::default().add_modifier(Modifier::BOLD));
+        .border_style(Style::default().fg(theme::MAUVE))
+        .title(ratatui::text::Span::styled(
+            title,
+            Style::default()
+                .fg(theme::LAVENDER)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(theme::BASE));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -1225,12 +1529,12 @@ fn render_picker(f: &mut Frame, area: Rect, picker: &Picker) {
             Line::from(""),
             Line::from(ratatui::text::Span::styled(
                 format!("  ⚠  {err}"),
-                Style::default().fg(Color::Red),
+                Style::default().fg(theme::RED),
             )),
             Line::from(""),
             Line::from(ratatui::text::Span::styled(
                 "  esc / q to close",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme::OVERLAY),
             )),
         ];
         f.render_widget(Paragraph::new(body), inner);
@@ -1252,11 +1556,16 @@ fn render_picker(f: &mut Frame, area: Rect, picker: &Picker) {
         ratatui::text::Span::styled(
             "  / ",
             Style::default()
-                .fg(Color::Yellow)
+                .fg(theme::PEACH)
                 .add_modifier(Modifier::BOLD),
         ),
-        ratatui::text::Span::raw(picker.filter.clone()),
-        ratatui::text::Span::styled("_", Style::default().fg(Color::Yellow)),
+        ratatui::text::Span::styled(&picker.filter, Style::default().fg(theme::YELLOW)),
+        ratatui::text::Span::styled(
+            "▌",
+            Style::default()
+                .fg(theme::PEACH)
+                .add_modifier(Modifier::BOLD),
+        ),
     ]);
     f.render_widget(Paragraph::new(filter_line), chunks[0]);
 
@@ -1275,39 +1584,58 @@ fn render_picker(f: &mut Frame, area: Rect, picker: &Picker) {
         .skip(scroll_top)
         .take(visible_h)
     {
+        use ratatui::text::Span;
         let item = &picker.items[item_idx];
         let is_cursor = visual_idx == picker.cursor;
-        let prefix = if is_cursor { "▶ " } else { "  " };
-        let labels = if item.labels.is_empty() {
-            String::new()
-        } else {
-            format!("  [{}]", item.labels.join(","))
-        };
-        let row_text = format!("{prefix}#{:<5}  {}{}", item.number, item.title, labels);
-        let style = if is_cursor {
+        let prefix = if is_cursor { " ▶ " } else { "   " };
+
+        let mut spans: Vec<Span> = vec![
+            Span::styled(
+                prefix,
+                Style::default()
+                    .fg(theme::PEACH)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("#{:<5}  ", item.number),
+                Style::default().fg(theme::MAUVE),
+            ),
+            Span::styled(&item.title, Style::default().fg(theme::TEXT)),
+        ];
+        if !item.labels.is_empty() {
+            spans.push(Span::styled(
+                format!("  [{}]", item.labels.join(",")),
+                Style::default().fg(theme::TEAL),
+            ));
+        }
+
+        let line_style = if is_cursor {
             Style::default()
-                .bg(Color::Blue)
-                .fg(Color::White)
+                .bg(theme::SURFACE1)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
-        lines.push(Line::from(ratatui::text::Span::styled(row_text, style)));
+        lines.push(Line::from(spans).style(line_style));
     }
     if lines.is_empty() {
         lines.push(Line::from(ratatui::text::Span::styled(
             "  (no matches)",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::OVERLAY),
         )));
     }
     f.render_widget(Paragraph::new(lines), chunks[1]);
 
-    // Footer.
-    let footer = Line::from(ratatui::text::Span::styled(
-        "  j/k=move  type=filter  enter=open in browser  esc=close",
-        Style::default().fg(Color::DarkGray),
-    ));
-    f.render_widget(Paragraph::new(footer), chunks[2]);
+    // Footer — pill-style hints matching the main dashboard footer.
+    f.render_widget(
+        Paragraph::new(Line::from(footer_pills(&[
+            ("j/k", "move"),
+            ("type", "filter"),
+            ("⏎", "open"),
+            ("esc", "close"),
+        ]))),
+        chunks[2],
+    );
 }
 
 #[cfg(test)]
