@@ -147,16 +147,19 @@ fn build_rows(
         let path = resolved
             .clone_path_for(repo, &mut engine)
             .with_context(|| format!("resolving clone path for {}", repo.slug()))?;
-        // TODO(#57): cache lookup is `(host, owner, name)`-keyed and
-        // returns the first match, so when the shelf holds multiple
-        // path-pinned clones of the same remote, every row gets the
-        // *same* `git_status` (whichever the refresher updated last).
-        // Fix is path-aware cache identity — tracked in
-        // https://github.com/yukimemi/shoka/issues/57. The `gh`
-        // half is remote-derived so triple-sharing remains correct.
-        let cache_entry = cache.find(&repo.host, &repo.owner, &repo.name);
-        let status = cache_entry.and_then(|c| c.git_status.clone());
-        let gh = cache_entry.and_then(|c| c.gh.clone());
+        // Split lookup: `git_status` is per-checkout so it needs the
+        // path-aware identity (multi-clone rows must each carry
+        // their own branch / dirty / ahead-behind), while `gh` is
+        // remote-derived — open PR count + CI status are the same
+        // upstream value regardless of which local copy asks, so
+        // sharing across triple siblings is correct and saves API
+        // budget. Resolves the TODO from #57.
+        let status = cache
+            .find(&repo.host, &repo.owner, &repo.name, repo.path.as_deref())
+            .and_then(|c| c.git_status.clone());
+        let gh = cache
+            .find_gh_by_triple(&repo.host, &repo.owner, &repo.name)
+            .cloned();
         let slug = repo.slug();
         let search_key = format!("{slug} {}", path.display());
         out.push(DashRow {
@@ -1347,6 +1350,88 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn build_rows_splits_status_per_path_but_shares_gh_by_triple() {
+        // Regression guard for the split-lookup contract introduced
+        // by #57: per-checkout `git_status` must come from the
+        // path-pinned cache entry (different value per row), while
+        // `gh` is remote-derived and shared across siblings (the
+        // first populated snapshot wins, even if it lives on a
+        // different sibling than the row being rendered).
+        use crate::cache::Cache;
+        use crate::config::ShokaConfig;
+        use crate::gh::{CiStatus, GhSnapshot};
+        use crate::git_status::GitStatusSnapshot;
+        use crate::state::{Repo, Shelf};
+
+        let path_a = PathBuf::from("/home/u/a/shoka");
+        let path_b = PathBuf::from("/home/u/b/shoka");
+
+        // Shelf: two checkouts of the same remote at different
+        // paths. Identical (host, owner, name) — only the path
+        // distinguishes them.
+        let mut shelf = Shelf::default();
+        shelf
+            .add(Repo::new("github.com", "yukimemi", "shoka").with_path(path_a.clone()))
+            .unwrap();
+        shelf
+            .add(Repo::new("github.com", "yukimemi", "shoka").with_path(path_b.clone()))
+            .unwrap();
+
+        // Cache: two path-pinned rows. Different `git_status`
+        // snapshots per row (so we can detect cross-contamination)
+        // and `gh` populated only on row B (so we can prove the
+        // lookup walked past row A's `None`).
+        let status_a = GitStatusSnapshot {
+            branch: Some("feat/a".into()),
+            dirty: false,
+            ahead: Some(1),
+            behind: Some(0),
+        };
+        let status_b = GitStatusSnapshot {
+            branch: Some("feat/b".into()),
+            dirty: true,
+            ahead: Some(0),
+            behind: Some(2),
+        };
+        let shared_gh = GhSnapshot {
+            open_pr_count: Some(7),
+            ci_status: Some(CiStatus::Success),
+        };
+
+        let mut cache = Cache::default();
+        let row_a = cache.upsert(&shelf.repos[0]);
+        row_a.git_status = Some(status_a.clone());
+        row_a.gh = None;
+        let row_b = cache.upsert(&shelf.repos[1]);
+        row_b.git_status = Some(status_b.clone());
+        row_b.gh = Some(shared_gh.clone());
+
+        // `clone_path_for` early-returns `repo.path` for pinned
+        // entries before consulting routes, so the root only needs
+        // to satisfy `resolve()`'s "must be set" guard — it never
+        // surfaces in the output rows for this test's path-pinned
+        // shelf.
+        let mut cfg = ShokaConfig::default();
+        cfg.global.root = Some("/unused-for-pinned-rows".into());
+        let resolved = cfg.resolve(None).expect("resolve");
+        let rows = build_rows(&shelf, &resolved, &cache, &[]).expect("build rows");
+        assert_eq!(rows.len(), 2);
+
+        // Per-path `git_status`: each row sees its own snapshot
+        // (not a cross-row leak). This is the bug PR #59 left open
+        // and #57 explicitly resolves.
+        assert_eq!(rows[0].status.as_ref(), Some(&status_a));
+        assert_eq!(rows[1].status.as_ref(), Some(&status_b));
+
+        // Triple-shared `gh`: both rows see the same snapshot —
+        // and crucially row A sees row B's populated value (not
+        // row A's own `None`), proving `find_gh_by_triple` walked
+        // past the unpopulated sibling.
+        assert_eq!(rows[0].gh.as_ref(), Some(&shared_gh));
+        assert_eq!(rows[1].gh.as_ref(), Some(&shared_gh));
     }
 
     #[test]
