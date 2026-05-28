@@ -111,6 +111,15 @@ Sleep 1800ms
 Escape
 Sleep 800ms
 
+# Pop the `?` help overlay — shows the full keybind cheat sheet
+# (j/k, /, Enter, i/p pickers, f/P fetch+push, y/o yank+open, …).
+# Held longer than other prompts so the viewer can actually read
+# the 15-row table.
+Type "?"
+Sleep 3500ms
+Escape
+Sleep 700ms
+
 # Jump down a row, then quit with q (we don't want the tape to
 # trigger a real cd via SHOKA_CD_OUT — it's not set in the demo
 # env anyway, so Enter would just print the path).
