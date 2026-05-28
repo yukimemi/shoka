@@ -32,6 +32,21 @@ pub fn install_default_crypto_provider() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
+/// Windows `CreateProcess` flag that suppresses the new-console-window
+/// allocation for a console-subsystem child. Set on every short-
+/// lived subprocess shoka spawns (`gh auth token`, `jj git clone`,
+/// `jj git fetch/push`, etc.) because the background cache refresh
+/// runs detached without a console — and when a console-less parent
+/// spawns a console child, Windows allocates a fresh black window
+/// for the child by default, flashing on every command tail. The
+/// flag is a no-op when the parent already owns a console (the
+/// child just inherits it as usual), so it's safe to apply
+/// unconditionally at every subprocess site.
+#[cfg(windows)]
+pub(crate) const fn silent_creation_flags() -> u32 {
+    0x0800_0000 // CREATE_NO_WINDOW
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

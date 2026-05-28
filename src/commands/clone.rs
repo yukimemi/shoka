@@ -155,11 +155,16 @@ fn gix_clone(url: gix::Url, dest: &Path) -> Result<()> {
 
 async fn spawn_jj_clone(url: &str, dest: &Path) -> Result<()> {
     let jj = which::which("jj").context("`jj` not found on PATH (required for vcs = jj)")?;
-    let status = tokio::process::Command::new(&jj)
-        .arg("git")
-        .arg("clone")
-        .arg(url)
-        .arg(dest)
+    let mut cmd = tokio::process::Command::new(&jj);
+    cmd.arg("git").arg("clone").arg(url).arg(dest);
+    // See `crate::silent_creation_flags` for the rationale. The
+    // foreground `clone` path normally has a console (no flash), but
+    // applying the flag uniformly keeps the spawn pattern consistent
+    // and protects against future callers that fold this into a
+    // detached refresh.
+    #[cfg(windows)]
+    cmd.creation_flags(crate::silent_creation_flags());
+    let status = cmd
         .status()
         .await
         .with_context(|| format!("spawning `{} git clone`", jj.display()))?;
