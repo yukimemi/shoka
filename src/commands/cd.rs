@@ -153,6 +153,13 @@ fn choose_by_hint<'a>(candidates: &[&'a Repo], hint: &str) -> Result<&'a Repo> {
 /// for the TUI). Items are wrapped in a thin `Display` adapter so
 /// the picker can return the chosen [`Repo`] reference directly —
 /// no string round-trip + linear scan on the way back.
+///
+/// Each item renders as `slug` plus, when the entry has a path
+/// override (`shoka import` for repos cloned with a non-default
+/// dir name, or multiple checkouts of the same remote), `→ <path>`
+/// with `$HOME` tilde-shortened. Path-less entries (laid out by
+/// `shoka clone` against the configured layout) render slug only,
+/// matching the historic look.
 fn fuzzy_pick<'a>(candidates: &[&'a Repo], prompt: &str) -> Result<&'a Repo> {
     if candidates.is_empty() {
         // Defensive: callers already filter to non-empty, but in case
@@ -168,7 +175,11 @@ fn fuzzy_pick<'a>(candidates: &[&'a Repo], prompt: &str) -> Result<&'a Repo> {
     struct RepoItem<'r>(&'r Repo);
     impl fmt::Display for RepoItem<'_> {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str(&self.0.slug())
+            f.write_str(&self.0.slug())?;
+            if let Some(p) = &self.0.path {
+                write!(f, "  →  {}", tilde_shorten(p))?;
+            }
+            Ok(())
         }
     }
 
@@ -177,6 +188,28 @@ fn fuzzy_pick<'a>(candidates: &[&'a Repo], prompt: &str) -> Result<&'a Repo> {
         .prompt()
         .context("repo selection cancelled")?;
     Ok(chosen.0)
+}
+
+/// Render `p` with the user's home dir collapsed to `~`. Falls back
+/// to the verbatim path string if home can't be resolved or if `p`
+/// doesn't start under it — the worst case is "the path shows in
+/// full", which is still readable, just longer.
+fn tilde_shorten(p: &Path) -> String {
+    let home = directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf());
+    match home {
+        Some(h) => match p.strip_prefix(&h) {
+            Ok(rest) => {
+                let sep = std::path::MAIN_SEPARATOR;
+                if rest.as_os_str().is_empty() {
+                    "~".to_string()
+                } else {
+                    format!("~{sep}{}", rest.display())
+                }
+            }
+            Err(_) => p.display().to_string(),
+        },
+        None => p.display().to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -245,6 +278,49 @@ mod tests {
         }
         .resolve(None)
         .expect("resolve")
+    }
+
+    #[test]
+    fn tilde_shorten_collapses_home_dir_prefix() {
+        // We can't know the test runner's actual home dir, but we
+        // can exercise the strip-prefix branch by passing the home
+        // dir back in as the prefix. Two checks:
+        // 1. A path with no home prefix renders verbatim (no panic).
+        // 2. The home dir itself collapses to `~`.
+        // 3. A nested path under home renders with `~/…` (or
+        //    `~\…` on Windows — `MAIN_SEPARATOR` keeps the test
+        //    platform-agnostic).
+        let home = match directories::BaseDirs::new() {
+            Some(b) => b.home_dir().to_path_buf(),
+            None => return, // sandboxed CI without a home dir — skip silently.
+        };
+        let sep = std::path::MAIN_SEPARATOR;
+
+        assert_eq!(tilde_shorten(&home), "~");
+
+        let nested = home
+            .join("src")
+            .join("github.com")
+            .join("yukimemi")
+            .join("shoka");
+        let rendered = tilde_shorten(&nested);
+        assert!(
+            rendered.starts_with(&format!("~{sep}src")),
+            "expected `~{sep}src…`, got {rendered:?}"
+        );
+
+        // A path outside home falls back to verbatim — pick a path
+        // that can't plausibly be a subpath of the test runner's home.
+        let outside = std::path::PathBuf::from(if cfg!(windows) {
+            r"C:\definitely\not\home"
+        } else {
+            "/definitely/not/home"
+        });
+        let rendered = tilde_shorten(&outside);
+        assert!(
+            !rendered.starts_with('~'),
+            "outside-home path must not tilde-shorten, got {rendered:?}"
+        );
     }
 
     #[test]

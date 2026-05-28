@@ -110,6 +110,13 @@ pub async fn run(ctx: &ShokaContext, args: TuiArgs) -> Result<()> {
 struct DashRow {
     slug: String,
     path: PathBuf,
+    /// `slug` + " " + path-as-string, cached so the per-keystroke
+    /// nucleo scorer in [`App::refilter`] has a single haystack to
+    /// score against. Path is included because the dashboard now
+    /// renders multiple checkouts of the same remote (different
+    /// `path`s for the same triple), and a slug-only filter would
+    /// be useless for picking among them.
+    search_key: String,
     /// Display string — `tags.join(", ")` cached so we don't
     /// re-join per frame.
     tags_display: String,
@@ -140,12 +147,22 @@ fn build_rows(
         let path = resolved
             .clone_path_for(repo, &mut engine)
             .with_context(|| format!("resolving clone path for {}", repo.slug()))?;
+        // TODO(#57): cache lookup is `(host, owner, name)`-keyed and
+        // returns the first match, so when the shelf holds multiple
+        // path-pinned clones of the same remote, every row gets the
+        // *same* `git_status` (whichever the refresher updated last).
+        // Fix is path-aware cache identity — tracked in
+        // https://github.com/yukimemi/shoka/issues/57. The `gh`
+        // half is remote-derived so triple-sharing remains correct.
         let cache_entry = cache.find(&repo.host, &repo.owner, &repo.name);
         let status = cache_entry.and_then(|c| c.git_status.clone());
         let gh = cache_entry.and_then(|c| c.gh.clone());
+        let slug = repo.slug();
+        let search_key = format!("{slug} {}", path.display());
         out.push(DashRow {
-            slug: repo.slug(),
+            slug,
             path,
+            search_key,
             tags_display: repo.tags.join(", "),
             status,
             gh,
@@ -360,9 +377,12 @@ impl App {
 
     /// Recompute `matches` against `filter`. Empty filter = identity
     /// (everything in shelf order); otherwise nucleo scores each
-    /// row's slug and we keep the matches sorted by score
-    /// descending. Cursor pins to the top so the highlighted row is
-    /// always visible after a refilter.
+    /// row's `search_key` (slug + path) and we keep the matches
+    /// sorted by score descending. Path is in the haystack so that
+    /// multiple path-pinned checkouts of the same remote can be
+    /// distinguished by typing part of the dir name. Cursor pins to
+    /// the top so the highlighted row is always visible after a
+    /// refilter.
     fn refilter(&mut self) {
         if self.filter.is_empty() {
             self.matches = (0..self.rows.len()).collect();
@@ -372,7 +392,7 @@ impl App {
             let mut buf: Vec<char> = Vec::new();
             for (idx, row) in self.rows.iter().enumerate() {
                 buf.clear();
-                let haystack = nucleo::Utf32Str::new(&row.slug, &mut buf);
+                let haystack = nucleo::Utf32Str::new(&row.search_key, &mut buf);
                 if let Some(score) = pattern.score(haystack, &mut self.matcher) {
                     scored.push((idx, score));
                 }
@@ -1294,12 +1314,37 @@ mod tests {
     fn rows(slugs: &[&str]) -> Vec<DashRow> {
         slugs
             .iter()
-            .map(|s| DashRow {
-                slug: (*s).into(),
-                path: PathBuf::from("/tmp"),
-                tags_display: String::new(),
-                status: None,
-                gh: None,
+            .map(|s| {
+                let path = PathBuf::from("/tmp");
+                let search_key = format!("{s} {}", path.display());
+                DashRow {
+                    slug: (*s).into(),
+                    path,
+                    search_key,
+                    tags_display: String::new(),
+                    status: None,
+                    gh: None,
+                }
+            })
+            .collect()
+    }
+
+    /// `rows()` variant that lets a test pin per-row `path` strings,
+    /// so we can verify the filter scores against `slug + path`.
+    fn rows_with_paths(items: &[(&str, &str)]) -> Vec<DashRow> {
+        items
+            .iter()
+            .map(|(slug, path)| {
+                let path = PathBuf::from(path);
+                let search_key = format!("{slug} {}", path.display());
+                DashRow {
+                    slug: (*slug).into(),
+                    path,
+                    search_key,
+                    tags_display: String::new(),
+                    status: None,
+                    gh: None,
+                }
             })
             .collect()
     }
@@ -1469,6 +1514,40 @@ mod tests {
         assert!(app.matches.is_empty());
         assert_eq!(app.cursor, 0);
         assert!(app.table_state.selected().is_none());
+    }
+
+    #[test]
+    fn refilter_matches_against_path_for_multi_clone_disambiguation() {
+        // Two rows with the same slug but different on-disk paths.
+        // Filtering by a substring that only appears in one path
+        // must narrow to that row — that's how the user picks
+        // between multiple checkouts of the same remote.
+        let mut app = App::new(rows_with_paths(&[
+            (
+                "github.com/yukimemi/admintask",
+                "/home/u/src/DeviceManagement",
+            ),
+            (
+                "github.com/yukimemi/admintask",
+                "/home/u/old/admintask-backup",
+            ),
+            ("github.com/yukimemi/shoka", "/home/u/src/shoka"),
+        ]));
+        app.filter = "backup".into();
+        app.refilter();
+        assert_eq!(
+            app.matches.len(),
+            1,
+            "exactly one row should match `backup`: {:?}",
+            app.matches
+                .iter()
+                .map(|&i| &app.rows[i].path)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            app.rows[app.matches[0]].path.to_string_lossy(),
+            "/home/u/old/admintask-backup"
+        );
     }
 
     #[test]
@@ -1741,9 +1820,11 @@ mod tests {
         // message — never panic, never silently swallow.
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().to_path_buf();
+        let search_key = format!("local/test/repo {}", path.display());
         let row = DashRow {
             slug: "local/test/repo".into(),
             path,
+            search_key,
             tags_display: String::new(),
             status: None,
             gh: None,

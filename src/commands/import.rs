@@ -10,11 +10,31 @@
 //! When that path doesn't apply (`.jj/`-only, or `.git/` without a
 //! remote, or a remote URL shoka can't parse) the importer falls
 //! back to a synthesised local identity: `host = "local"`,
-//! `owner = <parent dir name>`, `name = <repo dir name>`, and the
-//! repo's path is pinned via [`Repo::with_path`] so `cd` / `tui`
-//! resolve to the exact location on disk rather than running the
-//! entry through `[global].layout`. Repos stay where they are —
-//! shoka doesn't move local checkouts.
+//! `owner = <parent dir name>`, `name = <repo dir name>`.
+//!
+//! Either way, the repo's absolute on-disk path is pinned via
+//! [`Repo::with_path`] so `cd` / `tui` resolve to the exact location
+//! we just walked to rather than running the entry through
+//! `[global].layout`. That matters because `git clone <url> <other-name>`
+//! is officially supported (and a local rename of the working tree
+//! is just as legitimate) — the on-disk dir name can legitimately
+//! differ from the URL-derived `name`, and the importer must honour
+//! that. Repos stay where they are — shoka doesn't move local
+//! checkouts.
+//!
+//! Shelf identity is `(host, owner, name, path?)`. Same triple with
+//! different paths is allowed — that's exactly the
+//! `git clone <url> <other-name>` / local-rename / multi-checkout
+//! case. Re-running `shoka import` distinguishes three sub-cases:
+//!
+//! - **exact (triple, path) match** → skip ("already on shelf")
+//! - **triple matches, existing entry has `path = None`** → fill in
+//!   the path (self-heal for shelves imported before the always-pin
+//!   behaviour landed, or `shoka clone`-laid-out entries that the
+//!   user has since moved on disk)
+//! - **triple matches, existing entry has a different `path`** →
+//!   add as a new entry (a second checkout of the same remote)
+//! - **triple not on shelf** → add
 //!
 //! No `git` subprocess is spawned — gix does everything in-process.
 //! That matters most on Windows, where `CreateProcess` is slow enough
@@ -57,6 +77,7 @@ pub async fn run(ctx: &ShokaContext, args: ImportArgs) -> Result<()> {
     let mut shelf = Shelf::load(&ctx.paths)?;
 
     let mut imported = 0usize;
+    let mut updated = 0usize;
     let mut skipped_already = 0usize;
     let mut errors = 0usize;
     // Repo roots already imported in this run, keyed by the parent
@@ -131,21 +152,25 @@ pub async fn run(ctx: &ShokaContext, args: ImportArgs) -> Result<()> {
         match result {
             Ok(repo) => {
                 let slug = repo.slug();
-                if shelf.find(&repo.host, &repo.owner, &repo.name).is_some() {
-                    skipped_already += 1;
-                } else {
-                    match shelf.add(repo) {
-                        Ok(()) => {
-                            println!("  {} {slug}", "+".green());
-                            imported += 1;
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                target: "shoka",
-                                "failed to add {slug} to shelf: {e:#}"
-                            );
-                            errors += 1;
-                        }
+                let outcome = upsert_into_shelf(&mut shelf, repo);
+                match outcome {
+                    Outcome::Imported => {
+                        println!("  {} {slug}", "+".green());
+                        imported += 1;
+                    }
+                    Outcome::PathFilled => {
+                        println!("  {} {slug}", "↻".cyan());
+                        updated += 1;
+                    }
+                    Outcome::AlreadyOnShelf => {
+                        skipped_already += 1;
+                    }
+                    Outcome::AddFailed(e) => {
+                        tracing::warn!(
+                            target: "shoka",
+                            "failed to add {slug} to shelf: {e:#}"
+                        );
+                        errors += 1;
                     }
                 }
             }
@@ -169,6 +194,9 @@ pub async fn run(ctx: &ShokaContext, args: ImportArgs) -> Result<()> {
         imported,
         shelf.len()
     );
+    if updated > 0 {
+        println!("  {} {} path refreshed", "↻".cyan(), updated);
+    }
     if skipped_already > 0 {
         println!("  {} {} already on shelf", "↩".dimmed(), skipped_already);
     }
@@ -180,6 +208,60 @@ pub async fn run(ctx: &ShokaContext, args: ImportArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// What happened when the importer tried to fold one repo into the
+/// shelf. Mirrors the user-visible summary so the main loop just
+/// counts + prints.
+enum Outcome {
+    /// New row added (either a fresh triple, or a second checkout
+    /// of an existing remote at a different path).
+    Imported,
+    /// Existing path-less row got its path filled in. The shelf
+    /// grew by zero rows but the entry now resolves correctly via
+    /// `clone_path_for`.
+    PathFilled,
+    /// Exact `(triple, path)` already on the shelf; nothing to do.
+    AlreadyOnShelf,
+    /// `Shelf::add` returned an error. Wrapped so the caller can
+    /// log + count without juggling the enum / Result split.
+    AddFailed(anyhow::Error),
+}
+
+/// Decide whether to add a new row, fill in a path-less twin, or
+/// skip outright. See module docs for the full case analysis.
+fn upsert_into_shelf(shelf: &mut Shelf, repo: Repo) -> Outcome {
+    // Exact `(host, owner, name, path)` already there → nothing to do.
+    if shelf
+        .find_by_path(&repo.host, &repo.owner, &repo.name, repo.path.as_deref())
+        .is_some()
+    {
+        return Outcome::AlreadyOnShelf;
+    }
+
+    // Self-heal the pre-always-pin shelf: when the new entry brings
+    // a `path` but the shelf already has a path-less twin for this
+    // triple, fill in the path rather than add a duplicate. A
+    // path-less entry is by definition the *single* layout-derived
+    // checkout for that triple, so it's safe to refine in place.
+    //
+    // Crucially, we only do this when the new entry has `Some(path)`
+    // — never when both are `None` (that case is the exact-duplicate
+    // branch above) and never when the existing entry is already
+    // path-pinned (treating that as a different checkout is the
+    // entire point of the multi-clone story).
+    if repo.path.is_some()
+        && let Some(existing) = shelf.find_mut(&repo.host, &repo.owner, &repo.name)
+        && existing.path.is_none()
+    {
+        existing.path = repo.path;
+        return Outcome::PathFilled;
+    }
+
+    match shelf.add(repo) {
+        Ok(()) => Outcome::Imported,
+        Err(e) => Outcome::AddFailed(e),
+    }
 }
 
 /// Pop up an inquire picker listing the candidate source dirs that
@@ -219,6 +301,14 @@ fn prompt_for_source() -> Result<PathBuf> {
 /// when the repo simply has no remote / no fetch URL. Genuine
 /// config-load or repo-corruption errors propagate as `Err` so the
 /// caller logs + counts them rather than masking them as "no remote".
+///
+/// The returned [`Repo`] always has its `path` pinned to `repo_root`'s
+/// absolute form. Git officially supports `git clone <url> <other-name>`
+/// (and locally-renamed working trees are equally legitimate), so
+/// the URL-derived `name` and the on-disk dir name can legitimately
+/// diverge. Without an explicit `path`, `clone_path_for` would route
+/// `cd` / `tui` to the layout-derived location, which simply doesn't
+/// exist when the dir was renamed.
 fn extract_git_repo(repo_root: &Path) -> Result<Repo> {
     let repo = gix::open(repo_root)
         .with_context(|| format!("opening {} as a git repo", repo_root.display()))?;
@@ -248,7 +338,9 @@ fn extract_git_repo(repo_root: &Path) -> Result<Repo> {
     };
 
     match parse_remote_url(&url) {
-        Ok(parts) => Ok(Repo::new(parts.host, parts.owner, parts.name)),
+        Ok(parts) => {
+            Ok(Repo::new(parts.host, parts.owner, parts.name).with_path(absolute(repo_root)))
+        }
         Err(e) => {
             // URL exists but doesn't conform to host/owner/name (e.g.
             // gitlab subgroups, or a deliberately-weird internal URL).
@@ -262,6 +354,14 @@ fn extract_git_repo(repo_root: &Path) -> Result<Repo> {
             Ok(synthesise_local(repo_root))
         }
     }
+}
+
+/// Absolutise `p`, falling back to the input verbatim if the OS can't
+/// give us a cwd (no current directory, weird state). Shared by
+/// [`extract_git_repo`] and [`synthesise_local`] so both paths agree
+/// on what "absolute" means.
+fn absolute(p: &Path) -> PathBuf {
+    std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
 /// Build a local-identity [`Repo`] for `repo_root`.
@@ -283,14 +383,7 @@ fn extract_git_repo(repo_root: &Path) -> Result<Repo> {
 /// `(local, <parent>, <repo>)` is unique enough for the vast
 /// majority of real layouts.
 fn synthesise_local(repo_root: &Path) -> Repo {
-    let abs = match std::path::absolute(repo_root) {
-        Ok(p) => p,
-        // Absolutising can fail (no cwd, weird OS state). Fall back
-        // to the caller-supplied path verbatim — it's still useful
-        // even if not normalised, and shoka doesn't validate
-        // absoluteness on save.
-        Err(_) => repo_root.to_path_buf(),
-    };
+    let abs = absolute(repo_root);
     let name = path_component_string(abs.file_name()).unwrap_or_else(|| abs.display().to_string());
     let owner = abs
         .parent()
@@ -322,6 +415,63 @@ mod tests {
         let canonical = std::fs::canonicalize(&repo).unwrap();
         let stored = std::fs::canonicalize(r.path.as_ref().unwrap()).unwrap();
         assert_eq!(stored, canonical);
+    }
+
+    /// Build a `.git/`-marked repo at `dir` with the given remote
+    /// URL via `gix::init` + a hand-written `[remote "origin"]`
+    /// stanza. Mirrors the integration-test helper but lives here so
+    /// the unit test stays in-crate.
+    fn init_git_with_remote(dir: &Path, url: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        gix::init(dir).expect("gix init");
+        let cfg = dir.join(".git").join("config");
+        let mut body = std::fs::read_to_string(&cfg).unwrap();
+        body.push_str(&format!(
+            "\n[remote \"origin\"]\n\turl = {url}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n"
+        ));
+        std::fs::write(&cfg, body).unwrap();
+    }
+
+    #[test]
+    fn extract_git_repo_pins_path_when_dirname_differs_from_remote_slug() {
+        // The headline regression: `git clone <url> <other-name>` (or
+        // a local rename) leaves the working tree at a dir whose name
+        // doesn't match the URL-derived `name`. Without a `path`
+        // override, layout would route `cd` / `tui` to a nonexistent
+        // location. We must pin the actual on-disk path.
+        let tmp = TempDir::new().unwrap();
+        let repo_root = tmp.path().join("DeviceManagement");
+        init_git_with_remote(&repo_root, "https://github.com/yukimemi/admintask.git");
+
+        let r = extract_git_repo(&repo_root).expect("extract");
+        assert_eq!(r.host, "github.com");
+        assert_eq!(r.owner, "yukimemi");
+        // Identity comes from the URL, not the dir name.
+        assert_eq!(r.name, "admintask");
+        // Path is pinned to the actual on-disk location.
+        let pinned = r.path.as_ref().expect("path must be pinned on import");
+        assert_eq!(
+            std::fs::canonicalize(pinned).unwrap(),
+            std::fs::canonicalize(&repo_root).unwrap(),
+        );
+    }
+
+    #[test]
+    fn extract_git_repo_pins_path_even_when_dirname_matches_slug() {
+        // For consistency the path is pinned unconditionally, not
+        // just on the rename case. Always-pin means re-running
+        // `shoka import` after a root move never silently strands
+        // entries at stale layout-derived paths.
+        let tmp = TempDir::new().unwrap();
+        let repo_root = tmp.path().join("matching-name");
+        init_git_with_remote(&repo_root, "https://github.com/yukimemi/matching-name.git");
+
+        let r = extract_git_repo(&repo_root).expect("extract");
+        assert_eq!(r.name, "matching-name");
+        assert!(
+            r.path.is_some(),
+            "path should be pinned even in the matching-name case"
+        );
     }
 
     #[test]
