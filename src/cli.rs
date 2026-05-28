@@ -260,8 +260,12 @@ pub struct InitShellArgs {
     #[arg(value_enum)]
     pub shell: SupportedShell,
 
-    /// Wrapper function name (default: `s`).
-    #[arg(long, default_value = "s")]
+    /// Wrapper function name (default: `shoka`). The function
+    /// intercepts `cd` / `tui` to chdir the parent shell and
+    /// transparently passes every other subcommand through to the
+    /// `shoka` binary, so the same name covers both worlds. Override
+    /// to `s` (or anything shorter) if you want a separate alias.
+    #[arg(long, default_value = "shoka")]
     pub name: String,
 }
 

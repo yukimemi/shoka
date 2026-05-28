@@ -1,21 +1,29 @@
-//! Emit a shell wrapper that turns `shoka cd` into an actual cd.
+//! Emit a shell wrapper that lets `shoka cd` / `shoka tui` actually
+//! change the parent shell's working directory.
 //!
-//! The wrapper has to work around a constraint of `shoka cd`'s
-//! interactive picker: `inquire` 0.9 writes its prompt UI to stdout
-//! and exposes no public switch to stderr. If the shell captured
-//! stdout naively (`dest=$(shoka cd ...)`), the prompt would be
-//! swallowed into the variable and the user would see nothing.
+//! A child process can't chdir its parent on any OS shoka cares
+//! about — kernel-enforced. The standard workaround is a shell
+//! function that captures shoka's resolved path and runs the
+//! parent's own `cd` builtin on it. The function we emit goes one
+//! step further: it claims the `shoka` *name itself* (instead of
+//! the older `s` alias), intercepts the `cd` / `tui` subcommands,
+//! and transparently passes every other shoka subcommand through to
+//! the binary via `command shoka` / `& shoka.exe`. The user sees a
+//! single `shoka` they can run any subcommand against; the wrapper
+//! is invisible until they touch `cd` or `tui`.
 //!
-//! Each wrapper therefore:
+//! Each subcommand has a small twist:
 //!
-//! 1. Creates a tmp file and sets [`SHOKA_CD_OUT`] to point at it.
-//!    `shoka cd` writes the resolved path to that file (see
-//!    [`crate::commands::cd::emit_path`]).
-//! 2. Lets `shoka cd`'s stdout flow to the user's terminal (so the
-//!    `inquire` prompt UI renders normally) and reads the path back
-//!    from the tmp file.
-//! 3. Cleans up the tmp file and does the actual `cd` if a non-empty
-//!    path came back.
+//! - **`shoka cd`** uses an interactive picker. `inquire` 0.9 writes
+//!   its prompt UI to stdout with no public switch to stderr, so the
+//!   wrapper can't capture stdout (would swallow the prompt).
+//!   Instead it sets [`SHOKA_CD_OUT`] to a tmp file, lets stdout
+//!   flow to the terminal, and reads the resolved path back from
+//!   that file.
+//! - **`shoka tui`** owns stdin/stdout for the ratatui dashboard;
+//!   the path emission goes through the same sidechannel so the
+//!   wrapper's logic is identical.
+//! - **Everything else** is a plain pass-through to the binary.
 //!
 //! [`SHOKA_CD_OUT`]: crate::commands::cd::CD_OUT_ENV
 
@@ -34,18 +42,27 @@ pub async fn run(args: InitShellArgs) -> anyhow::Result<()> {
 }
 
 fn posix_wrapper(name: &str) -> String {
+    // `command shoka` bypasses the function lookup so the same name
+    // can shadow the binary without infinite recursion.
     format!(
         r#"{name}() {{
-    local tmp dest status
-    tmp=$(mktemp) || return 1
-    {env}="$tmp" shoka cd "$@"
-    status=$?
-    if [ "$status" -eq 0 ]; then
-        dest=$(cat "$tmp")
-    fi
-    rm -f "$tmp"
-    [ "$status" -eq 0 ] && [ -n "$dest" ] && cd -- "$dest"
-    return $status
+    case "$1" in
+        cd|tui)
+            local tmp dest status
+            tmp=$(mktemp) || return 1
+            {env}="$tmp" command shoka "$@"
+            status=$?
+            if [ "$status" -eq 0 ]; then
+                dest=$(cat "$tmp")
+            fi
+            rm -f "$tmp"
+            [ "$status" -eq 0 ] && [ -n "$dest" ] && cd -- "$dest"
+            return $status
+            ;;
+        *)
+            command shoka "$@"
+            ;;
+    esac
 }}
 "#,
         env = CD_OUT_ENV,
@@ -55,18 +72,24 @@ fn posix_wrapper(name: &str) -> String {
 fn fish_wrapper(name: &str) -> String {
     format!(
         r#"function {name}
-    set -l tmp (mktemp); or return 1
-    {env}=$tmp shoka cd $argv
-    set -l status $status
-    set -l dest ""
-    if test $status -eq 0
-        set dest (cat $tmp)
+    switch "$argv[1]"
+        case cd tui
+            set -l tmp (mktemp); or return 1
+            set -lx {env} $tmp
+            command shoka $argv
+            set -l rc $status
+            set -l dest ""
+            if test $rc -eq 0
+                set dest (cat $tmp)
+            end
+            rm -f $tmp
+            if test $rc -eq 0; and test -n "$dest"
+                cd -- $dest
+            end
+            return $rc
+        case '*'
+            command shoka $argv
     end
-    rm -f $tmp
-    if test $status -eq 0; and test -n "$dest"
-        cd -- $dest
-    end
-    return $status
 end
 "#,
         env = CD_OUT_ENV,
@@ -74,25 +97,50 @@ end
 }
 
 fn powershell_wrapper(name: &str) -> String {
-    // `New-TemporaryFile` returns a `FileInfo`; `.FullName` is the
-    // path. We deliberately don't use try/finally with `throw` so a
-    // missing tmp file (rare) doesn't mask the underlying `shoka cd`
-    // exit code.
+    // PowerShell needs the binary resolved explicitly because the
+    // function name shadows the executable in command lookup. We
+    // cache the resolved path in a `$script:` variable so the
+    // `Get-Command` lookup (50-200 ms on Windows depending on PATH
+    // length) runs once per session rather than on every wrapper
+    // invocation — meaningful because the wrapper is now on the hot
+    // path for every shoka subcommand. The cache invalidates
+    // automatically on shell restart, which is also when a
+    // `cargo install --force` would land a new binary.
+    //
+    // `Get-Command -CommandType Application` works on both Windows
+    // (`shoka.exe`) and pwsh on Linux/macOS without a separate
+    // code path.
+    //
+    // No try/finally around the pass-through branch — there's no
+    // tmp file to clean up there, and a missing executable should
+    // surface as PowerShell's standard error rather than be
+    // swallowed.
     format!(
         r#"function {name} {{
-    $tmp = New-TemporaryFile
-    try {{
-        $env:{env} = $tmp.FullName
-        shoka cd @args
-        $code = $LASTEXITCODE
-        if ($code -eq 0) {{
-            $dest = Get-Content -LiteralPath $tmp.FullName -Raw
-            if ($dest) {{ Set-Location -LiteralPath $dest.TrimEnd() }}
+    if (-not $script:ShokaExe) {{
+        $script:ShokaExe = (Get-Command -Name shoka -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+    }}
+    if (-not $script:ShokaExe) {{
+        Write-Error 'shoka binary not found on PATH'
+        return
+    }}
+    if ($args.Count -gt 0 -and ($args[0] -eq 'cd' -or $args[0] -eq 'tui')) {{
+        $tmp = New-TemporaryFile
+        try {{
+            $env:{env} = $tmp.FullName
+            & $script:ShokaExe @args
+            $code = $LASTEXITCODE
+            if ($code -eq 0) {{
+                $dest = Get-Content -LiteralPath $tmp.FullName -Raw
+                if ($dest) {{ Set-Location -LiteralPath $dest.TrimEnd() }}
+            }}
+            $global:LASTEXITCODE = $code
+        }} finally {{
+            Remove-Item -LiteralPath $tmp.FullName -Force -ErrorAction SilentlyContinue
+            Remove-Item Env:{env} -ErrorAction SilentlyContinue
         }}
-        $global:LASTEXITCODE = $code
-    }} finally {{
-        Remove-Item -LiteralPath $tmp.FullName -Force -ErrorAction SilentlyContinue
-        Remove-Item Env:{env} -ErrorAction SilentlyContinue
+    }} else {{
+        & $script:ShokaExe @args
     }}
 }}
 "#,
@@ -123,51 +171,119 @@ mod tests {
     }
 
     #[test]
-    fn posix_wrapper_uses_sidechannel_env_var() {
-        let body = rendered(SupportedShell::Bash, "s");
-        assert!(body.contains("s()"), "function name should be `s`: {body}");
+    fn posix_wrapper_dispatches_cd_and_tui_through_sidechannel() {
+        let body = rendered(SupportedShell::Bash, "shoka");
+        assert!(
+            body.contains("shoka()"),
+            "function name should be `shoka`: {body}"
+        );
         assert!(
             body.contains("SHOKA_CD_OUT"),
             "wrapper must set the sidechannel env var: {body}"
         );
-        // The previous wrapper version captured `shoka cd`'s stdout
-        // into a variable. With the sidechannel, stdout is left alone
-        // (so the prompt UI renders) — guard against the old shape
-        // creeping back in.
         assert!(
-            !body.contains("$(shoka cd"),
+            body.contains("cd|tui)"),
+            "wrapper must intercept both `cd` and `tui`: {body}"
+        );
+        assert!(
+            body.contains("command shoka"),
+            "wrapper must use `command shoka` to bypass the function: {body}"
+        );
+        // The previous wrapper version captured `shoka cd`'s stdout
+        // into a variable. With the sidechannel, stdout is left
+        // alone (so the prompt UI renders) — guard against the old
+        // shape creeping back in.
+        assert!(
+            !body.contains("$(command shoka cd"),
             "wrapper must not capture stdout via command substitution: {body}"
         );
     }
 
     #[test]
-    fn fish_wrapper_uses_sidechannel_env_var() {
-        let body = rendered(SupportedShell::Fish, "s");
-        assert!(body.contains("function s"));
+    fn posix_wrapper_passes_other_subcommands_through_to_binary() {
+        // A non-cd, non-tui subcommand must reach the binary
+        // unchanged so users can run e.g. `shoka clone` with the
+        // function shadow still present. The pass-through arm is
+        // the wildcard branch of the case statement.
+        let body = rendered(SupportedShell::Bash, "shoka");
+        let wildcard_pos = body
+            .find("*)")
+            .expect("wildcard pass-through branch must exist");
+        let after = &body[wildcard_pos..];
+        assert!(
+            after.contains(r#"command shoka "$@""#),
+            "pass-through arm must invoke the binary without sidechannel setup: {body}"
+        );
+    }
+
+    #[test]
+    fn fish_wrapper_dispatches_cd_and_tui_through_sidechannel() {
+        let body = rendered(SupportedShell::Fish, "shoka");
+        assert!(body.contains("function shoka"));
         assert!(body.contains("SHOKA_CD_OUT"));
+        assert!(
+            body.contains("case cd tui"),
+            "fish wrapper must intercept both `cd` and `tui`: {body}"
+        );
+        assert!(
+            body.contains("command shoka"),
+            "fish wrapper must invoke the binary via `command`: {body}"
+        );
         // fish wrappers also must not capture stdout via subshell.
         assert!(
-            !body.contains("(shoka cd"),
+            !body.contains("(command shoka cd"),
             "fish wrapper must not capture stdout via subshell: {body}"
         );
     }
 
     #[test]
-    fn powershell_wrapper_uses_sidechannel_env_var() {
-        let body = rendered(SupportedShell::Powershell, "s");
-        assert!(body.contains("function s"));
+    fn powershell_wrapper_dispatches_cd_and_tui_through_sidechannel() {
+        let body = rendered(SupportedShell::Powershell, "shoka");
+        assert!(body.contains("function shoka"));
         assert!(body.contains("SHOKA_CD_OUT"));
-        // Verify try/finally is present so the tmp file + env var
-        // cleanup happens even if shoka cd panics.
+        // Verify the binary is resolved via `Get-Command`, not
+        // re-invoked by name (which would recurse into the function).
+        assert!(
+            body.contains("Get-Command -Name shoka -CommandType Application"),
+            "PowerShell wrapper must resolve the binary explicitly to avoid recursion: {body}"
+        );
+        // Verify the resolved path is cached in a script-scope
+        // variable so the 50-200 ms `Get-Command` cost runs once
+        // per session, not on every wrapper invocation.
+        assert!(
+            body.contains("$script:ShokaExe"),
+            "PowerShell wrapper must cache the resolved binary in $script:ShokaExe: {body}"
+        );
+        assert!(
+            body.contains("$args[0] -eq 'cd' -or $args[0] -eq 'tui'"),
+            "PowerShell wrapper must dispatch on the first arg: {body}"
+        );
+        // try/finally is present so the tmp file + env var cleanup
+        // happens even if shoka cd panics.
         assert!(body.contains("finally"), "wrapper missing cleanup: {body}");
+    }
+
+    #[test]
+    fn custom_name_substitutes_throughout() {
+        // Users overriding `--name s` for a shorter alias must get
+        // the same dispatch behavior at the new name, not a half-
+        // renamed wrapper.
+        let body = rendered(SupportedShell::Bash, "s");
+        assert!(body.contains("s()"));
+        assert!(body.contains("cd|tui)"));
+        assert!(body.contains("command shoka"));
+        assert!(
+            !body.contains("shoka()"),
+            "custom name must not also emit a default `shoka()` definition: {body}"
+        );
     }
 
     #[test]
     fn run_emits_wrapper_for_each_supported_shell() {
         // Doesn't capture stdout (would need IO redirection), but
         // confirms the dispatcher actually picks a wrapper without
-        // panicking for every supported shell. The wrapper body itself
-        // is verified by the per-shell tests above.
+        // panicking for every supported shell. The wrapper body
+        // itself is verified by the per-shell tests above.
         let rt = tokio::runtime::Runtime::new().unwrap();
         for shell in [
             SupportedShell::Bash,
@@ -175,7 +291,7 @@ mod tests {
             SupportedShell::Fish,
             SupportedShell::Powershell,
         ] {
-            rt.block_on(run(args(shell, "s"))).unwrap();
+            rt.block_on(run(args(shell, "shoka"))).unwrap();
         }
     }
 }
