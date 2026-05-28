@@ -88,7 +88,7 @@ open = "5.3.5"
 # `default-features = false` drops the `image` feature, which would
 # otherwise pull in `image` + `png` + `tiff` + `zune-jpeg` etc. —
 # pure dead weight for a text-only clipboard write.
-arboard = { version = "3.6.0", default-features = false }
+arboard = { version = "3.6.1", default-features = false }
 
 # Both reqwest (via hyper-rustls "aws-lc-rs") and octocrab (via
 # rustls-ring) pull rustls into the tree with conflicting
