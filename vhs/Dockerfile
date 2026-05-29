@@ -53,7 +53,7 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 # lag behind the GIF's apparent state. Override with
 # `--build-arg SHOKA_VERSION=X.Y.Z` when re-recording against an
 # unreleased branch.
-ARG SHOKA_VERSION=0.11.0
+ARG SHOKA_VERSION=0.14.1
 RUN cargo install shoka --version "${SHOKA_VERSION}" --locked
 
 # Sandbox layout. The tape exports SHOKA_CONFIG / SHOKA_STATE_DIR /
@@ -89,7 +89,7 @@ RUN printf '%s\n' \
 # failure (transient network, deleted repo) would let the RUN
 # succeed with a partially-staged sandbox. Forcing per-iteration
 # exit on failure makes the build crash visibly instead.
-RUN for repo in shoka renri kanade teravars; do \
+RUN for repo in shoka renri kata teravars; do \
         git clone --depth 1 --quiet \
             "https://github.com/yukimemi/${repo}.git" \
             "${SHOKA_SANDBOX}/root/github.com/yukimemi/${repo}" \
