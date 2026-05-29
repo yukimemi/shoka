@@ -137,41 +137,86 @@ pub async fn capture_snapshot(client: &Octocrab, owner: &str, name: &str) -> Res
 }
 
 async fn open_pr_count(client: &Octocrab, owner: &str, name: &str) -> Result<usize> {
-    // `per_page(100)` is the API max; octocrab doesn't surface
-    // `total_count` for /pulls (Search API would, but at 1/30 of the
-    // rate-limit budget). Anything over 100 open PRs is unusual
-    // enough that under-counting at the cap is acceptable — the TUI
-    // clamps the display at "99+" regardless.
-    let prs = client
-        .pulls(owner, name)
-        .list()
-        .state(octocrab::params::State::Open)
-        .per_page(100)
-        .send()
+    // Bypass octocrab's typed `pulls(...).list().send()` because
+    // its [`octocrab::models::pulls::PullRequest`] schema treats
+    // several optional fields as required `String` — when GitHub
+    // returns `null` for any of them (which it does for several of
+    // our own repos, including kanade / kaishin / todoke), the
+    // whole snapshot fails with `Serde Error: invalid type: null,
+    // expected a string` and the row in the TUI renders `-`. We
+    // only need the *count*, so a minimal local struct (`items: Vec<
+    // serde_json::Value>`) skips every per-PR field and is immune
+    // to the schema drift entirely.
+    //
+    // `per_page(100)` is the API max; the response is a JSON
+    // *array* (not the `Page<T>` envelope octocrab synthesises),
+    // so we deserialise straight into a `Vec`. Anything over 100
+    // open PRs is unusual enough that under-counting at the cap is
+    // acceptable — the TUI clamps the display at "99+" regardless.
+    let route = format!("/repos/{owner}/{name}/pulls");
+    // `IgnoredAny` accepts any JSON value and discards it, so the
+    // per-PR contents never touch a typed deserialiser. Counting
+    // the Vec gives us the open-PR total without paying for a
+    // single struct field.
+    let prs: Vec<serde::de::IgnoredAny> = client
+        .get(route, Some(&[("state", "open"), ("per_page", "100")]))
         .await?;
-    Ok(prs.items.len())
+    Ok(prs.len())
+}
+
+/// Minimal subset of GitHub's workflow-run object — only the two
+/// fields [`latest_ci_status`] needs to classify the result. Avoids
+/// pulling in octocrab's [`octocrab::models::workflows::Run`],
+/// whose strict-`String` typing on optional fields (notably
+/// `previous_attempt_url`) makes the entire response refuse to
+/// deserialise when GitHub returns `null` for them.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct RunMinimal {
+    status: String,
+    #[serde(default)]
+    conclusion: Option<String>,
+}
+
+/// Wire envelope the `/actions/runs` endpoint returns. We only
+/// peel off `workflow_runs`; everything else (`total_count`,
+/// pagination links) is ignored, so a future field addition or
+/// rename upstream can't break this code path.
+///
+/// `Option<Vec<…>>` rather than `#[serde(default)] Vec<…>` because
+/// the latter only catches a *missing* key — if GitHub ever
+/// returns `{"workflow_runs": null}` (rare but documented in some
+/// upstream issues), serde would still fail deserialising `null`
+/// into a `Vec`. `Option` flattens both shapes into the same
+/// "treat as no runs" branch via `unwrap_or_default()` at the
+/// call site.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct CiRunsResponse {
+    #[serde(default)]
+    workflow_runs: Option<Vec<RunMinimal>>,
 }
 
 async fn latest_ci_status(client: &Octocrab, owner: &str, name: &str) -> Result<Option<CiStatus>> {
-    // List runs sorted newest first (octocrab default). `per_page(1)`
-    // is enough — we only care about the most recent visible run.
-    // Branch filter is *not* applied: a hand-pushed feature-branch
-    // CI run can legitimately precede a default-branch run, and the
-    // dashboard's job is "what's the latest visible CI state" not
-    // "is main green specifically".
-    let runs = client
-        .workflows(owner, name)
-        .list_all_runs()
-        .per_page(1)
-        .send()
-        .await?;
-    let Some(run) = runs.items.into_iter().next() else {
+    // Same minimal-struct rationale as `open_pr_count`. The
+    // `/actions/runs` response is sorted newest first by GitHub
+    // default, so `per_page=1` is enough to read the most recent
+    // visible run. Branch filter is *not* applied: a hand-pushed
+    // feature-branch CI run can legitimately precede a
+    // default-branch run, and the dashboard's job is "what's the
+    // latest visible CI state" not "is main green specifically".
+    let route = format!("/repos/{owner}/{name}/actions/runs");
+    let response: CiRunsResponse = client.get(route, Some(&[("per_page", "1")])).await?;
+    let Some(run) = response
+        .workflow_runs
+        .unwrap_or_default()
+        .into_iter()
+        .next()
+    else {
         return Ok(None);
     };
     Ok(Some(classify_ci(&run)))
 }
 
-fn classify_ci(run: &octocrab::models::workflows::Run) -> CiStatus {
+fn classify_ci(run: &RunMinimal) -> CiStatus {
     // `status` is queued / in_progress / completed. `conclusion` is
     // populated only when status == completed.
     match run.status.as_str() {
@@ -219,6 +264,46 @@ impl PickerItem {
     }
 }
 
+/// Minimal subset of a `/issues` or `/pulls` array element — just
+/// the fields the Telescope-style picker actually displays. Same
+/// rationale as [`RunMinimal`]: octocrab's typed `Issue` /
+/// `PullRequest` schemas mark several optional fields as required
+/// `String`, so the entire picker fails on repos where GitHub
+/// returns `null` for any of them. The label sub-object likewise
+/// uses [`LabelMinimal`] to skip the rest of GitHub's label
+/// payload (colour, description, default flag, …).
+#[derive(Debug, Clone, serde::Deserialize)]
+struct PickerItemRaw {
+    number: u64,
+    title: String,
+    html_url: String,
+    #[serde(default)]
+    labels: Vec<LabelMinimal>,
+    /// Present on the `/issues` endpoint when the item is actually
+    /// a pull request (GitHub folds PRs into `/issues`). The picker
+    /// filters these out on the issues side. `IgnoredAny` skips the
+    /// payload so a future schema change in `pull_request.*` can't
+    /// break the filter.
+    #[serde(default)]
+    pull_request: Option<serde::de::IgnoredAny>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct LabelMinimal {
+    name: String,
+}
+
+impl PickerItemRaw {
+    fn into_picker_item(self) -> PickerItem {
+        PickerItem {
+            number: self.number,
+            title: self.title,
+            html_url: self.html_url,
+            labels: self.labels.into_iter().map(|l| l.name).collect(),
+        }
+    }
+}
+
 /// List open issues for `owner/name`. Filters out pull requests —
 /// GitHub's REST API folds PRs into the `/issues` listing with a
 /// `pull_request` field set, and showing them twice (once in `i`
@@ -229,50 +314,28 @@ pub async fn list_open_issues(
     owner: &str,
     name: &str,
 ) -> Result<Vec<PickerItem>> {
-    let page = client
-        .issues(owner, name)
-        .list()
-        .state(octocrab::params::State::Open)
-        .per_page(100)
-        .send()
+    let route = format!("/repos/{owner}/{name}/issues");
+    let raw: Vec<PickerItemRaw> = client
+        .get(route, Some(&[("state", "open"), ("per_page", "100")]))
         .await?;
-    Ok(page
-        .items
+    Ok(raw
         .into_iter()
         .filter(|i| i.pull_request.is_none())
-        .map(|i| PickerItem {
-            number: i.number,
-            title: i.title,
-            html_url: i.html_url.to_string(),
-            labels: i.labels.into_iter().map(|l| l.name).collect(),
-        })
+        .map(PickerItemRaw::into_picker_item)
         .collect())
 }
 
-/// List open pull requests for `owner/name`. octocrab's pulls API
-/// already returns *only* PRs (no issue cross-contamination), so no
-/// extra filtering needed.
+/// List open pull requests for `owner/name`. The `/pulls` endpoint
+/// returns only PRs, so no cross-contamination filter is needed —
+/// `pull_request` on the deserialised items is always `None` here.
 pub async fn list_open_prs(client: &Octocrab, owner: &str, name: &str) -> Result<Vec<PickerItem>> {
-    let page = client
-        .pulls(owner, name)
-        .list()
-        .state(octocrab::params::State::Open)
-        .per_page(100)
-        .send()
+    let route = format!("/repos/{owner}/{name}/pulls");
+    let raw: Vec<PickerItemRaw> = client
+        .get(route, Some(&[("state", "open"), ("per_page", "100")]))
         .await?;
-    Ok(page
-        .items
+    Ok(raw
         .into_iter()
-        .map(|pr| PickerItem {
-            number: pr.number,
-            // octocrab's `title` / `html_url` / `labels` are all
-            // non-optional on PullRequest as of 0.45, so no fallback
-            // needed. Kept explicit in case of a future schema bump
-            // that re-introduces Option<…> wrappers.
-            title: pr.title,
-            html_url: pr.html_url.to_string(),
-            labels: pr.labels.into_iter().map(|l| l.name).collect(),
-        })
+        .map(PickerItemRaw::into_picker_item)
         .collect())
 }
 
