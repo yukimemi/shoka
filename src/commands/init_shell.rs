@@ -44,8 +44,16 @@ pub async fn run(args: InitShellArgs) -> anyhow::Result<()> {
 fn posix_wrapper(name: &str) -> String {
     // `command shoka` bypasses the function lookup so the same name
     // can shadow the binary without infinite recursion.
+    //
+    // Bare `shoka` with no arguments defaults to `tui` so the most
+    // common action (drop into the dashboard) is a single keystroke.
+    // `set -- tui` rewrites the positional args; the `cd|tui` case
+    // arm below then routes correctly.
     format!(
         r#"{name}() {{
+    if [ $# -eq 0 ]; then
+        set -- tui
+    fi
     case "$1" in
         cd|tui)
             local tmp dest status
@@ -70,8 +78,14 @@ fn posix_wrapper(name: &str) -> String {
 }
 
 fn fish_wrapper(name: &str) -> String {
+    // Bare `shoka` defaults to `tui` (see posix_wrapper comment for
+    // the rationale). fish's `set argv tui` rewrites the function's
+    // arg list so the `case cd tui` arm picks it up cleanly.
     format!(
         r#"function {name}
+    if test (count $argv) -eq 0
+        set argv tui
+    end
     switch "$argv[1]"
         case cd tui
             set -l tmp (mktemp); or return 1
@@ -111,6 +125,14 @@ fn powershell_wrapper(name: &str) -> String {
     // (`shoka.exe`) and pwsh on Linux/macOS without a separate
     // code path.
     //
+    // Bare `shoka` defaults to `tui`. **Do not** build the args via
+    // `$effectiveArgs = if (...) { @('tui') } else { $args }` and
+    // splat it: PowerShell silently unwraps single-element arrays on
+    // scalar assignment, the variable becomes the string `'tui'`,
+    // and `@$str` then iterates *characters*, invoking the binary
+    // as `shoka.exe t u i` (errors with "unrecognized subcommand
+    // 't'"). The explicit `& $exe tui` arm below avoids the trap.
+    //
     // No try/finally around the pass-through branch — there's no
     // tmp file to clean up there, and a missing executable should
     // surface as PowerShell's standard error rather than be
@@ -124,11 +146,16 @@ fn powershell_wrapper(name: &str) -> String {
         Write-Error 'shoka binary not found on PATH'
         return
     }}
-    if ($args.Count -gt 0 -and ($args[0] -eq 'cd' -or $args[0] -eq 'tui')) {{
+    $first = if ($args.Count -gt 0) {{ $args[0] }} else {{ 'tui' }}
+    if ($first -eq 'cd' -or $first -eq 'tui') {{
         $tmp = New-TemporaryFile
         try {{
             $env:{env} = $tmp.FullName
-            & $script:ShokaExe @args
+            if ($args.Count -eq 0) {{
+                & $script:ShokaExe tui
+            }} else {{
+                & $script:ShokaExe @args
+            }}
             $code = $LASTEXITCODE
             if ($code -eq 0) {{
                 $dest = Get-Content -LiteralPath $tmp.FullName -Raw
@@ -255,12 +282,61 @@ mod tests {
             "PowerShell wrapper must cache the resolved binary in $script:ShokaExe: {body}"
         );
         assert!(
-            body.contains("$args[0] -eq 'cd' -or $args[0] -eq 'tui'"),
+            body.contains("$first -eq 'cd' -or $first -eq 'tui'"),
             "PowerShell wrapper must dispatch on the first arg: {body}"
         );
         // try/finally is present so the tmp file + env var cleanup
         // happens even if shoka cd panics.
         assert!(body.contains("finally"), "wrapper missing cleanup: {body}");
+        // PowerShell-specific: avoid the array-unwrap trap. The
+        // bare-`shoka` branch must invoke `& $exe tui` *literally*
+        // (not splat a single-element array, which PowerShell
+        // silently unwraps to a string then iterates as characters).
+        assert!(
+            body.contains("& $script:ShokaExe tui"),
+            "PowerShell wrapper must invoke tui literally to avoid the array-unwrap trap: {body}"
+        );
+    }
+
+    #[test]
+    fn posix_wrapper_defaults_to_tui_when_called_without_args() {
+        // Bare `shoka` is the most common action users want — drop
+        // into the dashboard. `set -- tui` rewrites the positional
+        // args inside the function so the existing `cd|tui` case
+        // arm picks it up without duplicating the sidechannel
+        // teardown logic.
+        let body = rendered(SupportedShell::Bash, "shoka");
+        assert!(
+            body.contains("if [ $# -eq 0 ]; then\n        set -- tui\n    fi"),
+            "bash wrapper must default to `tui` when called without args: {body}"
+        );
+    }
+
+    #[test]
+    fn fish_wrapper_defaults_to_tui_when_called_without_args() {
+        let body = rendered(SupportedShell::Fish, "shoka");
+        assert!(
+            body.contains("if test (count $argv) -eq 0\n        set argv tui\n    end"),
+            "fish wrapper must default to `tui` when called without args: {body}"
+        );
+    }
+
+    #[test]
+    fn powershell_wrapper_defaults_to_tui_when_called_without_args() {
+        // Two-part assertion: the `$first` default is `'tui'`, and
+        // the actual subprocess invocation passes `tui` literally
+        // (the array-unwrap-trap guard above covers the literal
+        // form; this test catches the regression of dropping the
+        // default-fallback altogether).
+        let body = rendered(SupportedShell::Powershell, "shoka");
+        assert!(
+            body.contains("if ($args.Count -gt 0) { $args[0] } else { 'tui' }"),
+            "PowerShell wrapper must compute first-arg default as `tui`: {body}"
+        );
+        assert!(
+            body.contains("if ($args.Count -eq 0) {\n                & $script:ShokaExe tui"),
+            "PowerShell wrapper must invoke shoka.exe tui when called without args: {body}"
+        );
     }
 
     #[test]

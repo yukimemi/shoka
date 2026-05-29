@@ -83,7 +83,7 @@ shoka exec --tag rust -- cargo check
 | `shoka prune` | Drop shelf entries whose clone path is missing on disk. `--dry-run` to rehearse; `--yes` to skip the prompt. |
 | `shoka cache {refresh,show,clear}` | Per-repo volatile cache. Auto-refreshed in the background after most commands. |
 | `shoka doctor` | Diagnose environment + config. |
-| `shoka init-shell <shell>` | Print the shell wrapper for `cd` (see below). |
+| `shoka init-shell <shell>` | Print a shell wrapper that claims the `shoka` name and chdirs the parent shell on `cd` / `tui` (see below). |
 | `shoka completion <shell>` | Print a shell-completion script. |
 | `shoka tui` | TUI dashboard — branch / ↑↓ / dirty / PR / CI columns from the cached snapshot; j/k navigation, `/` for nucleo filter, Enter exits and emits the chosen repo's path so the shell wrapper can `cd` to it. |
 
@@ -94,24 +94,38 @@ Output from each repo is captured and printed as a banner-headed
 block when the process exits, so parallel runs don't interleave
 into nonsense.
 
-## Shell integration for `cd`
+## Shell integration
 
-A child process can't change its parent shell's cwd, so `shoka cd`
-prints the chosen path and a small wrapper function does the
-actual `cd`. The wrapper uses a `SHOKA_CD_OUT` sidechannel file so
-the interactive fuzzy picker can render normally while the path
-travels out-of-band.
+A child process can't chdir its parent shell — kernel rule, no
+escape on any OS shoka cares about. So `shoka init-shell` emits a
+shell function that claims the `shoka` name itself, intercepts the
+`cd` and `tui` subcommands (which need to chdir the parent), and
+transparently passes every other subcommand through to the binary.
+The user sees one `shoka` they can run any subcommand against; the
+wrapper is invisible until they touch `cd` or `tui`.
+
+Behavior of the installed function:
+
+- `shoka` *(no args)* — opens the TUI dashboard, Enter selects and
+  cds into the highlighted repo.
+- `shoka cd [hint]` — fuzzy picker (or direct hint), cds on
+  selection. The path travels out-of-band via a `SHOKA_CD_OUT`
+  sidechannel file so the interactive prompt UI can render normally.
+- `shoka tui [--tag …]` — same as bare `shoka`, with explicit args.
+- `shoka <anything-else>` — passes through to the binary
+  unchanged (`shoka clone <url>`, `shoka list`, `shoka exec …`,
+  `shoka --version`, …).
 
 ### PowerShell
 
 ```pwsh
 # one-shot (current session):
-shoka init-shell powershell --name s | Out-String | Invoke-Expression
+shoka init-shell powershell | Out-String | Invoke-Expression
 
 # persistent (append to $PROFILE — create it first if missing,
 # which it is on a fresh PowerShell install):
 if (!(Test-Path $PROFILE)) { New-Item -Type File -Path $PROFILE -Force | Out-Null }
-shoka init-shell powershell --name s | Add-Content $PROFILE
+shoka init-shell powershell | Add-Content $PROFILE
 . $PROFILE
 ```
 
@@ -119,21 +133,23 @@ shoka init-shell powershell --name s | Add-Content $PROFILE
 
 ```sh
 # bash — add to ~/.bashrc:
-eval "$(shoka init-shell bash --name s)"
+eval "$(shoka init-shell bash)"
 
 # zsh — add to ~/.zshrc:
-eval "$(shoka init-shell zsh --name s)"
+eval "$(shoka init-shell zsh)"
 ```
 
 ### fish
 
 ```fish
 # ~/.config/fish/config.fish:
-shoka init-shell fish --name s | source
+shoka init-shell fish | source
 ```
 
-After that, `s shoka` cds straight into the repo, `s` with no
-arg opens a fuzzy picker, `s --tag rust` filters before the picker.
+Pass `--name s` (or any other identifier) to install the function
+under a shorter alias instead of shadowing `shoka`. The alias
+behaves the same — `s` opens the TUI, `s cd <hint>` picks, `s
+clone <url>` passes through.
 
 ## Configuration
 
