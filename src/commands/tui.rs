@@ -126,7 +126,8 @@ pub async fn run(ctx: &ShokaContext, args: TuiArgs) -> Result<()> {
         );
     }
 
-    let mut app = App::new(rows);
+    let own_owners = resolved.ui.own_owners.clone();
+    let mut app = App::new(rows, own_owners);
     let selection = run_app(&mut app)?;
 
     // After the alternate screen tears down, emit the path so the
@@ -142,6 +143,10 @@ pub async fn run(ctx: &ShokaContext, args: TuiArgs) -> Result<()> {
 #[derive(Debug, Clone)]
 struct DashRow {
     slug: String,
+    /// Bare owner segment (the `<owner>` in `<host>/<owner>/<name>`).
+    /// Cached on construction so the mine-only filter doesn't
+    /// re-split `slug` on every refilter pass.
+    owner: String,
     path: PathBuf,
     /// `slug` + " " + path-as-string, cached so the per-keystroke
     /// nucleo scorer in [`App::refilter`] has a single haystack to
@@ -197,6 +202,7 @@ fn build_rows(
         let search_key = format!("{slug} {}", path.display());
         out.push(DashRow {
             slug,
+            owner: repo.owner.clone(),
             path,
             search_key,
             tags_display: repo.tags.join(", "),
@@ -211,6 +217,15 @@ fn has_all_tags(repo: &Repo, wanted: &[String]) -> bool {
     wanted.iter().all(|w| repo.tags.iter().any(|t| t == w))
 }
 
+/// Case-insensitive owner membership check used by the mine-only
+/// gate. GitHub / GitLab / Gitea all treat owner names (users and
+/// orgs) as case-insensitive, so a config of `["YukimemI"]` against
+/// a slug `github.com/yukimemi/shoka` must still match — a literal
+/// `==` would silently drop the row.
+fn owner_in(owners: &[String], candidate: &str) -> bool {
+    owners.iter().any(|o| o.eq_ignore_ascii_case(candidate))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Normal,
@@ -219,6 +234,15 @@ enum Mode {
 
 struct App {
     rows: Vec<DashRow>,
+    /// Owners (`<owner>` in `<host>/<owner>/<name>`) the user counts
+    /// as "theirs" — sourced from `[ui].own_owners`. Empty disables
+    /// the mine-only feature entirely (no toggle pill, `m` is a
+    /// no-op-with-hint).
+    own_owners: Vec<String>,
+    /// When true, [`refilter`] excludes rows whose owner isn't in
+    /// [`own_owners`]. Initialised to `!own_owners.is_empty()` so a
+    /// configured user lands directly on their shelf; toggled by `m`.
+    mine_only: bool,
     /// Filter query (the live input). Empty in normal mode.
     filter: String,
     /// Indices into `rows`, sorted by nucleo score (highest first).
@@ -392,12 +416,22 @@ impl Picker {
 }
 
 impl App {
-    fn new(rows: Vec<DashRow>) -> Self {
-        let matches = (0..rows.len()).collect();
+    fn new(rows: Vec<DashRow>, own_owners: Vec<String>) -> Self {
+        let mine_only = !own_owners.is_empty();
+        // Same identity-order seed as before, then narrowed by
+        // `mine_only` so the initial matches respect the configured
+        // default scope — without this, an own_owners user would see
+        // every shelf row for one frame before the first navigation.
+        let mut matches: Vec<usize> = (0..rows.len()).collect();
+        if mine_only {
+            matches.retain(|&i| owner_in(&own_owners, &rows[i].owner));
+        }
         let mut table_state = TableState::default();
-        table_state.select(if rows.is_empty() { None } else { Some(0) });
+        table_state.select(if matches.is_empty() { None } else { Some(0) });
         Self {
             rows,
+            own_owners,
+            mine_only,
             filter: String::new(),
             matches,
             cursor: 0,
@@ -411,22 +445,58 @@ impl App {
         }
     }
 
-    /// Recompute `matches` against `filter`. Empty filter = identity
-    /// (everything in shelf order); otherwise nucleo scores each
-    /// row's `search_key` (slug + path) and we keep the matches
+    /// True when [`row`] belongs to one of the configured
+    /// [`own_owners`]. Empty own_owners short-circuits to `true` so
+    /// callers that gate on this (currently only [`refilter`]) treat
+    /// the unconfigured case as "everything is mine".
+    fn is_mine(&self, row: &DashRow) -> bool {
+        self.own_owners.is_empty() || owner_in(&self.own_owners, &row.owner)
+    }
+
+    /// Flip the mine-only flag and re-run the filter pass so the
+    /// table reflects the new scope on the next frame. No-op (with a
+    /// status banner) when own_owners is empty — pressing `m` then
+    /// would silently change nothing and leave the user wondering
+    /// whether the key registered.
+    fn toggle_mine_only(&mut self) {
+        if self.own_owners.is_empty() {
+            self.status_message =
+                Some("no `[ui].own_owners` configured — nothing to scope to".into());
+            return;
+        }
+        self.mine_only = !self.mine_only;
+        self.refilter();
+        self.status_message = Some(if self.mine_only {
+            "scope: mine".into()
+        } else {
+            "scope: all".into()
+        });
+    }
+
+    /// Recompute `matches` against `filter` + the mine-only scope.
+    /// Empty filter = identity (everything in shelf order, restricted
+    /// to mine when [`mine_only`] is set); otherwise nucleo scores
+    /// each row's `search_key` (slug + path) and we keep the matches
     /// sorted by score descending. Path is in the haystack so that
     /// multiple path-pinned checkouts of the same remote can be
-    /// distinguished by typing part of the dir name. Cursor pins to
-    /// the top so the highlighted row is always visible after a
-    /// refilter.
+    /// distinguished by typing part of the dir name. The mine-only
+    /// gate is applied *before* scoring so non-owned rows never enter
+    /// the result set even when their search_key would have matched.
+    /// Cursor pins to the top so the highlighted row is always
+    /// visible after a refilter.
     fn refilter(&mut self) {
         if self.filter.is_empty() {
-            self.matches = (0..self.rows.len()).collect();
+            self.matches = (0..self.rows.len())
+                .filter(|&i| !self.mine_only || self.is_mine(&self.rows[i]))
+                .collect();
         } else {
             let pattern = Pattern::parse(&self.filter, CaseMatching::Smart, Normalization::Smart);
             let mut scored: Vec<(usize, u32)> = Vec::new();
             let mut buf: Vec<char> = Vec::new();
             for (idx, row) in self.rows.iter().enumerate() {
+                if self.mine_only && !self.is_mine(row) {
+                    continue;
+                }
                 buf.clear();
                 let haystack = nucleo::Utf32Str::new(&row.search_key, &mut buf);
                 if let Some(score) = pattern.score(haystack, &mut self.matcher) {
@@ -620,6 +690,7 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<O
                     KeyCode::Char('P') => run_action_for_selected(app, ActionKind::Push),
                     KeyCode::Char('y') => yank_selected_slug(app),
                     KeyCode::Char('o') => open_selected_repo_home(app),
+                    KeyCode::Char('m') => app.toggle_mine_only(),
                     KeyCode::Char('j') | KeyCode::Down => app.move_down(),
                     KeyCode::Char('k') | KeyCode::Up => app.move_up(),
                     KeyCode::Char('g') => {
@@ -728,6 +799,23 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(theme::SUBTEXT),
         ),
     ];
+    // Surface the active scope when own_owners is configured so the
+    // user can tell at a glance whether they're looking at the
+    // narrowed default or the full shelf. Hidden otherwise to avoid
+    // labelling a feature that isn't wired up for them.
+    if !app.own_owners.is_empty() {
+        spans.push(Span::styled("  ◇ ", Style::default().fg(theme::OVERLAY)));
+        spans.push(Span::styled(
+            if app.mine_only { "mine" } else { "all" },
+            Style::default()
+                .fg(if app.mine_only {
+                    theme::TEAL
+                } else {
+                    theme::PEACH
+                })
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     if !app.filter.is_empty() {
         spans.push(Span::styled(
             "  ◇ /",
@@ -996,19 +1084,31 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     }
 
     let line = match app.mode {
-        Mode::Normal => Line::from(footer_pills(&[
-            ("j/k", "move"),
-            ("/", "filter"),
-            ("⏎", "cd"),
-            ("i", "iss"),
-            ("p", "PR"),
-            ("f", "fetch"),
-            ("P", "push"),
-            ("y", "yank"),
-            ("o", "open"),
-            ("?", "help"),
-            ("q", "quit"),
-        ])),
+        Mode::Normal => {
+            // Build pill set dynamically: the `m` toggle only makes
+            // sense when `[ui].own_owners` is configured, so hide it
+            // entirely otherwise rather than render a key that
+            // produces a "nothing to scope to" hint when pressed.
+            // Label reflects the *result* of pressing (i.e. shows
+            // `all` when currently mine, `mine` when currently all)
+            // so the user can read the footer as "what `m` will do".
+            let mut pills: Vec<(&'static str, &'static str)> =
+                vec![("j/k", "move"), ("/", "filter"), ("⏎", "cd")];
+            if !app.own_owners.is_empty() {
+                pills.push(("m", if app.mine_only { "all" } else { "mine" }));
+            }
+            pills.extend_from_slice(&[
+                ("i", "iss"),
+                ("p", "PR"),
+                ("f", "fetch"),
+                ("P", "push"),
+                ("y", "yank"),
+                ("o", "open"),
+                ("?", "help"),
+                ("q", "quit"),
+            ]);
+            Line::from(footer_pills(&pills))
+        }
         Mode::Filter => Line::from(footer_pills(&[
             ("type", "filter"),
             ("⌫", "del"),
@@ -1076,6 +1176,7 @@ fn render_help(f: &mut Frame, area: Rect) {
                 ("g", "jump to top"),
                 ("G", "jump to bottom"),
                 ("/", "filter — type to narrow, esc to clear"),
+                ("m", "toggle mine / all (needs [ui].own_owners)"),
                 ("Enter", "select (emit path for the shell wrapper to cd)"),
             ],
         ),
@@ -1642,6 +1743,15 @@ fn render_picker(f: &mut Frame, area: Rect, picker: &Picker) {
 mod tests {
     use super::*;
 
+    /// Owner derived from a `host/owner/name` slug. Test rows often
+    /// use bare strings like `"alpha"` (no slashes), where the second
+    /// segment doesn't exist — fall back to an empty owner there so
+    /// the mine-only filter excludes the row only when own_owners is
+    /// set, matching production semantics.
+    fn owner_from_slug(slug: &str) -> String {
+        slug.split('/').nth(1).unwrap_or("").to_string()
+    }
+
     fn rows(slugs: &[&str]) -> Vec<DashRow> {
         slugs
             .iter()
@@ -1650,6 +1760,7 @@ mod tests {
                 let search_key = format!("{s} {}", path.display());
                 DashRow {
                     slug: (*s).into(),
+                    owner: owner_from_slug(s),
                     path,
                     search_key,
                     tags_display: String::new(),
@@ -1670,6 +1781,7 @@ mod tests {
                 let search_key = format!("{slug} {}", path.display());
                 DashRow {
                     slug: (*slug).into(),
+                    owner: owner_from_slug(slug),
                     path,
                     search_key,
                     tags_display: String::new(),
@@ -1678,6 +1790,14 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    /// Construct an `App` with no `own_owners` configured — the
+    /// pre-mine-only default behaviour. Most existing tests assert
+    /// the unscoped path, so funnelling them through this helper
+    /// keeps their original semantics intact.
+    fn app(rows: Vec<DashRow>) -> App {
+        App::new(rows, Vec::new())
     }
 
     #[test]
@@ -1883,14 +2003,14 @@ mod tests {
 
     #[test]
     fn refilter_empty_query_keeps_shelf_order() {
-        let mut app = App::new(rows(&["alpha", "beta", "gamma"]));
+        let mut app = app(rows(&["alpha", "beta", "gamma"]));
         app.refilter();
         assert_eq!(app.matches, vec![0, 1, 2]);
     }
 
     #[test]
     fn refilter_narrows_to_matches() {
-        let mut app = App::new(rows(&["alpha", "beta", "gamma", "alphabeta"]));
+        let mut app = app(rows(&["alpha", "beta", "gamma", "alphabeta"]));
         app.filter = "alpha".into();
         app.refilter();
         // `alpha` and `alphabeta` should match; `beta` / `gamma` not.
@@ -1921,7 +2041,7 @@ mod tests {
 
     #[test]
     fn refilter_no_matches_leaves_empty() {
-        let mut app = App::new(rows(&["alpha", "beta"]));
+        let mut app = app(rows(&["alpha", "beta"]));
         app.filter = "zzzzz".into();
         app.refilter();
         assert!(app.matches.is_empty());
@@ -1935,7 +2055,7 @@ mod tests {
         // Filtering by a substring that only appears in one path
         // must narrow to that row — that's how the user picks
         // between multiple checkouts of the same remote.
-        let mut app = App::new(rows_with_paths(&[
+        let mut app = app(rows_with_paths(&[
             (
                 "github.com/yukimemi/admintask",
                 "/home/u/src/DeviceManagement",
@@ -1965,7 +2085,7 @@ mod tests {
 
     #[test]
     fn refilter_resets_cursor_to_top() {
-        let mut app = App::new(rows(&["a", "b", "c", "d"]));
+        let mut app = app(rows(&["a", "b", "c", "d"]));
         app.cursor = 3;
         app.refilter();
         assert_eq!(app.cursor, 0);
@@ -1973,7 +2093,7 @@ mod tests {
 
     #[test]
     fn navigation_clamps_at_edges() {
-        let mut app = App::new(rows(&["a", "b", "c"]));
+        let mut app = app(rows(&["a", "b", "c"]));
         // Up at top stays at top (saturating_sub).
         app.move_up();
         assert_eq!(app.cursor, 0);
@@ -1986,7 +2106,7 @@ mod tests {
 
     #[test]
     fn navigation_on_empty_match_list_is_noop() {
-        let mut app = App::new(rows(&[]));
+        let mut app = app(rows(&[]));
         app.move_down();
         app.move_up();
         assert_eq!(app.cursor, 0);
@@ -1998,11 +2118,130 @@ mod tests {
         // The TUI tracks cursor against `matches`, but the result
         // needs to be a shelf-relative index so the path emission
         // hits the right repo even when the filter reorders rows.
-        let mut app = App::new(rows(&["zzz", "aaa"]));
+        let mut app = app(rows(&["zzz", "aaa"]));
         app.filter = "aaa".into();
         app.refilter();
         // After filtering only "aaa" remains, mapping to shelf idx 1.
         assert_eq!(app.selected_row(), Some(1));
+    }
+
+    #[test]
+    fn mine_only_starts_active_when_own_owners_configured() {
+        // Two repos on the shelf: one mine, one upstream. With
+        // `own_owners = ["yukimemi"]` the dashboard should land on
+        // mine-only by default so the user sees their shelf first
+        // (the headline behaviour change of this feature).
+        let rows = rows(&["github.com/yukimemi/shoka", "github.com/rust-lang/rust"]);
+        let app = App::new(rows, vec!["yukimemi".into()]);
+        assert!(app.mine_only, "should default to mine when own_owners set");
+        let matched_slugs: Vec<&str> = app
+            .matches
+            .iter()
+            .map(|&i| app.rows[i].slug.as_str())
+            .collect();
+        assert_eq!(matched_slugs, vec!["github.com/yukimemi/shoka"]);
+    }
+
+    #[test]
+    fn mine_only_disabled_when_own_owners_empty() {
+        // Without `own_owners`, behaviour matches the pre-mine-only
+        // dashboard — every row visible from the start.
+        let app = app(rows(&[
+            "github.com/yukimemi/shoka",
+            "github.com/rust-lang/rust",
+        ]));
+        assert!(!app.mine_only);
+        assert_eq!(app.matches, vec![0, 1]);
+    }
+
+    #[test]
+    fn toggle_mine_only_flips_visible_set() {
+        let rows = rows(&["github.com/yukimemi/shoka", "github.com/rust-lang/rust"]);
+        let mut app = App::new(rows, vec!["yukimemi".into()]);
+        // Default = mine; toggle exposes everything.
+        app.toggle_mine_only();
+        assert!(!app.mine_only);
+        assert_eq!(app.matches.len(), 2);
+        // Toggle again returns to mine-only.
+        app.toggle_mine_only();
+        assert!(app.mine_only);
+        assert_eq!(app.matches.len(), 1);
+    }
+
+    #[test]
+    fn toggle_mine_only_is_noop_with_status_when_unconfigured() {
+        // Pressing `m` without configured owners shouldn't silently
+        // do nothing — surface a banner so the user knows why.
+        let mut app = app(rows(&["github.com/yukimemi/shoka"]));
+        app.toggle_mine_only();
+        assert!(!app.mine_only, "should stay off when nothing to scope to");
+        let msg = app.status_message.as_ref().expect("status banner set");
+        assert!(
+            msg.contains("own_owners"),
+            "banner should point at the config key, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn mine_only_matches_owner_case_insensitively() {
+        // GitHub/GitLab owner names are case-insensitive — a config
+        // of `["YukimemI"]` against the canonical lowercase slug
+        // must still match. Without this, the silent-exclude bug
+        // would let a typo in [ui].own_owners hide every "own" repo
+        // with no diagnostic.
+        let rows = rows(&["github.com/yukimemi/shoka", "github.com/RUST-LANG/rust"]);
+        // Mixed-case configuration entries: prove matching folds
+        // both directions (config-uppercase vs slug-lowercase, and
+        // config-lowercase vs slug-uppercase).
+        let app = App::new(rows, vec!["YukimemI".into(), "rust-lang".into()]);
+        assert!(app.mine_only);
+        let matched: Vec<&str> = app
+            .matches
+            .iter()
+            .map(|&i| app.rows[i].slug.as_str())
+            .collect();
+        assert_eq!(matched.len(), 2, "both rows should match: {matched:?}");
+        assert!(matched.contains(&"github.com/yukimemi/shoka"));
+        assert!(matched.contains(&"github.com/RUST-LANG/rust"));
+    }
+
+    #[test]
+    fn owner_in_is_case_insensitive() {
+        // Direct unit test of the helper so a future caller can rely
+        // on the fold without re-discovering it.
+        let owners = vec!["yukimemi".into(), "Rust-Lang".into()];
+        assert!(owner_in(&owners, "yukimemi"));
+        assert!(owner_in(&owners, "YukimemI"));
+        assert!(owner_in(&owners, "rust-lang"));
+        assert!(owner_in(&owners, "RUST-LANG"));
+        assert!(!owner_in(&owners, "someone-else"));
+        assert!(!owner_in(&[], "anyone"));
+    }
+
+    #[test]
+    fn mine_only_composes_with_text_filter() {
+        // The fuzzy filter still runs on top of the mine-only gate —
+        // typing a substring that matches the *non-mine* row must
+        // produce zero matches, not jump to it.
+        let rows = rows(&[
+            "github.com/yukimemi/shoka",
+            "github.com/yukimemi/renri",
+            "github.com/rust-lang/rust",
+        ]);
+        let mut app = App::new(rows, vec!["yukimemi".into()]);
+        app.filter = "rust".into();
+        app.refilter();
+        // The only `rust` row is rust-lang/rust, which mine-only
+        // excludes. So matches should be empty even though the
+        // search would otherwise hit.
+        assert!(
+            app.matches.is_empty(),
+            "non-mine matches must be hidden: {:?}",
+            app.matches
+                .iter()
+                .map(|&i| app.rows[i].slug.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 
     fn picker_items(items: &[(u64, &str, &[&str])]) -> Vec<crate::gh::PickerItem> {
@@ -2088,7 +2327,7 @@ mod tests {
     /// known input. The non-slug fields don't matter for the early-
     /// return branches we're testing.
     fn app_with_single_slug(slug: &str) -> App {
-        App::new(rows(&[slug]))
+        app(rows(&[slug]))
     }
 
     fn key(code: KeyCode) -> crossterm::event::KeyEvent {
@@ -2133,7 +2372,7 @@ mod tests {
 
     #[test]
     fn handle_picker_key_esc_closes_picker() {
-        let mut app = App::new(rows(&[]));
+        let mut app = app(rows(&[]));
         app.picker = Some(Picker::loaded(
             PickerKind::Issues,
             "github.com/x/y".into(),
@@ -2145,7 +2384,7 @@ mod tests {
 
     #[test]
     fn handle_picker_key_q_closes_picker() {
-        let mut app = App::new(rows(&[]));
+        let mut app = app(rows(&[]));
         app.picker = Some(Picker::loaded(
             PickerKind::Issues,
             "github.com/x/y".into(),
@@ -2163,7 +2402,7 @@ mod tests {
         // useless at best and flaky at worst, so the empty-list path
         // is the right hook to assert "Enter does close" without
         // collateral effects.
-        let mut app = App::new(rows(&[]));
+        let mut app = app(rows(&[]));
         app.picker = Some(Picker::loaded(
             PickerKind::Issues,
             "github.com/x/y".into(),
@@ -2178,7 +2417,7 @@ mod tests {
 
     #[test]
     fn handle_picker_key_char_appends_to_filter_and_refilters() {
-        let mut app = App::new(rows(&[]));
+        let mut app = app(rows(&[]));
         app.picker = Some(Picker::loaded(
             PickerKind::Issues,
             "github.com/x/y".into(),
@@ -2196,7 +2435,7 @@ mod tests {
 
     #[test]
     fn handle_picker_key_backspace_pops_and_refilters() {
-        let mut app = App::new(rows(&[]));
+        let mut app = app(rows(&[]));
         let mut p = Picker::loaded(
             PickerKind::Issues,
             "github.com/x/y".into(),
@@ -2217,7 +2456,7 @@ mod tests {
         // (which would be wrong: there's no row to act on) and
         // crucially without installing a popup. The dashboard stays
         // exactly as it was.
-        let mut app = App::new(rows(&[]));
+        let mut app = app(rows(&[]));
         run_action_for_selected(&mut app, ActionKind::Fetch);
         assert!(
             app.action_popup.is_none(),
@@ -2236,13 +2475,14 @@ mod tests {
         let search_key = format!("local/test/repo {}", path.display());
         let row = DashRow {
             slug: "local/test/repo".into(),
+            owner: "test".into(),
             path,
             search_key,
             tags_display: String::new(),
             status: None,
             gh: None,
         };
-        let mut app = App::new(vec![row]);
+        let mut app = app(vec![row]);
         run_action_for_selected(&mut app, ActionKind::Fetch);
         let popup = app.action_popup.as_ref().expect("popup installed");
         assert!(
@@ -2264,7 +2504,7 @@ mod tests {
         // `Clipboard::new()` can fail on headless CI runners, and we
         // don't want a stray `y` keystroke (e.g. while debugging an
         // empty shelf) to surface a confusing error message.
-        let mut app = App::new(rows(&[]));
+        let mut app = app(rows(&[]));
         yank_selected_slug(&mut app);
         assert!(
             app.status_message.is_none(),
@@ -2297,7 +2537,7 @@ mod tests {
         // Empty shelf → no row, so neither the browser nor the
         // status banner should fire. Defensive: a stray `o` on an
         // empty dashboard shouldn't open a `https:///` tab.
-        let mut app = App::new(rows(&[]));
+        let mut app = app(rows(&[]));
         open_selected_repo_home(&mut app);
         assert!(
             app.status_message.is_none(),

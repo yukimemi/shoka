@@ -111,6 +111,11 @@ pub enum Protocol {
 pub struct UiConfig {
     pub status_cache_ttl_secs: u64,
     pub tui_refresh_ms: u64,
+    /// Owners considered "yours" (e.g. your GitHub username plus any
+    /// orgs you belong to). The TUI starts in mine-only mode when this
+    /// is non-empty and offers `m` to toggle back to the full shelf;
+    /// empty = no default filter and the toggle is hidden.
+    pub own_owners: Vec<String>,
 }
 
 impl Default for UiConfig {
@@ -118,6 +123,7 @@ impl Default for UiConfig {
         Self {
             status_cache_ttl_secs: 60,
             tui_refresh_ms: 250,
+            own_owners: Vec::new(),
         }
     }
 }
@@ -725,6 +731,9 @@ root = "~/src"
 # [global.ui]
 # status_cache_ttl_secs = 60
 # tui_refresh_ms = 250
+# # Owners treated as "yours" in the TUI. When non-empty the dashboard
+# # launches in mine-only mode and `m` toggles between mine and all.
+# own_owners = ["yukimemi"]
 
 # [global.shell]
 # cd_command_name = "s"
