@@ -341,12 +341,10 @@ fn extract_git_repo(repo_root: &Path) -> Result<Repo> {
     // `remote_default_name` handles the detached-HEAD case correctly:
     // it picks the sole remote when only one is configured, or falls
     // back to "origin" when multiple remotes include it.
-    let remote = match remote {
-        Some(r) => Some(r),
-        None => repo
-            .remote_default_name(gix::remote::Direction::Fetch)
-            .and_then(|name| repo.find_remote(name.as_ref()).ok()),
-    };
+    let remote = remote.or_else(|| {
+        repo.remote_default_name(gix::remote::Direction::Fetch)
+            .and_then(|name| repo.find_remote(name.as_ref()).ok())
+    });
 
     let maybe_url = remote.and_then(|r| r.url(gix::remote::Direction::Fetch).cloned());
 
