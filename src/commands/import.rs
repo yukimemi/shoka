@@ -314,7 +314,11 @@ fn extract_git_repo(repo_root: &Path) -> Result<Repo> {
         .with_context(|| format!("opening {} as a git repo", repo_root.display()))?;
 
     // `find_default_remote` returns `Option<Result<Remote>>`:
-    //   - outer `None`  → no remote configured (legitimate local-only).
+    //   - outer `None`  → no remote configured, or HEAD is detached
+    //                     (common with jj-colocated checkouts where jj
+    //                     always leaves HEAD pointing at a commit hash,
+    //                     not a branch ref, so gix can't derive the
+    //                     branch's tracking remote this way).
     //   - outer `Some(Err)` → genuine resolution error worth surfacing.
     //   - outer `Some(Ok(Remote))` → the configured default remote.
     //
@@ -331,6 +335,17 @@ fn extract_git_repo(repo_root: &Path) -> Result<Repo> {
                 repo_root.display()
             )
         })?;
+
+    // When HEAD is detached (typical for jj-colocated checkouts),
+    // `find_default_remote` returns `None` even if remotes exist.
+    // `remote_default_name` handles the detached-HEAD case correctly:
+    // it picks the sole remote when only one is configured, or falls
+    // back to "origin" when multiple remotes include it.
+    let remote = remote.or_else(|| {
+        repo.remote_default_name(gix::remote::Direction::Fetch)
+            .and_then(|name| repo.find_remote(name.as_ref()).ok())
+    });
+
     let maybe_url = remote.and_then(|r| r.url(gix::remote::Direction::Fetch).cloned());
 
     let Some(url) = maybe_url else {
@@ -519,6 +534,36 @@ mod tests {
             r.path.is_some(),
             "path should be pinned even in the matching-name case"
         );
+    }
+
+    /// Build a `.git/`-marked repo with a remote and a detached HEAD
+    /// (a commit hash written directly into `.git/HEAD`). This is the
+    /// state jj always produces for colocated checkouts.
+    fn init_git_with_remote_detached(dir: &Path, url: &str) {
+        init_git_with_remote(dir, url);
+        // Write a fake commit hash into HEAD to simulate detached state.
+        std::fs::write(
+            dir.join(".git").join("HEAD"),
+            "0000000000000000000000000000000000000000\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn extract_git_repo_resolves_remote_when_head_is_detached() {
+        // Regression: jj always leaves HEAD pointing at a bare commit
+        // hash (detached). `find_default_remote` returns `None` in that
+        // case, which previously triggered the synthesise-local fallback
+        // even though "origin" was correctly configured.
+        let tmp = TempDir::new().unwrap();
+        let repo_root = tmp.path().join("rvpm");
+        init_git_with_remote_detached(&repo_root, "https://github.com/yukimemi/rvpm.git");
+
+        let r = extract_git_repo(&repo_root).expect("extract");
+        assert_eq!(r.host, "github.com");
+        assert_eq!(r.owner, "yukimemi");
+        assert_eq!(r.name, "rvpm");
+        assert!(r.path.is_some(), "path must be pinned");
     }
 
     #[test]
