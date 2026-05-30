@@ -82,12 +82,12 @@ pub async fn run(ctx: &ShokaContext, args: ImportArgs) -> Result<()> {
     let mut errors = 0usize;
     // Repo roots already imported in this run, keyed by the parent
     // directory of the marker (`.git` / `.jj`). Used to dedupe
-    // colocated checkouts: the first marker yielded (`.git` by
-    // walkdir's alphabetical ordering) records the root here, and
-    // the sibling `.jj` is then skipped. `skip_current_dir()` only
-    // prunes *descendants* of the yielded entry — it has no effect
-    // on siblings — so an explicit set is the only reliable way to
-    // avoid double-importing the same repo.
+    // colocated checkouts: the first marker yielded (`.git`, guaranteed
+    // by `sort_by_file_name`) records the root here, and the sibling
+    // `.jj` is then skipped. `skip_current_dir()` only prunes
+    // *descendants* of the yielded entry — it has no effect on siblings
+    // — so an explicit set is the only reliable way to avoid
+    // double-importing the same repo.
     let mut imported_roots: HashSet<PathBuf> = HashSet::new();
 
     println!(
@@ -102,7 +102,16 @@ pub async fn run(ctx: &ShokaContext, args: ImportArgs) -> Result<()> {
     // method *only* prunes descendants of the just-yielded entry,
     // not siblings; colocated-checkout dedup is done via
     // `imported_roots` below.
-    let mut it = WalkDir::new(&source).follow_links(false).into_iter();
+    //
+    // `sort_by_file_name` ensures `.git` is always yielded before `.jj`
+    // within the same directory. WalkDir does not guarantee order by
+    // default — on some filesystems `.jj` arrives first, which would
+    // cause a colocated checkout to be imported as local rather than
+    // having its remote URL read from `.git/config`.
+    let mut it = WalkDir::new(&source)
+        .follow_links(false)
+        .sort_by_file_name()
+        .into_iter();
     while let Some(entry) = it.next() {
         let entry = match entry {
             Ok(e) => e,
@@ -130,10 +139,9 @@ pub async fn run(ctx: &ShokaContext, args: ImportArgs) -> Result<()> {
             None => continue,
         };
 
-        // Colocated `.git` + `.jj`: walkdir yields `.git` first
-        // (alphabetical), records the root, then yields `.jj` —
-        // here we recognise the duplicate and skip it. Single
-        // import per repo even with two markers present.
+        // Colocated `.git` + `.jj`: sort_by_file_name guarantees `.git`
+        // is yielded first, records the root here, and the sibling `.jj`
+        // is then skipped. Single import per repo even with two markers.
         if !imported_roots.insert(repo_root.clone()) {
             continue;
         }
