@@ -8,10 +8,25 @@
 //!   from the resolved config.
 //! - `host/owner/name` — embedded host overrides `default_host`.
 //!
-//! Argument omitted ⇒ interactive [`inquire::Text`] prompt. A
-//! gh-API-backed fuzzy picker over the user's own repos lands in a
-//! follow-up PR (needs `octocrab` + token wiring); the prompt is the
-//! phase-1 stand-in.
+//! Argument omitted ⇒ interactive flow:
+//!
+//! 1. Prompt for an org/user. Default is `[ui].own_owners[0]` from
+//!    the resolved config (reuses PR #81's "self" definition), else
+//!    the authenticated user's own login (looked up via
+//!    `gh.rs::whoami`).
+//! 2. Route to the API endpoint that matches the input —
+//!    empty / personal login → `/user/repos` (private visible),
+//!    other `own_owners` entry → `/orgs/{org}/repos` (org's
+//!    private visible to members),
+//!    anything else → `/users/{user}/repos` (public only).
+//!    All three are `sort=updated`, archived filtered out.
+//! 3. Show the result in an `inquire::Select` with fuzzy filtering
+//!    over `owner/name` + description; Enter picks one, which the
+//!    rest of `run` then clones.
+//!
+//! Token resolution falls back to a plain `inquire::Text` prompt
+//! (the legacy path) when no `GITHUB_TOKEN` / `gh auth` is
+//! available — the no-arg path stays usable without auth.
 //!
 //! Backend selection:
 //!
@@ -31,22 +46,23 @@ use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result, bail};
-use inquire::Text;
+use inquire::{Select, Text};
 use owo_colors::OwoColorize;
 
 use crate::cli::CloneArgs;
 use crate::commands::ShokaContext;
 use crate::config::{ShokaConfig, VcsDefault};
+use crate::gh;
 use crate::remote::parse_clone_input;
 use crate::state::{Repo, Shelf};
 
 pub async fn run(ctx: &ShokaContext, args: CloneArgs) -> Result<()> {
+    let cfg = ShokaConfig::load(&ctx.paths)?.resolve(ctx.profile_override.as_deref())?;
     let input = match args.url {
         Some(s) => s,
-        None => prompt_for_input()?,
+        None => prompt_for_input(&cfg.ui.own_owners).await?,
     };
 
-    let cfg = ShokaConfig::load(&ctx.paths)?.resolve(ctx.profile_override.as_deref())?;
     let (parts, url) = parse_clone_input(&input, &cfg.default_host, cfg.default_protocol)?;
 
     let repo = Repo::new(parts.host, parts.owner, parts.name);
@@ -103,13 +119,126 @@ pub async fn run(ctx: &ShokaContext, args: CloneArgs) -> Result<()> {
     Ok(())
 }
 
-/// Phase-1 fallback when the user calls `shoka clone` with no arg:
-/// pop up an [`inquire::Text`] prompt asking for a URL / shorthand.
+/// Interactive flow when the user calls `shoka clone` with no arg.
 ///
-/// The fuzzy gh-API picker over the user's own repos lands in a
-/// follow-up (needs `octocrab` + `gh auth token` resolution); this
-/// keeps the no-arg path usable in the meantime.
-fn prompt_for_input() -> Result<String> {
+/// Authenticated path:
+///   org prompt (default = `own_owners[0]` from config, else the
+///   personal login)  →  fuzzy `Select` over:
+///     - `/user/repos` (self — personal login or empty input),
+///     - `/orgs/{org}/repos` (input matches an `own_owners` entry
+///       that *isn't* the personal login → assumed to be an org we
+///       belong to, so the private repos show up too),
+///     - `/users/{user}/repos` (anyone else — public only).
+///
+/// Unauthenticated path:
+///   falls back to a free-form [`Text`] prompt accepting URL /
+///   shorthand, so the no-arg form keeps working without `gh auth`.
+async fn prompt_for_input(own_owners: &[String]) -> Result<String> {
+    let Some(token) = gh::resolve_token().await else {
+        return text_fallback_prompt();
+    };
+    let client = match gh::build_client(&token) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(target: "shoka", "octocrab client build failed: {e:#}");
+            return text_fallback_prompt();
+        }
+    };
+
+    // Always resolve the personal login upfront. We need it to
+    // disambiguate "is the typed owner my own login (→ /user/repos
+    // for private) or an org I belong to (→ /orgs/{org}/repos)?"
+    // when both possibilities live in `[ui].own_owners`.
+    let personal_login = match gh::whoami(&client).await {
+        Ok(login) => login,
+        Err(e) => {
+            tracing::warn!(target: "shoka", "gh /user lookup failed: {e:#}");
+            return text_fallback_prompt();
+        }
+    };
+
+    // Prefer the configured `[ui].own_owners[0]` as the default —
+    // that's what the user already declared as "theirs" for the
+    // TUI's mine-only filter, so reusing it keeps the two commands'
+    // notions of "self" in sync. Fall back to the personal login
+    // when `own_owners` isn't configured.
+    let default_owner = own_owners
+        .first()
+        .cloned()
+        .unwrap_or_else(|| personal_login.clone());
+
+    // Re-prompt loop: a 404 from `/users/{owner}/repos` (typo /
+    // private user / deleted account) shouldn't drop the whole
+    // clone session — print "no such owner" inline and ask again.
+    // Other errors still propagate as fatal: network / auth /
+    // schema breakage are nothing the user can fix by retyping.
+    //
+    // First prompt uses `default_owner` as the pre-fill. After a
+    // miss we clear the default — the bad string is gone, and the
+    // user has to actually type a real owner instead of bouncing
+    // Enter on a stale pre-fill that we already know fails.
+    let mut default: Option<&str> = Some(default_owner.as_str());
+    loop {
+        let mut prompt = Text::new("org or user (Enter = your own repos):");
+        if let Some(d) = default {
+            prompt = prompt.with_default(d);
+        }
+        let owner_input = prompt.prompt().context("clone owner prompt cancelled")?;
+        let trimmed = owner_input.trim();
+        // Empty input — or input that case-insensitively matches
+        // the personal login — routes to `/user/repos` (private
+        // repos visible). GitHub logins are case-insensitive, so
+        // `Yukimemi` and `yukimemi` are the same account; matching
+        // case-sensitively would silently misroute private repos
+        // to the public-only `/users/{u}/repos` endpoint.
+        let want_mine = trimmed.is_empty() || trimmed.eq_ignore_ascii_case(&personal_login);
+        let owner_for_query = if want_mine { None } else { Some(trimmed) };
+        // Any non-self owner that the user has declared in
+        // `own_owners` is treated as an org they belong to — that
+        // routes to `/orgs/{org}/repos`, which (with the OAuth
+        // token's `read:org` / repo scopes) surfaces the org's
+        // private repos. A non-self, non-`own_owners` owner stays
+        // on `/users/{u}/repos` (public).
+        let is_org = owner_for_query
+            .is_some_and(|o| own_owners.iter().any(|own| own.eq_ignore_ascii_case(o)));
+
+        match gh::list_repos(&client, owner_for_query, is_org).await {
+            Ok(repos) if repos.is_empty() => {
+                eprintln!(
+                    "{} no repos found for {} — try another?",
+                    "clone:".bold(),
+                    owner_for_query.unwrap_or(default_owner.as_str())
+                );
+                default = None;
+                continue;
+            }
+            Ok(repos) => {
+                let picked = Select::new("pick a repo:", repos)
+                    .with_page_size(15)
+                    .prompt()
+                    .context("clone repo select cancelled")?;
+                return Ok(format!("{}/{}", picked.owner, picked.name));
+            }
+            Err(e) if gh::is_not_found(&e) => {
+                eprintln!(
+                    "{} no such org or user: {} — try another?",
+                    "clone:".bold(),
+                    owner_for_query.unwrap_or(default_owner.as_str())
+                );
+                default = None;
+                continue;
+            }
+            Err(e) => {
+                return Err(e).with_context(|| match owner_for_query {
+                    None => "listing your own repos".to_string(),
+                    Some(o) => format!("listing repos for {o}"),
+                });
+            }
+        }
+    }
+}
+
+fn text_fallback_prompt() -> Result<String> {
     let answer = Text::new("URL or owner/name to clone:")
         .with_help_message("e.g. https://github.com/foo/bar or foo/bar")
         .prompt()

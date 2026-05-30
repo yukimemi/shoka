@@ -339,6 +339,123 @@ pub async fn list_open_prs(client: &Octocrab, owner: &str, name: &str) -> Result
         .collect())
 }
 
+/// One repo from a `/user/repos` or `/users/{user}/repos` listing,
+/// trimmed to the fields the clone picker actually shows. GitHub
+/// returns ~40 fields per repo; we deserialise only the four we
+/// render so a future schema change in the rest can't break us.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct RepoListItem {
+    /// `owner.login` flattened — the picker shows `owner/name` and
+    /// the clone path uses the same pair, so keeping them split
+    /// saves the caller from re-splitting on `/`.
+    #[serde(rename = "owner", deserialize_with = "deserialize_owner_login")]
+    pub owner: String,
+    pub name: String,
+    /// `None` when the repo has no description set. Displayed dim
+    /// after a `—` separator in the picker; absent line stays clean.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// True for archived repos. Filtered out at the call site —
+    /// archived repos rarely belong on a fresh shelf.
+    #[serde(default)]
+    pub archived: bool,
+}
+
+fn deserialize_owner_login<'de, D>(de: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    struct OwnerLogin {
+        login: String,
+    }
+    OwnerLogin::deserialize(de).map(|o| o.login)
+}
+
+/// `inquire::Select` requires `Display` on its options — the line
+/// rendered here is also what `inquire`'s default `string_matches`
+/// filter scores: `owner/name` plus an em-dash-separated
+/// description when present.
+impl std::fmt::Display for RepoListItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.description {
+            Some(d) if !d.is_empty() => write!(f, "{}/{}  —  {d}", self.owner, self.name),
+            _ => write!(f, "{}/{}", self.owner, self.name),
+        }
+    }
+}
+
+/// Authenticated user's login. Used to seed the `shoka clone`
+/// org-prompt default — pressing Enter without typing lands on
+/// "list my own repos" instead of forcing the user to retype their
+/// own handle.
+pub async fn whoami(client: &Octocrab) -> Result<String> {
+    #[derive(serde::Deserialize)]
+    struct User {
+        login: String,
+    }
+    let user: User = client.get("/user", None::<&()>).await?;
+    Ok(user.login)
+}
+
+/// True when `err` (or anything in its `source` chain) is an
+/// octocrab `GitHubError` with HTTP 404. Lets the clone-flow
+/// re-prompt on "no such org" instead of bubbling up as a fatal
+/// error and forcing the user to retype from scratch.
+pub fn is_not_found(err: &anyhow::Error) -> bool {
+    err.chain()
+        .filter_map(|e| e.downcast_ref::<octocrab::GitHubError>())
+        .any(|gh| gh.status_code.as_u16() == 404)
+}
+
+/// List repos for one of three audiences:
+///
+/// - `owner = None` ⇒ the authenticated user's own repos via
+///   `/user/repos?affiliation=owner` (includes private).
+/// - `owner = Some, is_org = true` ⇒ an organisation's repos via
+///   `/orgs/{org}/repos`. When the caller is a member this endpoint
+///   includes the org's private repos too; `/users/{org}/repos`
+///   would silently show only the public subset.
+/// - `owner = Some, is_org = false` ⇒ another user's repos via
+///   `/users/{user}/repos` (public only — there's no way to read
+///   another user's private repos through an OAuth token).
+///
+/// Filters out archived repos before returning; forks are kept
+/// since users often clone their own forks for upstream-tracking
+/// work. Sorted most-recently-updated first. Capped at 100 — the
+/// few users with more repos than that can still pass `owner/name`
+/// directly.
+///
+/// A 404 from a named-owner path (typo / private user / deleted
+/// account) propagates as an octocrab error; callers can detect
+/// it via [`is_not_found`] and re-prompt rather than aborting.
+pub async fn list_repos(
+    client: &Octocrab,
+    owner: Option<&str>,
+    is_org: bool,
+) -> Result<Vec<RepoListItem>> {
+    let (route, params): (String, &[(&str, &str)]) = match owner {
+        None => (
+            "/user/repos".to_string(),
+            &[
+                ("affiliation", "owner"),
+                ("sort", "updated"),
+                ("per_page", "100"),
+            ],
+        ),
+        Some(o) if is_org => (
+            format!("/orgs/{o}/repos"),
+            &[("sort", "updated"), ("per_page", "100")],
+        ),
+        Some(o) => (
+            format!("/users/{o}/repos"),
+            &[("sort", "updated"), ("per_page", "100")],
+        ),
+    };
+    let raw: Vec<RepoListItem> = client.get(route, Some(params)).await?;
+    Ok(raw.into_iter().filter(|r| !r.archived).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,6 +502,51 @@ mod tests {
             !s.contains("ci_status"),
             "None ci_status shouldn't serialise, got: {s}"
         );
+    }
+
+    #[test]
+    fn repo_list_item_deserialises_owner_login_flat() {
+        let json = r#"{
+            "owner": { "login": "yukimemi", "id": 1 },
+            "name": "shoka",
+            "description": "jj-aware ghq successor",
+            "archived": false,
+            "extra_field_we_dont_care_about": 42
+        }"#;
+        let item: RepoListItem = serde_json::from_str(json).unwrap();
+        assert_eq!(item.owner, "yukimemi");
+        assert_eq!(item.name, "shoka");
+        assert_eq!(item.description.as_deref(), Some("jj-aware ghq successor"));
+        assert!(!item.archived);
+    }
+
+    #[test]
+    fn repo_list_item_display_includes_description() {
+        let item = RepoListItem {
+            owner: "yukimemi".into(),
+            name: "shoka".into(),
+            description: Some("书架".into()),
+            archived: false,
+        };
+        assert_eq!(item.to_string(), "yukimemi/shoka  —  书架");
+    }
+
+    #[test]
+    fn repo_list_item_display_falls_back_to_slug_when_no_description() {
+        let item = RepoListItem {
+            owner: "yukimemi".into(),
+            name: "shoka".into(),
+            description: None,
+            archived: false,
+        };
+        assert_eq!(item.to_string(), "yukimemi/shoka");
+        // Empty-string description is treated as absent rather than
+        // a stray trailing em-dash.
+        let empty_desc = RepoListItem {
+            description: Some(String::new()),
+            ..item
+        };
+        assert_eq!(empty_desc.to_string(), "yukimemi/shoka");
     }
 
     #[test]
