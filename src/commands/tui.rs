@@ -308,52 +308,93 @@ impl PickerKind {
     }
 }
 
-/// Picker overlay state. Either showing live data ([`Self::loaded`])
-/// or a single-line failure message ([`Self::error`]) — both render
-/// in the same popup so the user always sees *something* explaining
-/// why they pressed the key.
+/// Picker overlay state. Three variants:
+///
+/// - [`PickerState::Loading`] — fetch task is in flight. Renders a
+///   centred spinner so the user gets an immediate "I heard you" beat
+///   instead of a frozen frame. Cancellable via Esc/q (the gh fetch
+///   future is `.abort()`-ed on close).
+/// - [`PickerState::Loaded`] — items are in, the filter input + list
+///   are interactive.
+/// - [`PickerState::Error`] — single-line failure message
+///   (no token / non-github host / fetch errored). Same popup shell
+///   so the user always sees *something* explaining why they pressed
+///   the key.
 struct Picker {
     kind: PickerKind,
     /// Display label for the repo the picker was opened on, e.g.
     /// `github.com/yukimemi/shoka`. Shown in the popup title so
     /// the user can tell which row they triggered against.
     repo_label: String,
-    /// Items fetched from gh. Empty when `error` is `Some` or when
-    /// the repo legitimately has no open issues / PRs.
-    items: Vec<crate::gh::PickerItem>,
-    /// Precomputed [`crate::gh::PickerItem::search_key`] per item.
-    /// Built once at construction so the hot path in [`refilter`]
-    /// (one nucleo scoring round per item per keystroke) doesn't
-    /// reallocate a `String` for every entry every time the user
-    /// types a character.
-    search_keys: Vec<String>,
-    /// Live filter query.
-    filter: String,
-    /// Indices into `items`, score-sorted (highest first).
-    matches: Vec<usize>,
-    /// Position within `matches` of the highlighted row.
-    cursor: usize,
-    /// When `Some`, the popup renders just the message (no list,
-    /// no filter). Drives the "no token" / "non-github host" /
-    /// "fetch errored" branches.
-    error: Option<String>,
+    /// Allocated once at construction so per-keystroke refilter
+    /// rounds don't pay for matcher init. Lives on `Picker` rather
+    /// than inside [`PickerState::Loaded`] so it survives the
+    /// `Loading → Loaded` state transition without re-allocating.
     matcher: Matcher,
+    state: PickerState,
+}
+
+/// Result of an in-flight picker fetch: the items on success, or a
+/// stringified error to display in the picker error state.
+type PickerFetchResult = std::result::Result<Vec<crate::gh::PickerItem>, String>;
+
+enum PickerState {
+    Loading {
+        /// Wall-clock instant the fetch task was spawned. Drives
+        /// the spinner-frame computation in `render_picker` —
+        /// `Instant::now().duration_since(started_at).as_millis() /
+        /// FRAME_MS % FRAMES` keeps animation independent of the
+        /// event-loop's wake cadence.
+        started_at: std::time::Instant,
+        /// Receiver for the spawned fetch task's result. Closed
+        /// (`Err(Empty)` until ready, `Err(Closed)` if the task
+        /// panicked / was dropped). `Ok(Ok(items))` on success,
+        /// `Ok(Err(msg))` on a caught fetch error.
+        rx: tokio::sync::oneshot::Receiver<PickerFetchResult>,
+        /// Cancellation handle for the in-flight task. Closing the
+        /// picker calls `.abort()` so a slow gh fetch isn't left
+        /// charging through the user's network bandwidth after
+        /// they've moved on.
+        abort: tokio::task::AbortHandle,
+    },
+    Loaded {
+        /// Items fetched from gh. Empty when the repo legitimately
+        /// has no open issues / PRs.
+        items: Vec<crate::gh::PickerItem>,
+        /// Precomputed [`crate::gh::PickerItem::search_key`] per
+        /// item. Built once at the `Loading → Loaded` transition
+        /// so the hot path in [`Picker::refilter`] (one nucleo
+        /// scoring round per item per keystroke) doesn't
+        /// reallocate.
+        search_keys: Vec<String>,
+        /// Live filter query.
+        filter: String,
+        /// Indices into `items`, score-sorted (highest first).
+        matches: Vec<usize>,
+        /// Position within `matches` of the highlighted row.
+        cursor: usize,
+    },
+    Error(String),
 }
 
 impl Picker {
+    /// Test-only constructor that skips the async fetch and lands
+    /// directly in the loaded state with the provided items.
+    #[cfg(test)]
     fn loaded(kind: PickerKind, repo_label: String, items: Vec<crate::gh::PickerItem>) -> Self {
         let matches = (0..items.len()).collect();
         let search_keys = items.iter().map(|i| i.search_key()).collect();
         Self {
             kind,
             repo_label,
-            items,
-            search_keys,
-            filter: String::new(),
-            matches,
-            cursor: 0,
-            error: None,
             matcher: Matcher::default(),
+            state: PickerState::Loaded {
+                items,
+                search_keys,
+                filter: String::new(),
+                matches,
+                cursor: 0,
+            },
         }
     }
 
@@ -361,13 +402,58 @@ impl Picker {
         Self {
             kind,
             repo_label,
-            items: Vec::new(),
-            search_keys: Vec::new(),
-            filter: String::new(),
-            matches: Vec::new(),
-            cursor: 0,
-            error: Some(msg.into()),
             matcher: Matcher::default(),
+            state: PickerState::Error(msg.into()),
+        }
+    }
+
+    /// Indicates whether the event loop should switch to its
+    /// short-timeout polling path (for spinner animation).
+    fn is_loading(&self) -> bool {
+        matches!(self.state, PickerState::Loading { .. })
+    }
+
+    /// Poll the in-flight fetch task. Transitions [`PickerState::
+    /// Loading`] to either [`PickerState::Loaded`] (success) or
+    /// [`PickerState::Error`] (caught failure, task drop, panic).
+    /// No-op when the picker is already in a terminal state.
+    /// Returns `true` iff a state transition happened so the
+    /// event loop can decide to redraw immediately.
+    fn poll_fetch(&mut self) -> bool {
+        let PickerState::Loading { rx, .. } = &mut self.state else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(Ok(items)) => {
+                let matches = (0..items.len()).collect();
+                let search_keys = items.iter().map(|i| i.search_key()).collect();
+                self.state = PickerState::Loaded {
+                    items,
+                    search_keys,
+                    filter: String::new(),
+                    matches,
+                    cursor: 0,
+                };
+                true
+            }
+            Ok(Err(msg)) => {
+                self.state = PickerState::Error(msg);
+                true
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => false,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                self.state = PickerState::Error("fetch task ended without a result".into());
+                true
+            }
+        }
+    }
+
+    /// Abort the in-flight fetch task if any. Called when the user
+    /// dismisses the picker before the fetch lands — we owe it to
+    /// them not to keep the network handle live.
+    fn abort_inflight(&self) {
+        if let PickerState::Loading { abort, .. } = &self.state {
+            abort.abort();
         }
     }
 
@@ -375,15 +461,26 @@ impl Picker {
     /// identity order (as returned by the gh API, which is
     /// most-recently-updated first); a non-empty filter scores each
     /// item's precomputed `search_keys` entry via nucleo and keeps
-    /// positive-score matches sorted descending.
+    /// positive-score matches sorted descending. No-op outside of
+    /// [`PickerState::Loaded`].
     fn refilter(&mut self) {
-        if self.filter.is_empty() {
-            self.matches = (0..self.items.len()).collect();
+        let PickerState::Loaded {
+            items,
+            search_keys,
+            filter,
+            matches,
+            cursor,
+        } = &mut self.state
+        else {
+            return;
+        };
+        if filter.is_empty() {
+            *matches = (0..items.len()).collect();
         } else {
-            let pattern = Pattern::parse(&self.filter, CaseMatching::Smart, Normalization::Smart);
+            let pattern = Pattern::parse(filter, CaseMatching::Smart, Normalization::Smart);
             let mut scored: Vec<(usize, u32)> = Vec::new();
             let mut buf: Vec<char> = Vec::new();
-            for (idx, key) in self.search_keys.iter().enumerate() {
+            for (idx, key) in search_keys.iter().enumerate() {
                 buf.clear();
                 let haystack = nucleo::Utf32Str::new(key, &mut buf);
                 if let Some(score) = pattern.score(haystack, &mut self.matcher) {
@@ -391,27 +488,56 @@ impl Picker {
                 }
             }
             scored.sort_by_key(|&(_, score)| std::cmp::Reverse(score));
-            self.matches = scored.into_iter().map(|(idx, _)| idx).collect();
+            *matches = scored.into_iter().map(|(idx, _)| idx).collect();
         }
-        self.cursor = 0;
+        *cursor = 0;
     }
 
     fn move_down(&mut self) {
-        if self.matches.is_empty() {
+        let PickerState::Loaded {
+            matches, cursor, ..
+        } = &mut self.state
+        else {
+            return;
+        };
+        if matches.is_empty() {
             return;
         }
-        self.cursor = (self.cursor + 1).min(self.matches.len() - 1);
+        *cursor = (*cursor + 1).min(matches.len() - 1);
     }
 
     fn move_up(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
+        let PickerState::Loaded { cursor, .. } = &mut self.state else {
+            return;
+        };
+        *cursor = cursor.saturating_sub(1);
     }
 
-    /// The currently-highlighted item, if any. `None` when the
-    /// list is empty (no matches, no fetched items, or error mode).
+    /// The currently-highlighted item, if any. `None` outside of
+    /// `Loaded`, or when the list is empty.
     fn selected(&self) -> Option<&crate::gh::PickerItem> {
-        let idx = *self.matches.get(self.cursor)?;
-        self.items.get(idx)
+        let PickerState::Loaded {
+            items,
+            matches,
+            cursor,
+            ..
+        } = &self.state
+        else {
+            return None;
+        };
+        let idx = *matches.get(*cursor)?;
+        items.get(idx)
+    }
+}
+
+impl Drop for Picker {
+    /// Belt-and-braces cancellation: any path that drops the picker
+    /// (Esc, `q`, app exit, panic, future dismissal sites) releases
+    /// the in-flight fetch task instead of leaking the network
+    /// handle. The explicit Esc/q handler no longer needs to call
+    /// `abort_inflight` — Drop handles it.
+    fn drop(&mut self) {
+        self.abort_inflight();
     }
 }
 
@@ -583,6 +709,14 @@ fn run_app(app: &mut App) -> Result<Option<usize>> {
 
 fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<Option<usize>> {
     loop {
+        // Drain the picker's in-flight fetch channel before draw so
+        // a just-arrived result lands in the same frame the user
+        // sees rather than waiting for the next keystroke. No-op
+        // outside of `PickerState::Loading`.
+        if let Some(picker) = app.picker.as_mut() {
+            picker.poll_fetch();
+        }
+
         // ratatui's `Backend::Error` is not always `std::error::Error +
         // Send + Sync` (depends on the backend), so anyhow's
         // `.context` blanket impl doesn't apply. Convert manually.
@@ -590,13 +724,25 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<O
             .draw(|f| ui(f, app))
             .map_err(|e| anyhow::anyhow!("drawing frame: {e}"))?;
 
-        // Block on `read()` rather than polling: there's no
-        // animation or background work to drive, and Ctrl-C arrives
-        // as a `KeyEvent` under crossterm's raw mode (not a signal),
-        // so we're never stranded waiting. The polled variant
-        // burned CPU + wall-time for no UX gain.
-        let evt = event::read().context("reading event")?;
-        let Event::Key(key) = evt else { continue };
+        // Default to a blocking `event::read()` — there's nothing
+        // animating in the quiescent TUI and Ctrl-C arrives as a
+        // `KeyEvent` under crossterm's raw mode (not a signal), so
+        // we're never stranded waiting. The exception is when a
+        // picker is loading: we want the braille spinner to tick
+        // every ~80 ms and we need to revisit `poll_fetch` even
+        // without keyboard input, so switch to polled reads with
+        // the spinner's frame interval as the timeout.
+        if app.picker.as_ref().is_some_and(|p| p.is_loading())
+            && !event::poll(std::time::Duration::from_millis(SPINNER_FRAME_MS as u64))
+                .context("polling for event")?
+        {
+            // Timeout — no key. Loop back to redraw the next
+            // spinner frame and re-poll the fetch channel.
+            continue;
+        }
+        let Event::Key(key) = event::read().context("reading event")? else {
+            continue;
+        };
         if key.kind == KeyEventKind::Release {
             // Windows fires Press + Release; we only act on Press so
             // a single physical keystroke doesn't double-fire.
@@ -1287,27 +1433,33 @@ fn centered_rect(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
         .split(vert[1])[1]
 }
 
-/// Resolve the current row → octocrab client → list_open_issues /
-/// list_open_prs (synchronous: `block_on` inside `block_in_place`,
-/// safe under the multi-threaded tokio runtime shoka's `main` uses).
-/// All failure modes (no selected row, non-github host, missing
-/// token, gh client build error, API error) collapse to a single
-/// `Picker::error(...)` so the user always gets a popup that
-/// explains what happened instead of a silently-stuck keystroke.
+/// Validate the current row → spawn a background fetch task →
+/// install a [`PickerState::Loading`] popup the next frame draws.
+/// The synchronous part (slug parse, host check) runs inline so an
+/// obvious failure (`local/...` row, malformed slug) lands in
+/// [`PickerState::Error`] immediately without spinning the user
+/// through a fake "loading…" beat.
 ///
-/// Blocking the runtime here makes the UI freeze briefly during the
-/// fetch — acceptable for a v1 picker, since the call is bounded by
-/// `per_page(100)` plus normal network RTT. A future polish PR can
-/// move this to a background tokio task + spinner without
-/// restructuring callers.
+/// All success-path failure modes (no token, gh client build error,
+/// API error) are caught inside the spawned task and forwarded as a
+/// `String` over the oneshot channel — the event loop turns that
+/// into [`PickerState::Error`] on its next poll. Result: the user
+/// always sees *something* explaining what happened, never a
+/// silently-stuck keystroke.
+///
+/// The task is detached but cancellable: the returned
+/// [`tokio::task::AbortHandle`] is stored on
+/// [`PickerState::Loading`] so [`handle_picker_key`]'s
+/// Esc/q/Ctrl-C arms can stop the request mid-flight.
 fn open_picker(app: &mut App, kind: PickerKind) {
     let Some(row_idx) = app.selected_row() else {
         return;
     };
     let row = &app.rows[row_idx];
 
-    // Slug is `<host>/<owner>/<name>`. Anything else means a malformed
-    // shelf entry — short-circuit with a message rather than panic.
+    // Slug is `<host>/<owner>/<name>`. Anything else means a
+    // malformed shelf entry — short-circuit with a message rather
+    // than panic.
     let parts: Vec<&str> = row.slug.splitn(3, '/').collect();
     let &[host, owner, name] = parts.as_slice() else {
         app.picker = Some(Picker::error(
@@ -1331,43 +1483,71 @@ fn open_picker(app: &mut App, kind: PickerKind) {
         return;
     }
 
-    // Resolve token + build client + fetch, all under one block_on
-    // so we don't fragment the runtime stack. block_in_place lets
-    // the multi-threaded scheduler reuse this worker thread while
-    // we block, rather than stalling other tasks.
-    let fetched = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async move {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let owner = owner.to_string();
+    let name = name.to_string();
+    let join = tokio::spawn(async move {
+        // Caught failure: every step gets folded into the `Err(String)`
+        // arm of the channel send so the wire format the event loop
+        // sees is uniform. The `let _ =` swallows a send failure
+        // (receiver dropped because the user closed the picker
+        // before the fetch landed) — we have nothing to do about it.
+        let result: PickerFetchResult = async {
             let Some(token) = crate::gh::resolve_token().await else {
-                return Err(anyhow::anyhow!(
-                    "no GITHUB_TOKEN — set the env var or run `gh auth login`"
-                ));
+                return Err("no GITHUB_TOKEN — set the env var or run `gh auth login`".to_string());
             };
             let client = crate::gh::build_client(&token)
-                .map_err(|e| anyhow::anyhow!("gh client init failed: {e:#}"))?;
-            match kind {
-                PickerKind::Issues => crate::gh::list_open_issues(&client, owner, name).await,
-                PickerKind::Prs => crate::gh::list_open_prs(&client, owner, name).await,
-            }
-        })
+                .map_err(|e| format!("gh client init failed: {e:#}"))?;
+            let fetched = match kind {
+                PickerKind::Issues => crate::gh::list_open_issues(&client, &owner, &name).await,
+                PickerKind::Prs => crate::gh::list_open_prs(&client, &owner, &name).await,
+            };
+            fetched.map_err(|e| format!("{e:#}"))
+        }
+        .await;
+        let _ = tx.send(result);
     });
 
-    let picker = match fetched {
-        Ok(items) => Picker::loaded(kind, repo_label, items),
-        Err(e) => Picker::error(kind, repo_label, format!("{e:#}")),
-    };
-    app.picker = Some(picker);
+    app.picker = Some(Picker {
+        kind,
+        repo_label,
+        matcher: Matcher::default(),
+        state: PickerState::Loading {
+            started_at: std::time::Instant::now(),
+            rx,
+            abort: join.abort_handle(),
+        },
+    });
 }
 
 /// Dispatch a keystroke while the picker overlay is open. Mutates
 /// `app.picker` (close on Esc/q, refilter on typing, move cursor,
 /// hand off to `open::that` on Enter).
+///
+/// During [`PickerState::Loading`] only Esc / q are honoured —
+/// j/k navigation and filter typing have nothing to operate on
+/// yet, and ignoring them lets the user mash the keyboard without
+/// the closing keystroke accidentally landing as a filter
+/// character once the fetch resolves. The close arm aborts the
+/// in-flight fetch task via the stored [`tokio::task::AbortHandle`]
+/// so a slow gh request doesn't keep using bandwidth after the
+/// user moves on.
 fn handle_picker_key(app: &mut App, key: crossterm::event::KeyEvent) {
     let Some(picker) = app.picker.as_mut() else {
         return;
     };
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => {
+            // `Picker::drop` aborts the in-flight fetch task, so
+            // dropping the picker here is enough — no manual
+            // `abort_inflight` call needed.
             app.picker = None;
+        }
+        _ if picker.is_loading() => {
+            // Swallow every other key while the spinner is up.
+            // Nothing to navigate, nothing to filter, and a stray
+            // Enter shouldn't queue up a browser launch the user
+            // can't see yet.
         }
         KeyCode::Char('j') | KeyCode::Down => picker.move_down(),
         KeyCode::Char('k') | KeyCode::Up => picker.move_up(),
@@ -1387,11 +1567,15 @@ fn handle_picker_key(app: &mut App, key: crossterm::event::KeyEvent) {
             app.picker = None;
         }
         KeyCode::Backspace => {
-            picker.filter.pop();
+            if let PickerState::Loaded { filter, .. } = &mut picker.state {
+                filter.pop();
+            }
             picker.refilter();
         }
         KeyCode::Char(c) => {
-            picker.filter.push(c);
+            if let PickerState::Loaded { filter, .. } = &mut picker.state {
+                filter.push(c);
+            }
             picker.refilter();
         }
         _ => {}
@@ -1592,10 +1776,17 @@ fn render_action_popup(f: &mut Frame, area: Rect, popup: &ActionPopup) {
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
+/// Braille spinner frames. The Catppuccin-friendly Unicode dot set
+/// (every glyph is in the `U+28xx` block, all fixed-width) and a
+/// 10-frame cycle gives a ~800 ms rotation at the 80 ms event-loop
+/// poll cadence — fast enough to feel responsive without distracting.
+const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER_FRAME_MS: u128 = 80;
+
 /// Render the picker overlay. Always centered, always full-bleed
-/// over the dashboard. Three modes — error (single line + dismiss
-/// hint), empty list (no items match the current filter), populated
-/// list (filter line + scrollable items).
+/// over the dashboard. Three modes — loading (centred spinner +
+/// "fetching…" label), error (single line + dismiss hint), or
+/// loaded (filter line + scrollable list).
 fn render_picker(f: &mut Frame, area: Rect, picker: &Picker) {
     let popup = centered_rect(80, 80, area);
     f.render_widget(Clear, popup);
@@ -1622,25 +1813,83 @@ fn render_picker(f: &mut Frame, area: Rect, picker: &Picker) {
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
-    // Single-line error mode: render the message and a dismiss hint,
-    // skip the list entirely. Keeps the visual weight matched to
-    // what the user can act on.
-    if let Some(err) = &picker.error {
-        let body = vec![
-            Line::from(""),
-            Line::from(ratatui::text::Span::styled(
-                format!("  ⚠  {err}"),
-                Style::default().fg(theme::RED),
-            )),
-            Line::from(""),
-            Line::from(ratatui::text::Span::styled(
-                "  esc / q to close",
-                Style::default().fg(theme::OVERLAY),
-            )),
-        ];
-        f.render_widget(Paragraph::new(body), inner);
-        return;
+    match &picker.state {
+        PickerState::Loading { started_at, .. } => {
+            // Spinner mode — centred message with a rotating
+            // braille glyph. Frame derived from wall time so the
+            // animation stays in step regardless of the event-loop's
+            // wake jitter (a `frame_idx += 1` counter would skip on
+            // a slow frame; modulo elapsed time is self-correcting).
+            let elapsed = started_at.elapsed().as_millis();
+            // Take the modulo in `u128` *before* narrowing to `usize`
+            // so a long-running fetch on a 32-bit target can't
+            // truncate the frame index before it's bounded.
+            let frame = SPINNER_FRAMES
+                [((elapsed / SPINNER_FRAME_MS) % SPINNER_FRAMES.len() as u128) as usize];
+            let body = vec![
+                Line::from(""),
+                Line::from(vec![
+                    ratatui::text::Span::styled(
+                        format!("  {frame}  "),
+                        Style::default()
+                            .fg(theme::PEACH)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    ratatui::text::Span::styled(
+                        format!("fetching {}…", picker.kind.title().to_lowercase()),
+                        Style::default().fg(theme::TEXT),
+                    ),
+                ]),
+                Line::from(""),
+                Line::from(ratatui::text::Span::styled(
+                    "  esc / q to cancel",
+                    Style::default().fg(theme::OVERLAY),
+                )),
+            ];
+            f.render_widget(Paragraph::new(body), inner);
+        }
+        PickerState::Error(err) => {
+            // Single-line error mode: render the message and a
+            // dismiss hint, skip the list entirely. Keeps the
+            // visual weight matched to what the user can act on.
+            let body = vec![
+                Line::from(""),
+                Line::from(ratatui::text::Span::styled(
+                    format!("  ⚠  {err}"),
+                    Style::default().fg(theme::RED),
+                )),
+                Line::from(""),
+                Line::from(ratatui::text::Span::styled(
+                    "  esc / q to close",
+                    Style::default().fg(theme::OVERLAY),
+                )),
+            ];
+            f.render_widget(Paragraph::new(body), inner);
+        }
+        PickerState::Loaded {
+            items,
+            filter,
+            matches,
+            cursor,
+            ..
+        } => {
+            render_picker_loaded(f, inner, items, filter, matches, *cursor);
+        }
     }
+}
+
+/// Pulled out of `render_picker` so the busy `Loaded` arm stays
+/// readable. Same as the v0.13.0 picker render minus the
+/// pre-refactor field access shape.
+fn render_picker_loaded(
+    f: &mut Frame,
+    inner: Rect,
+    items: &[crate::gh::PickerItem],
+    filter: &str,
+    matches: &[usize],
+    cursor: usize,
+) {
+    use ratatui::text::Span;
 
     // Layout: filter row (1 line) + list (rest minus 1) + footer (1).
     let chunks = Layout::default()
@@ -1652,16 +1901,16 @@ fn render_picker(f: &mut Frame, area: Rect, picker: &Picker) {
         ])
         .split(inner);
 
-    // Filter row — cursor `_` glyph indicates this is a live input.
+    // Filter row — caret `▌` glyph indicates this is a live input.
     let filter_line = Line::from(vec![
-        ratatui::text::Span::styled(
+        Span::styled(
             "  / ",
             Style::default()
                 .fg(theme::PEACH)
                 .add_modifier(Modifier::BOLD),
         ),
-        ratatui::text::Span::styled(&picker.filter, Style::default().fg(theme::YELLOW)),
-        ratatui::text::Span::styled(
+        Span::styled(filter, Style::default().fg(theme::YELLOW)),
+        Span::styled(
             "▌",
             Style::default()
                 .fg(theme::PEACH)
@@ -1674,20 +1923,13 @@ fn render_picker(f: &mut Frame, area: Rect, picker: &Picker) {
     // We don't paginate; if a repo has 100+ items the user just narrows
     // with the filter (that's the whole point of the popup).
     let visible_h = chunks[1].height as usize;
-    let total = picker.matches.len();
-    let scroll_top = picker.cursor.saturating_sub(visible_h.saturating_sub(1));
+    let total = matches.len();
+    let scroll_top = cursor.saturating_sub(visible_h.saturating_sub(1));
 
     let mut lines: Vec<Line> = Vec::with_capacity(total.min(visible_h));
-    for (visual_idx, &item_idx) in picker
-        .matches
-        .iter()
-        .enumerate()
-        .skip(scroll_top)
-        .take(visible_h)
-    {
-        use ratatui::text::Span;
-        let item = &picker.items[item_idx];
-        let is_cursor = visual_idx == picker.cursor;
+    for (visual_idx, &item_idx) in matches.iter().enumerate().skip(scroll_top).take(visible_h) {
+        let item = &items[item_idx];
+        let is_cursor = visual_idx == cursor;
         let prefix = if is_cursor { " ▶ " } else { "   " };
 
         let mut spans: Vec<Span> = vec![
@@ -1720,7 +1962,7 @@ fn render_picker(f: &mut Frame, area: Rect, picker: &Picker) {
         lines.push(Line::from(spans).style(line_style));
     }
     if lines.is_empty() {
-        lines.push(Line::from(ratatui::text::Span::styled(
+        lines.push(Line::from(Span::styled(
             "  (no matches)",
             Style::default().fg(theme::OVERLAY),
         )));
@@ -2264,7 +2506,7 @@ mod tests {
             picker_items(&[(1, "alpha", &[]), (2, "beta", &[]), (3, "gamma", &[])]),
         );
         p.refilter();
-        assert_eq!(p.matches, vec![0, 1, 2]);
+        assert_eq!(picker_matches(&p), &[0, 1, 2]);
     }
 
     #[test]
@@ -2278,11 +2520,16 @@ mod tests {
                 (3, "another bug-fix", &[]),
             ]),
         );
-        p.filter = "bug".into();
+        if let PickerState::Loaded { filter, .. } = &mut p.state {
+            *filter = "bug".into();
+        }
         p.refilter();
         // Items 1 and 3 should match (1 via label, 3 via title);
         // item 2 should not. Order is nucleo's call (score desc).
-        let matched: Vec<u64> = p.matches.iter().map(|&i| p.items[i].number).collect();
+        let PickerState::Loaded { matches, items, .. } = &p.state else {
+            panic!("expected loaded picker")
+        };
+        let matched: Vec<u64> = matches.iter().map(|&i| items[i].number).collect();
         assert!(
             matched.contains(&1) && matched.contains(&3),
             "expected items 1 + 3 to match, got: {matched:?}"
@@ -2294,13 +2541,13 @@ mod tests {
     }
 
     #[test]
-    fn picker_error_renders_with_no_items() {
-        // Error-mode picker has an empty items list and a non-None
-        // error field. `selected()` returns None — render_picker
-        // takes the error branch and never reaches the list code.
+    fn picker_error_state_holds_message_and_blocks_selection() {
+        // Error-mode picker doesn't expose a list — `selected()`
+        // returns `None`, and `render_picker` takes the error
+        // branch and never reaches the list code.
         let p = Picker::error(PickerKind::Prs, "github.com/x/y".into(), "no GITHUB_TOKEN");
-        assert!(p.items.is_empty());
-        assert_eq!(p.error.as_deref(), Some("no GITHUB_TOKEN"));
+        assert!(matches!(p.state, PickerState::Error(_)));
+        assert_eq!(picker_error_message(&p), "no GITHUB_TOKEN");
         assert!(p.selected().is_none());
     }
 
@@ -2334,6 +2581,45 @@ mod tests {
         crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
     }
 
+    /// Pull the error string out of a `Picker` for assertions. The
+    /// `Loading` arm only appears when `open_picker` actually spawned
+    /// a task (which means a tokio runtime is required), so any test
+    /// that reaches this helper expects the sync short-circuit
+    /// arm — anything else is an outright test bug.
+    fn picker_error_message(picker: &Picker) -> &str {
+        match &picker.state {
+            PickerState::Error(msg) => msg.as_str(),
+            other => panic!(
+                "expected PickerState::Error, got {:?}",
+                std::mem::discriminant(other)
+            ),
+        }
+    }
+
+    /// Pull the filter string out of a loaded `Picker` for the
+    /// keystroke-dispatch tests.
+    fn picker_filter(picker: &Picker) -> &str {
+        match &picker.state {
+            PickerState::Loaded { filter, .. } => filter.as_str(),
+            other => panic!(
+                "expected PickerState::Loaded, got {:?}",
+                std::mem::discriminant(other)
+            ),
+        }
+    }
+
+    /// Pull the `matches` slice out of a loaded picker for the
+    /// "refilter actually ran" assertion.
+    fn picker_matches(picker: &Picker) -> &[usize] {
+        match &picker.state {
+            PickerState::Loaded { matches, .. } => matches,
+            other => panic!(
+                "expected PickerState::Loaded, got {:?}",
+                std::mem::discriminant(other)
+            ),
+        }
+    }
+
     #[test]
     fn open_picker_short_circuits_on_malformed_slug() {
         // A slug missing the host/owner/name shape should land us in
@@ -2342,7 +2628,7 @@ mod tests {
         let mut app = app_with_single_slug("no-slashes-here");
         open_picker(&mut app, PickerKind::Issues);
         let picker = app.picker.as_ref().expect("error picker installed");
-        let err = picker.error.as_ref().expect("error message set");
+        let err = picker_error_message(picker);
         assert!(
             err.contains("no-slashes-here"),
             "malformed-slug error should mention the slug, got: {err}"
@@ -2359,7 +2645,7 @@ mod tests {
         let mut app = app_with_single_slug("gitlab.com/some/proj");
         open_picker(&mut app, PickerKind::Prs);
         let picker = app.picker.as_ref().expect("error picker installed");
-        let err = picker.error.as_ref().expect("error message set");
+        let err = picker_error_message(picker);
         assert!(
             err.contains("github.com") && err.contains("gitlab.com"),
             "non-github error should mention both the requirement and the actual host, got: {err}"
@@ -2425,12 +2711,12 @@ mod tests {
         ));
         handle_picker_key(&mut app, key(KeyCode::Char('a')));
         let picker = app.picker.as_ref().unwrap();
-        assert_eq!(picker.filter, "a");
+        assert_eq!(picker_filter(picker), "a");
         // Both items contain `a` (`alpha` literally, `zeta` ends with
         // it), so matches is non-empty — the real assertion is just
         // that typing went through and refilter ran. Stronger orderings
         // belong in the dedicated refilter tests above.
-        assert!(!picker.matches.is_empty());
+        assert!(!picker_matches(picker).is_empty());
     }
 
     #[test]
@@ -2441,12 +2727,101 @@ mod tests {
             "github.com/x/y".into(),
             picker_items(&[(1, "alpha", &[])]),
         );
-        p.filter = "ab".into();
+        if let PickerState::Loaded { filter, .. } = &mut p.state {
+            *filter = "ab".into();
+        }
         p.refilter();
         app.picker = Some(p);
         handle_picker_key(&mut app, key(KeyCode::Backspace));
         let picker = app.picker.as_ref().unwrap();
-        assert_eq!(picker.filter, "a");
+        assert_eq!(picker_filter(picker), "a");
+    }
+
+    #[test]
+    fn loading_state_swallows_navigation_until_fetch_lands() {
+        // Construct a Loading picker by hand (no spawn) using a
+        // dropped sender — the receiver will return `Closed` on
+        // poll, but until we call `poll_fetch` we're still in the
+        // Loading arm. We then assert that j/k/Enter are no-ops
+        // (matched by the loading guard in `handle_picker_key`)
+        // while Esc still closes.
+        let (_tx, rx) = tokio::sync::oneshot::channel::<PickerFetchResult>();
+        // A no-op task we can hand an abort handle from.
+        let join = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .spawn(async {});
+        let picker = Picker {
+            kind: PickerKind::Issues,
+            repo_label: "github.com/x/y".into(),
+            matcher: Matcher::default(),
+            state: PickerState::Loading {
+                started_at: std::time::Instant::now(),
+                rx,
+                abort: join.abort_handle(),
+            },
+        };
+
+        let mut app = App::new(rows(&[]), Vec::new());
+        app.picker = Some(picker);
+        assert!(app.picker.as_ref().unwrap().is_loading());
+
+        // j / Enter / typing — all should leave the picker installed
+        // and still in the Loading state.
+        for code in [
+            KeyCode::Char('j'),
+            KeyCode::Char('k'),
+            KeyCode::Enter,
+            KeyCode::Char('a'),
+            KeyCode::Backspace,
+        ] {
+            handle_picker_key(&mut app, key(code));
+            let picker = app.picker.as_ref().expect("picker survives ignored key");
+            assert!(
+                picker.is_loading(),
+                "key {code:?} must not transition the picker out of Loading"
+            );
+        }
+
+        // Esc closes the picker outright (and aborts the inflight
+        // task — covered indirectly: if abort weren't called, the
+        // tokio runtime would leak the task across test runs).
+        handle_picker_key(&mut app, key(KeyCode::Esc));
+        assert!(
+            app.picker.is_none(),
+            "Esc on Loading must still close the picker"
+        );
+    }
+
+    #[test]
+    fn poll_fetch_closed_channel_transitions_to_error() {
+        // The fetch task panicked / was dropped before sending a
+        // result. We model that with a sender that's dropped
+        // immediately. `poll_fetch` should fold that into the
+        // Error arm so the popup explains "something went wrong"
+        // rather than spinning forever.
+        let (tx, rx) = tokio::sync::oneshot::channel::<PickerFetchResult>();
+        drop(tx);
+        // Same "throwaway runtime for abort_handle" trick as the
+        // loading-state test above.
+        let join = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .spawn(async {});
+        let mut picker = Picker {
+            kind: PickerKind::Issues,
+            repo_label: "github.com/x/y".into(),
+            matcher: Matcher::default(),
+            state: PickerState::Loading {
+                started_at: std::time::Instant::now(),
+                rx,
+                abort: join.abort_handle(),
+            },
+        };
+        assert!(picker.poll_fetch(), "closed channel must transition state");
+        assert!(matches!(picker.state, PickerState::Error(_)));
     }
 
     #[test]
