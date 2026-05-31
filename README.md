@@ -157,9 +157,83 @@ clone <url>` passes through.
 `$XDG_CONFIG_HOME/shoka/`, macOS
 `~/Library/Application Support/yukimemi.shoka/`, Windows
 `%APPDATA%\yukimemi\shoka\config\`). A starter is auto-written on
-first run.
+first run, so `root` is the only key you usually need to touch.
 
 Minimal example:
+
+```toml
+[global]
+root = "~/src"
+```
+
+### Reference
+
+#### `[global]`
+
+| Key | Default | Description |
+| :--- | :--- | :--- |
+| `root` | _(required)_ | Filesystem root under which repos are cloned. Set here or in the active profile. |
+| `layout` | `"{{ root }}/{{ host }}/{{ owner }}/{{ name }}"` | Path-layout template, rendered at clone time. Context: `root`, `host`, `owner`, `name`, `profile`, `vcs`, `protocol`. |
+| `default_vcs` | `"auto"` | `"auto"` / `"git"` / `"jj"`. |
+| `default_protocol` | `"https"` | `"https"` / `"ssh"`. |
+| `default_host` | `"github.com"` | Host assumed when a spec omits it (e.g. `owner/name`). |
+| `default_profile` | _(none)_ | Profile used when neither `--profile` nor `$SHOKA_PROFILE` is set. |
+| `exec_concurrency` | `8` | Max parallel jobs for `shoka exec`. Floored at 1. |
+
+#### `[global.ui]`
+
+| Key | Default | Description |
+| :--- | :--- | :--- |
+| `status_cache_ttl_secs` | `60` | How long a cached per-repo status snapshot is considered fresh. |
+| `tui_refresh_ms` | `250` | TUI redraw interval in milliseconds. |
+| `own_owners` | `[]` | Owners treated as "yours". When non-empty the TUI starts in mine-only mode and `m` toggles to the full shelf; empty hides the toggle. |
+| `cd_page_size` | `15` | Rows the `shoka cd` fuzzy picker shows at once. Floored at 1. |
+
+#### `[global.shell]`
+
+| Key | Default | Description |
+| :--- | :--- | :--- |
+| `cd_command_name` | `"s"` | Default function name emitted by `shoka init-shell <shell>` (overridable with `--name`). |
+
+#### `[global.cache]`
+
+| Key | Default | Description |
+| :--- | :--- | :--- |
+| `background_refresh` | `true` | Spawn a detached background refresh after most commands. When `false`, only `shoka cache refresh` updates the cache. |
+| `refresh_threshold_secs` | `60` | Skip a per-repo refresh if it ran within this many seconds. `--force` bypasses it. |
+| `parallel_repos` | `8` | Cap on concurrent per-repo refresh tasks. Floored at 1. |
+
+#### `[[routes]]`
+
+Clone-destination routing, evaluated top-to-bottom at clone time —
+the first matching route wins. A matched route's set fields override
+the corresponding `[global]` values; unset fields fall through.
+
+| Key | Description |
+| :--- | :--- |
+| `pattern` | `host:<host>`, `host:<host>/<owner>`, or `/<regex>/` (Rust `regex` crate). |
+| `root` | Clone root for matching repos. |
+| `layout` | Per-route layout template override. |
+| `default_vcs` | Per-route VCS override. |
+| `default_protocol` | Per-route protocol override. |
+
+#### `[profiles.<name>]`
+
+Selected via `--profile <name>` / `$SHOKA_PROFILE` /
+`global.default_profile`. Set fields override `[global]`; unset
+fields fall through.
+
+| Key | Description |
+| :--- | :--- |
+| `root` | Profile clone root. When set, the profile claims clone routing and `[[routes]]` are skipped. |
+| `layout` | Profile layout template. |
+| `default_vcs` | Profile VCS default. |
+| `default_protocol` | Profile protocol default. |
+| `default_host` | Profile host default. |
+| `exec_concurrency` | Profile `shoka exec` concurrency. |
+| `git_config` | `key = "value"` pairs (a `[profiles.<name>.git_config]` table) injected as `git config` per-repo (e.g. `"user.email" = "work@example.com"`). |
+
+### Full example
 
 ```toml
 [global]
@@ -167,10 +241,19 @@ root = "~/src"
 default_host = "github.com"
 default_protocol = "https"
 default_vcs = "auto"
+exec_concurrency = 8
+
+[global.ui]
+own_owners = ["yukimemi"]
+cd_page_size = 15
+
+[global.shell]
+cd_command_name = "s"
 
 [global.cache]
 background_refresh = true
 refresh_threshold_secs = 60
+parallel_repos = 8
 
 [[routes]]
 pattern = "host:github.com/mycompany"
@@ -179,17 +262,22 @@ default_protocol = "ssh"
 
 [profiles.work]
 default_host = "github.mycompany.com"
+
+[profiles.work.git_config]
+"user.email" = "work@example.com"
 ```
 
-Route patterns support `host:<host>`, `host:<host>/<owner>`, and
-`/<regex>/`. The first matching route wins. Profile beats routes
-when `profile.root` is set; otherwise routes evaluate against the
-raw `[global]` baseline.
+Precedence for clone destinations is `profile.root` (when set) >
+first matching `[[routes]]` entry > `[global].root`.
+
+### Layering & templating
 
 Files in the same dir matching `config.*.toml` are layered on top
-(alphabetical order; `config.local.toml` last wins). All values
-flow through [`teravars`](https://github.com/yukimemi/teravars) so
-`[vars]` self-references resolve before deserialization.
+(alphabetical order; `config.local.toml` last wins). Point at a
+specific file with `--config PATH` or `$SHOKA_CONFIG`. All values
+flow through [`teravars`](https://github.com/yukimemi/teravars) so a
+`[vars]` table (with helpers like `home()` / `env(name=...)` /
+`is_windows()`) self-references and resolves before deserialization.
 
 ## Roadmap
 
