@@ -705,19 +705,33 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        // Best-effort cleanup — there's nothing we can do if any of
-        // these fail (no panic-in-drop), and the user is going to
-        // get their terminal back one way or another. Print cursor
-        // show explicitly: LeaveAlternateScreen restores the main
-        // buffer but the cursor visibility flag persists, and we
-        // hid it via TableState rendering.
-        let _ = disable_raw_mode();
+        // Tear down in the exact reverse of `new`: mouse capture +
+        // alt-screen first, raw mode LAST. Order matters on Windows.
+        //
+        // crossterm's `DisableMouseCapture` restores the console input
+        // mode that was captured when `EnableMouseCapture` ran — and that
+        // snapshot was taken *after* `enable_raw_mode`, so it still has
+        // ENABLE_LINE_INPUT / ENABLE_ECHO_INPUT / ENABLE_PROCESSED_INPUT
+        // cleared. If we called `disable_raw_mode` first, the subsequent
+        // `DisableMouseCapture` would clobber the cooked bits it just
+        // restored, leaving the *whole console* in raw mode after shoka
+        // exits — so the next program that does a line read in this
+        // terminal (e.g. `shoka self-update`'s `[y/N]` prompt) hangs with
+        // no echo and an inert Ctrl-C. Running `disable_raw_mode` last
+        // gives it the final say on the input mode.
+        //
+        // Best-effort throughout — there's nothing we can do if any step
+        // fails (no panic-in-drop), and the user gets their terminal back
+        // one way or another. `cursor::Show` is explicit because
+        // LeaveAlternateScreen restores the main buffer but not the cursor
+        // visibility flag, which TableState rendering hid.
         let _ = execute!(
             io::stdout(),
             LeaveAlternateScreen,
             DisableMouseCapture,
             crossterm::cursor::Show
         );
+        let _ = disable_raw_mode();
     }
 }
 
