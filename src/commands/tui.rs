@@ -19,11 +19,14 @@
 //!    from a definite zero.
 //! 3. Footer — mode-specific key hints, or the live filter input.
 //!
+//! The OSC 7 cwd hint is emitted on Enter-to-cd via the shared
+//! [`emit_path`] sidechannel, so a tab/split opened after picking a
+//! repo inherits its directory — see [`crate::commands::cd`].
+//!
 //! What's intentionally **not** here yet:
 //!
 //! - **Multi-select / bulk ops.** The TUI is currently a fancy `cd`
 //!   picker. Bulk `exec --tag X -- ...` would be a natural extension.
-//! - **OSC 7 cwd hint.** Phase 3 polish.
 
 use std::io;
 use std::path::PathBuf;

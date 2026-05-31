@@ -69,9 +69,11 @@ and `shoka cd` is "pull a volume off the shelf".
 - **Phase 2 — TUI dashboard.** `shoka tui` (ratatui +
   crossterm), cached status layer (sled or json), `gh` CLI
   integration for open PRs / CI status / contribution graph.
-- **Phase 3 — Polish & power features.** Profiles, scaffolding
-  (`shoka new` = `gh repo create` + clone + kata init), bulk
-  org-move follow, OSC 7 cwd hint for terminals that support it.
+- **Phase 3 — Polish & power features.** OSC 7 cwd hint for
+  terminals that support it — done (`cd` / `tui` emit it via the
+  `SHOKA_CD_OUT` sidechannel branch in `commands::cd::emit_path`).
+  Still open: Profiles, scaffolding (`shoka new` = `gh repo create`
+  + clone + kata init), bulk org-move follow.
 
 ## Open design questions
 
