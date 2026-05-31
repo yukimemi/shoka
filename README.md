@@ -86,7 +86,7 @@ shoka exec --tag rust -- cargo check
 | `shoka doctor` | Diagnose environment + config. |
 | `shoka init-shell <shell>` | Print a shell wrapper that claims the `shoka` name and chdirs the parent shell on `cd` / `tui` (see below). |
 | `shoka completion <shell>` | Print a shell-completion script. |
-| `shoka tui` | TUI dashboard — branch / ↑↓ / dirty / PR / CI columns from the cached snapshot; j/k navigation, `/` for nucleo filter, Enter exits and emits the chosen repo's path so the shell wrapper can `cd` to it. |
+| `shoka tui` | TUI dashboard — branch / ↑↓ / dirty / PR / CI / activity columns from the cached snapshot (activity is a per-repo, self-normalised sparkline of the last ~12 weeks' commits); j/k navigation, `/` for nucleo filter, Enter exits and emits the chosen repo's path so the shell wrapper can `cd` to it. |
 
 `shoka exec` is the transparent escape hatch: shoka never
 interprets the command. `shoka exec -- git fetch`, `shoka exec --
@@ -289,9 +289,10 @@ flow through [`teravars`](https://github.com/yukimemi/teravars) so a
   from `gix`, open PR count + CI status from `octocrab`. Done.
 - **Phase 3 — Polish.** OSC 7 cwd hint ✅ (`cd` / `tui` announce the
   picked repo's dir so new tabs/splits inherit it). `shoka new`
-  scaffolding ✅ (`gh repo create` + clone + `kata init`). Still open:
-  per-profile route overrides, bulk org-move follow,
-  contribution-graph column.
+  scaffolding ✅ (`gh repo create` + clone + `kata init`).
+  Contribution-graph column ✅ (per-repo commit-activity sparkline in
+  the TUI). Still open: per-profile route overrides, bulk org-move
+  follow.
 
 ## Development
 

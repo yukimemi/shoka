@@ -1035,6 +1035,7 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
         Cell::from(" ✓ "),
         Cell::from(" PR "),
         Cell::from(" CI "),
+        Cell::from(" activity "),
         Cell::from(" path "),
         Cell::from(" tags "),
     ])
@@ -1054,6 +1055,7 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
             let row = &app.rows[row_idx];
             let (branch, ahead_behind, dirty) = status_cells(row.status.as_ref());
             let (pr, ci) = gh_cells(row.gh.as_ref());
+            let activity = sparkline(row.gh.as_ref().and_then(|g| g.weekly_commits.as_deref()));
 
             // Alternating row tint — subtle stripe that makes
             // long shelves easier to scan without competing with
@@ -1080,6 +1082,7 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
                 Cell::from(style_dirty(&dirty)),
                 Cell::from(style_pr(&pr)),
                 Cell::from(style_ci(&ci)),
+                Cell::from(Line::from(vec![Span::raw(" "), style_activity(activity)])),
                 Cell::from(Span::styled(
                     row.path.to_string_lossy(),
                     Style::default().fg(theme::OVERLAY),
@@ -1100,6 +1103,7 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
         Constraint::Length(2),      // dirty glyph
         Constraint::Length(4),      // PR count (e.g. "99+")
         Constraint::Length(2),      // CI glyph
+        Constraint::Length(13),     // activity sparkline (1 lead + up to 12 weeks)
         Constraint::Min(20),        // path
         Constraint::Length(14),     // tags
     ];
@@ -1193,6 +1197,53 @@ fn style_ci(s: &str) -> ratatui::text::Span<'static> {
         _ => theme::OVERLAY,
     };
     Span::styled(s.to_string(), Style::default().fg(color))
+}
+
+/// Render weekly commit counts (oldest → newest) as a unicode
+/// sparkline — the dashboard's contribution-graph column.
+///
+/// Normalised to the row's **own** max so each repo's recent rhythm
+/// reads on its own scale: a busy mono-repo and a weekend hobby repo
+/// both fill the cell, showing trend rather than absolute volume.
+///
+/// Three distinct looks:
+/// - `None` / empty (snapshot absent, or GitHub hasn't computed the
+///   stat yet) → a single dim `-`, "never measured".
+/// - all-zero history → a flat run of the lowest bar `▁`, "measured,
+///   dormant" — deliberately different from `-`.
+/// - otherwise → `▁▂▃▄▅▆▇█` scaled 0..=max, rounded to nearest bar.
+fn sparkline(weekly: Option<&[u32]>) -> String {
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let Some(weekly) = weekly.filter(|w| !w.is_empty()) else {
+        return "-".into();
+    };
+    let max = weekly.iter().copied().max().unwrap_or(0);
+    if max == 0 {
+        return std::iter::repeat_n(BARS[0], weekly.len()).collect();
+    }
+    let max = u64::from(max);
+    weekly
+        .iter()
+        .map(|&w| {
+            // Round (w/max)·7 to the nearest bar so a mid-height week
+            // reads mid-height instead of truncating toward `▁`.
+            let idx = ((u64::from(w) * 7 + max / 2) / max) as usize;
+            BARS[idx.min(7)]
+        })
+        .collect()
+}
+
+/// Colour the activity sparkline: GitHub-green when there's data,
+/// dim overlay for the `-` "no data" placeholder so it recedes like
+/// the other unmeasured cells.
+fn style_activity(s: String) -> ratatui::text::Span<'static> {
+    use ratatui::text::Span;
+    let color = if s == "-" {
+        theme::OVERLAY
+    } else {
+        theme::GREEN
+    };
+    Span::styled(s, Style::default().fg(color))
 }
 
 /// Format the two gh cells (open PR count + CI glyph). `(-, -)`
@@ -2233,6 +2284,7 @@ mod tests {
         let shared_gh = GhSnapshot {
             open_pr_count: Some(7),
             ci_status: Some(CiStatus::Success),
+            weekly_commits: Some(vec![1, 0, 3, 2]),
         };
 
         let mut cache = Cache::default();
@@ -2276,10 +2328,43 @@ mod tests {
     }
 
     #[test]
+    fn sparkline_none_or_empty_renders_dash() {
+        // "never measured" — distinct from a dormant all-zero history.
+        assert_eq!(sparkline(None), "-");
+        assert_eq!(sparkline(Some(&[])), "-");
+    }
+
+    #[test]
+    fn sparkline_all_zero_is_a_flat_floor() {
+        // "measured, dormant" → lowest bar repeated, one per week, so
+        // it reads differently from the `-` no-data case.
+        assert_eq!(sparkline(Some(&[0, 0, 0])), "▁▁▁");
+    }
+
+    #[test]
+    fn sparkline_normalises_to_the_rows_own_max() {
+        // max maps to the top bar, 0 to the bottom, mid-range rounds
+        // to the nearest bar. With max=8: 8→█(7), 4→▅(idx4), 0→▁(0).
+        assert_eq!(sparkline(Some(&[0, 4, 8])), "▁▅█");
+        // A different absolute scale with the same *shape* yields the
+        // same sparkline — that's the per-row normalisation working:
+        // an active mono-repo and a hobby repo read on their own axis.
+        assert_eq!(sparkline(Some(&[0, 50, 100])), "▁▅█");
+    }
+
+    #[test]
+    fn sparkline_one_char_per_week() {
+        // Width tracks the input length (the column is sized for up to
+        // ACTIVITY_WEEKS); a short young-repo history stays short.
+        assert_eq!(sparkline(Some(&[1, 2, 3, 4, 5])).chars().count(), 5);
+    }
+
+    #[test]
     fn gh_cells_renders_count_and_status_glyph() {
         let snap = GhSnapshot {
             open_pr_count: Some(5),
             ci_status: Some(CiStatus::Success),
+            weekly_commits: None,
         };
         let (pr, ci) = gh_cells(Some(&snap));
         assert_eq!(pr, "5");
@@ -2291,6 +2376,7 @@ mod tests {
         let snap = GhSnapshot {
             open_pr_count: Some(150),
             ci_status: None,
+            weekly_commits: None,
         };
         let (pr, _) = gh_cells(Some(&snap));
         assert_eq!(pr, "99+");
@@ -2303,6 +2389,7 @@ mod tests {
         let zero = GhSnapshot {
             open_pr_count: Some(0),
             ci_status: None,
+            weekly_commits: None,
         };
         let (pr_zero, _) = gh_cells(Some(&zero));
         let (pr_none, _) = gh_cells(None);
@@ -2323,6 +2410,7 @@ mod tests {
             let snap = GhSnapshot {
                 open_pr_count: None,
                 ci_status: Some(status),
+                weekly_commits: None,
             };
             let (_, ci) = gh_cells(Some(&snap));
             assert_eq!(ci, expected, "ci glyph for {status:?}");

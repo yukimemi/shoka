@@ -74,8 +74,10 @@ and `shoka cd` is "pull a volume off the shelf".
   `SHOKA_CD_OUT` sidechannel branch in `commands::cd::emit_path`).
   Scaffolding (`shoka new` = `gh repo create` + clone + kata init)
   — done (`commands::new`; reuses `clone::clone_and_record`, preset
-  from `--preset` / `[global.new].preset`). Still open: Profiles,
-  bulk org-move follow.
+  from `--preset` / `[global.new].preset`). Contribution-graph column
+  — done (`tui` activity sparkline from `gh.rs` weekly commit counts
+  via `/stats/commit_activity`, cached in `GhSnapshot.weekly_commits`).
+  Still open: Profiles, bulk org-move follow.
 
 ## Open design questions
 

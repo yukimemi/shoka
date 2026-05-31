@@ -628,6 +628,7 @@ mod tests {
         let populated = GhSnapshot {
             open_pr_count: Some(3),
             ci_status: Some(CiStatus::Success),
+            weekly_commits: None,
         };
 
         let mut c = Cache::default();
