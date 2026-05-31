@@ -198,9 +198,10 @@ flow through [`teravars`](https://github.com/yukimemi/teravars) so
 - **Phase 2 — TUI dashboard** ✅ `ratatui` + `crossterm` + `nucleo`
   fuzzy. Per-repo cached status (branch / ahead-behind / dirty)
   from `gix`, open PR count + CI status from `octocrab`. Done.
-- **Phase 3 — Polish.** Per-profile route overrides, scaffolding
-  via `shoka new`, bulk org-move follow, OSC 7 cwd hint,
-  contribution-graph column.
+- **Phase 3 — Polish.** OSC 7 cwd hint ✅ (`cd` / `tui` announce the
+  picked repo's dir so new tabs/splits inherit it). Still open:
+  per-profile route overrides, scaffolding via `shoka new`, bulk
+  org-move follow, contribution-graph column.
 
 ## Development
 

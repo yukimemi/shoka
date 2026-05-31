@@ -112,12 +112,23 @@ pub fn emit_path(path: &Path) -> Result<()> {
     let rendered = path.to_string_lossy();
     match std::env::var_os(CD_OUT_ENV) {
         Some(out) if !out.is_empty() => {
+            // Write the sidechannel path FIRST, then announce the cwd —
+            // ordering matters. The wrapper only runs its `cd` when this
+            // write succeeds and `emit_path` returns `Ok`; if the write
+            // fails we propagate the error and no chdir happens, so the
+            // OSC 7 hint must not have fired yet (else the terminal would
+            // believe it moved into a dir the shell never entered). The
+            // manual / stdout branch below deliberately stays silent:
+            // there a script is just capturing a path string and may
+            // never chdir, so announcing a cwd would be a lie.
             std::fs::write(&out, rendered.as_bytes()).with_context(|| {
                 format!(
                     "writing path to ${CD_OUT_ENV}={}",
                     Path::new(&out).display()
                 )
-            })
+            })?;
+            emit_osc7_cwd(path);
+            Ok(())
         }
         // Trailing newline only on the stdout path: command substitution
         // strips it, while the sidechannel reader doesn't expect one.
@@ -125,6 +136,105 @@ pub fn emit_path(path: &Path) -> Result<()> {
             println!("{rendered}");
             Ok(())
         }
+    }
+}
+
+/// Announce `path` to the terminal as the new working directory via
+/// an OSC 7 escape — `ESC ] 7 ; file://<host>/<path> ST`. Terminals
+/// that understand it (WezTerm, iTerm2, Kitty, Windows Terminal,
+/// VTE-based GNOME / Tilix, …) use the hint to open new tabs / splits
+/// already `cd`'d into the same repo. Terminals that don't simply
+/// ignore the unknown sequence, so this is harmless everywhere.
+///
+/// Best-effort and side-effect-only:
+///
+/// - Written to **stderr**, never stdout. In the manual `shoka cd`
+///   contract stdout carries the resolved path for `$(…)` capture and
+///   must stay byte-clean; stderr reaches the same TTY in every shell
+///   wrapper flow.
+/// - Skipped unless stderr is a real terminal, so the escape never
+///   leaks into a pipe / file when the caller redirected output.
+/// - The host is left empty (`file:///…`), which terminals read as
+///   "local". Emitting the real hostname would buy only marginal SSH
+///   disambiguation at the cost of a `gethostname` dependency; the
+///   empty-authority form is the widely-supported minimal shape.
+/// - Write / flush errors are swallowed: a failed cwd hint must never
+///   take down the actual `cd`.
+fn emit_osc7_cwd(path: &Path) {
+    use std::io::{IsTerminal, Write};
+
+    let mut stderr = std::io::stderr();
+    if !stderr.is_terminal() {
+        return;
+    }
+    let _ = write!(stderr, "{}", osc7_sequence(&file_url(path)));
+    let _ = stderr.flush();
+}
+
+/// Wrap a `file://` URL in the OSC 7 control sequence. The terminator
+/// is ST (`ESC \`), the spec-correct string terminator — preferred
+/// over the BEL (`\x07`) shorthand some emitters use.
+fn osc7_sequence(url: &str) -> String {
+    format!("\x1b]7;{url}\x1b\\")
+}
+
+/// Build a `file://` URL for `path` suitable for an OSC 7 hint.
+///
+/// A normal absolute path has its authority (host) omitted, yielding
+/// `file:///…`, which terminals read as the local machine. A Windows
+/// UNC path (`\\server\share\…`) normalises to a `//server/share/…`
+/// url-path whose leading `//` already *is* the authority, so it's
+/// joined as `file:<path>` (→ `file://server/share/…`) rather than
+/// the invalid four-slash `file:////server/…` a blind `file://`
+/// prefix would produce.
+fn file_url(path: &Path) -> String {
+    let url_path = to_url_path(&path.to_string_lossy());
+    if url_path.starts_with("//") {
+        // UNC: the `//server/share` prefix is already authority + path.
+        format!("file:{url_path}")
+    } else {
+        format!("file://{url_path}")
+    }
+}
+
+/// Normalise a filesystem path string into the path component of a
+/// `file://` URL: backslashes become forward slashes (so Windows
+/// `C:\a` → `/C:/a`), a single leading slash is guaranteed (Unix
+/// paths already have one; a Windows drive path gains one so the
+/// authority/path split is well-formed), and the result is
+/// percent-encoded.
+fn to_url_path(raw: &str) -> String {
+    let mut slashed = raw.replace('\\', "/");
+    if !slashed.starts_with('/') {
+        slashed.insert(0, '/');
+    }
+    percent_encode_path(&slashed)
+}
+
+/// Percent-encode a URL path. The path-structural `/` and the Windows
+/// drive `:` are kept literal along with the RFC 3986 unreserved set
+/// (`ALPHA DIGIT - . _ ~`); every other byte — spaces, and each byte
+/// of a multibyte UTF-8 char — becomes `%XX`.
+fn percent_encode_path(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'/' | b':') {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(hex_upper(b >> 4));
+            out.push(hex_upper(b & 0x0f));
+        }
+    }
+    out
+}
+
+/// Uppercase hex digit for a nibble (`0..=15`). Used by the
+/// percent-encoder; uppercase matches the RFC 3986 recommendation.
+fn hex_upper(nibble: u8) -> char {
+    match nibble {
+        0..=9 => (b'0' + nibble) as char,
+        _ => (b'A' + (nibble - 10)) as char,
     }
 }
 
@@ -340,6 +450,65 @@ mod tests {
         assert!(
             !rendered.starts_with('~'),
             "outside-home path must not tilde-shorten, got {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn percent_encode_keeps_path_structure_and_escapes_the_rest() {
+        // `/`, `:` and the unreserved set survive verbatim so the URL
+        // path stays readable; a space (the common offender) escapes.
+        assert_eq!(
+            percent_encode_path("/home/user/a-b._~/c"),
+            "/home/user/a-b._~/c"
+        );
+        assert_eq!(
+            percent_encode_path("/C:/Program Files"),
+            "/C:/Program%20Files"
+        );
+        // Each byte of a multibyte UTF-8 char is percent-encoded — a
+        // Japanese path must round-trip through a byte-wise encoder,
+        // not a char-wise one. `雪` is E9 9B AA in UTF-8.
+        assert_eq!(percent_encode_path("/雪"), "/%E9%9B%AA");
+    }
+
+    #[test]
+    fn to_url_path_normalises_unix_and_windows_shapes() {
+        // Unix path already absolute → untouched but for encoding.
+        assert_eq!(to_url_path("/home/u/a b"), "/home/u/a%20b");
+        // Windows path: backslashes → slashes, and a leading slash is
+        // prepended so the drive letter lands in the path, not the
+        // authority — `C:\Users\a b` → `/C:/Users/a%20b`.
+        assert_eq!(to_url_path(r"C:\Users\a b"), "/C:/Users/a%20b");
+    }
+
+    #[test]
+    fn file_url_and_osc7_sequence_have_the_expected_envelope() {
+        // Forward-slash input keeps this assertion platform-agnostic
+        // (no backslash branch), so it holds on the Linux CI runner
+        // and a Windows dev box alike.
+        let url = file_url(Path::new("/home/u/repo"));
+        assert_eq!(url, "file:///home/u/repo");
+        // OSC 7 envelope: `ESC ] 7 ; <url> ST`, ST = ESC `\`.
+        let seq = osc7_sequence(&url);
+        assert_eq!(seq, "\x1b]7;file:///home/u/repo\x1b\\");
+        assert!(seq.starts_with("\x1b]7;"), "must open with OSC 7: {seq:?}");
+        assert!(seq.ends_with("\x1b\\"), "must close with ST: {seq:?}");
+    }
+
+    #[test]
+    fn file_url_keeps_windows_unc_paths_well_formed() {
+        // A UNC path normalises to a `//server/share/…` url-path; the
+        // leading `//` is the authority, so the join must NOT add its
+        // own `//` (that yields the invalid `file:////server/…`). The
+        // host segment carries the server name: `file://server/share`.
+        assert_eq!(
+            file_url(Path::new(r"\\server\share\repo")),
+            "file://server/share/repo"
+        );
+        // A space in a UNC path still percent-encodes inside the path.
+        assert_eq!(
+            file_url(Path::new(r"\\nas\team share\repo")),
+            "file://nas/team%20share/repo"
         );
     }
 
