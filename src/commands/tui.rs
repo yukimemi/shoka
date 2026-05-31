@@ -48,7 +48,7 @@ use ratatui::{Terminal, prelude::Backend};
 use teravars::Engine;
 
 use crate::actions::{ActionKind, ActionOutcome, run_action};
-use crate::cache::Cache;
+use crate::cache::{Cache, current_unix_secs};
 use crate::cli::TuiArgs;
 
 /// Catppuccin Mocha palette, kept as `Color::Rgb` so the dashboard
@@ -87,7 +87,8 @@ use crate::commands::ShokaContext;
 use crate::commands::cd::emit_path;
 use crate::config::{ResolvedConfig, ShokaConfig};
 use crate::gh::{CiStatus, GhSnapshot};
-use crate::git_status::GitStatusSnapshot;
+use crate::git_status::{self, GitStatusSnapshot};
+use crate::paths::ShokaPaths;
 use crate::state::{Repo, Shelf};
 
 pub async fn run(ctx: &ShokaContext, args: TuiArgs) -> Result<()> {
@@ -127,7 +128,7 @@ pub async fn run(ctx: &ShokaContext, args: TuiArgs) -> Result<()> {
     }
 
     let own_owners = resolved.ui.own_owners.clone();
-    let mut app = App::new(rows, own_owners);
+    let mut app = App::new(rows, own_owners, ctx.paths.clone());
     let selection = run_app(&mut app)?;
 
     // After the alternate screen tears down, emit the path so the
@@ -143,11 +144,25 @@ pub async fn run(ctx: &ShokaContext, args: TuiArgs) -> Result<()> {
 #[derive(Debug, Clone)]
 struct DashRow {
     slug: String,
+    /// Host segment (the `<host>` in `<host>/<owner>/<name>`). Kept
+    /// alongside `owner` / `name` so a post-action status refresh can
+    /// rebuild the `(host, owner, name, path?)` cache identity without
+    /// re-splitting `slug`.
+    host: String,
     /// Bare owner segment (the `<owner>` in `<host>/<owner>/<name>`).
     /// Cached on construction so the mine-only filter doesn't
     /// re-split `slug` on every refilter pass.
     owner: String,
+    /// Name segment (the `<name>` in `<host>/<owner>/<name>`). Other
+    /// half of the cache identity, see `host`.
+    name: String,
     path: PathBuf,
+    /// The shelf [`Repo::path`] override (`None` for layout-derived
+    /// repos). This — not the resolved clone `path` above — is the
+    /// fourth component of the cache's `(host, owner, name, path?)`
+    /// identity key, so a post-action refresh writes the snapshot back
+    /// to the same row [`build_rows`] read it from.
+    repo_path: Option<PathBuf>,
     /// `slug` + " " + path-as-string, cached so the per-keystroke
     /// nucleo scorer in [`App::refilter`] has a single haystack to
     /// score against. Path is included because the dashboard now
@@ -202,8 +217,11 @@ fn build_rows(
         let search_key = format!("{slug} {}", path.display());
         out.push(DashRow {
             slug,
+            host: repo.host.clone(),
             owner: repo.owner.clone(),
+            name: repo.name.clone(),
             path,
+            repo_path: repo.path.clone(),
             search_key,
             tags_display: repo.tags.join(", "),
             status,
@@ -276,6 +294,11 @@ struct App {
     status_message: Option<String>,
     table_state: TableState,
     matcher: Matcher,
+    /// Resolved paths, kept so a post-action status refresh can write
+    /// the freshly-captured snapshot back to `cache.toml` for the one
+    /// repo that was acted on — no full-shelf walk, just the row the
+    /// user pressed `f` / `P` on.
+    paths: ShokaPaths,
 }
 
 /// Result of an `f` / `P` keystroke. Holds the captured stdout +
@@ -542,7 +565,7 @@ impl Drop for Picker {
 }
 
 impl App {
-    fn new(rows: Vec<DashRow>, own_owners: Vec<String>) -> Self {
+    fn new(rows: Vec<DashRow>, own_owners: Vec<String>, paths: ShokaPaths) -> Self {
         let mine_only = !own_owners.is_empty();
         // Same identity-order seed as before, then narrowed by
         // `mine_only` so the initial matches respect the configured
@@ -568,6 +591,7 @@ impl App {
             status_message: None,
             table_state,
             matcher: Matcher::default(),
+            paths,
         }
     }
 
@@ -1601,12 +1625,23 @@ fn run_action_for_selected(app: &mut App, kind: ActionKind) {
     });
 
     app.action_popup = Some(match result {
-        Ok(outcome) => ActionPopup {
-            kind,
-            repo_label,
-            outcome: Some(outcome),
-            error: String::new(),
-        },
+        Ok(outcome) => {
+            // The action ran (fetch / push — whatever `kind` was) and
+            // touched the local repo's git state: a fetch advances the
+            // `behind` count, a push zeroes `ahead`. Re-capture *just
+            // this row* so the dashboard's branch / ↑↓ / ✓ columns
+            // reflect the new reality the instant the popup is
+            // dismissed, and write it back to the cache so the next
+            // `shoka tui` / `list` agrees — without re-walking the
+            // whole shelf the way `cache refresh` does.
+            refresh_row_status_after_action(app, row_idx);
+            ActionPopup {
+                kind,
+                repo_label,
+                outcome: Some(outcome),
+                error: String::new(),
+            }
+        }
         Err(e) => ActionPopup {
             kind,
             repo_label,
@@ -1614,6 +1649,59 @@ fn run_action_for_selected(app: &mut App, kind: ActionKind) {
             error: format!("{e:#}"),
         },
     });
+}
+
+/// Re-capture the git status of the row at `row_idx` after a fetch /
+/// push and fold the fresh snapshot into both the in-memory row (so
+/// the redraw behind the action popup is already current) and the
+/// on-disk cache (so the change survives to the next run).
+///
+/// Scoped to the single acted-on repo by design: the user pressed
+/// `f` / `P` on *one* row, so re-running a full-shelf `cache refresh`
+/// would be wasteful — and slow on a large shelf. We rebuild the
+/// `(host, owner, name, path?)` identity from the row and `upsert`
+/// exactly that entry.
+///
+/// Best-effort: a capture or cache I/O failure is logged and
+/// swallowed. The action itself already succeeded and its popup is
+/// the user's primary feedback; a momentarily-stale status cell isn't
+/// worth surfacing an error popup over (the next background refresh
+/// will reconcile it regardless).
+fn refresh_row_status_after_action(app: &mut App, row_idx: usize) {
+    let path = app.rows[row_idx].path.clone();
+    let snapshot = match git_status::capture(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                target: "shoka",
+                "tui: post-action status capture failed for {}: {e:#}",
+                path.display()
+            );
+            return;
+        }
+    };
+
+    // In-memory first: cheapest path to a correct redraw, and it
+    // holds even if the cache write below fails.
+    app.rows[row_idx].status = Some(snapshot.clone());
+
+    let row = &app.rows[row_idx];
+    let mut repo = Repo::new(row.host.as_str(), row.owner.as_str(), row.name.as_str());
+    repo.path = row.repo_path.clone();
+
+    match Cache::load(&app.paths) {
+        Ok(mut cache) => {
+            let entry = cache.upsert(&repo);
+            entry.git_status = Some(snapshot);
+            entry.last_refreshed = Some(current_unix_secs());
+            if let Err(e) = cache.save(&app.paths) {
+                tracing::warn!(target: "shoka", "tui: cache save after action failed: {e:#}");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(target: "shoka", "tui: cache load after action failed: {e:#}");
+        }
+    }
 }
 
 /// Copy the selected row's slug (e.g. `github.com/owner/name`) to
@@ -2000,10 +2088,14 @@ mod tests {
             .map(|s| {
                 let path = PathBuf::from("/tmp");
                 let search_key = format!("{s} {}", path.display());
+                let (host, name) = host_name_from_slug(s);
                 DashRow {
                     slug: (*s).into(),
+                    host,
                     owner: owner_from_slug(s),
+                    name,
                     path,
+                    repo_path: None,
                     search_key,
                     tags_display: String::new(),
                     status: None,
@@ -2011,6 +2103,17 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    /// Split a `host/owner/name` slug into `(host, name)`, mirroring
+    /// [`owner_from_slug`]'s lenient fallback so malformed fixtures
+    /// don't panic — the cache-identity fields aren't what those
+    /// fixtures exercise.
+    fn host_name_from_slug(slug: &str) -> (String, String) {
+        let mut parts = slug.split('/');
+        let host = parts.next().unwrap_or("").to_string();
+        let name = slug.rsplit('/').next().unwrap_or("").to_string();
+        (host, name)
     }
 
     /// `rows()` variant that lets a test pin per-row `path` strings,
@@ -2021,10 +2124,14 @@ mod tests {
             .map(|(slug, path)| {
                 let path = PathBuf::from(path);
                 let search_key = format!("{slug} {}", path.display());
+                let (host, name) = host_name_from_slug(slug);
                 DashRow {
                     slug: (*slug).into(),
+                    host,
                     owner: owner_from_slug(slug),
+                    name,
                     path,
+                    repo_path: None,
                     search_key,
                     tags_display: String::new(),
                     status: None,
@@ -2039,7 +2146,27 @@ mod tests {
     /// the unscoped path, so funnelling them through this helper
     /// keeps their original semantics intact.
     fn app(rows: Vec<DashRow>) -> App {
-        App::new(rows, Vec::new())
+        App::new(rows, Vec::new(), test_paths())
+    }
+
+    /// Serializes every test in this module that reads or writes a
+    /// process-global environment variable through `ShokaPaths::
+    /// resolve`. `cargo test` runs tests on multiple threads, and a
+    /// concurrent getenv/setenv pair is a data race (UB — segfaults
+    /// or flaky failures), so any code path that touches the env must
+    /// hold this lock first.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Throwaway [`ShokaPaths`] for `App` construction in tests. The
+    /// tests that exercise post-action behaviour never reach a
+    /// successful capture (no-VCS temp dir / empty shelf), so these
+    /// paths are never actually written to — `resolve(None)` just
+    /// computes the OS default locations without creating anything.
+    /// Holds [`ENV_LOCK`] because `resolve` reads `SHOKA_CACHE_DIR` /
+    /// `SHOKA_STATE_DIR`, which another test may be mid-`set_var` on.
+    fn test_paths() -> ShokaPaths {
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        ShokaPaths::resolve(None).expect("resolve default paths for test")
     }
 
     #[test]
@@ -2374,7 +2501,7 @@ mod tests {
         // mine-only by default so the user sees their shelf first
         // (the headline behaviour change of this feature).
         let rows = rows(&["github.com/yukimemi/shoka", "github.com/rust-lang/rust"]);
-        let app = App::new(rows, vec!["yukimemi".into()]);
+        let app = App::new(rows, vec!["yukimemi".into()], test_paths());
         assert!(app.mine_only, "should default to mine when own_owners set");
         let matched_slugs: Vec<&str> = app
             .matches
@@ -2399,7 +2526,7 @@ mod tests {
     #[test]
     fn toggle_mine_only_flips_visible_set() {
         let rows = rows(&["github.com/yukimemi/shoka", "github.com/rust-lang/rust"]);
-        let mut app = App::new(rows, vec!["yukimemi".into()]);
+        let mut app = App::new(rows, vec!["yukimemi".into()], test_paths());
         // Default = mine; toggle exposes everything.
         app.toggle_mine_only();
         assert!(!app.mine_only);
@@ -2435,7 +2562,11 @@ mod tests {
         // Mixed-case configuration entries: prove matching folds
         // both directions (config-uppercase vs slug-lowercase, and
         // config-lowercase vs slug-uppercase).
-        let app = App::new(rows, vec!["YukimemI".into(), "rust-lang".into()]);
+        let app = App::new(
+            rows,
+            vec!["YukimemI".into(), "rust-lang".into()],
+            test_paths(),
+        );
         assert!(app.mine_only);
         let matched: Vec<&str> = app
             .matches
@@ -2470,7 +2601,7 @@ mod tests {
             "github.com/yukimemi/renri",
             "github.com/rust-lang/rust",
         ]);
-        let mut app = App::new(rows, vec!["yukimemi".into()]);
+        let mut app = App::new(rows, vec!["yukimemi".into()], test_paths());
         app.filter = "rust".into();
         app.refilter();
         // The only `rust` row is rust-lang/rust, which mine-only
@@ -2763,7 +2894,7 @@ mod tests {
             },
         };
 
-        let mut app = App::new(rows(&[]), Vec::new());
+        let mut app = App::new(rows(&[]), Vec::new(), test_paths());
         app.picker = Some(picker);
         assert!(app.picker.as_ref().unwrap().is_loading());
 
@@ -2850,8 +2981,11 @@ mod tests {
         let search_key = format!("local/test/repo {}", path.display());
         let row = DashRow {
             slug: "local/test/repo".into(),
+            host: "local".into(),
             owner: "test".into(),
+            name: "repo".into(),
             path,
+            repo_path: None,
             search_key,
             tags_display: String::new(),
             status: None,
@@ -2870,6 +3004,86 @@ mod tests {
         );
         assert_eq!(popup.kind, ActionKind::Fetch);
         assert_eq!(popup.repo_label, "local/test/repo");
+    }
+
+    #[test]
+    fn refresh_row_status_after_action_updates_row_and_cache() {
+        // The headline behaviour: after a fetch / push lands, the
+        // acted-on row's status must be re-captured *in memory* (so
+        // the dashboard redraw behind the popup is already current)
+        // *and* written back to `cache.toml` (so the next `shoka tui`
+        // / `list` agrees) — without re-walking the rest of the shelf.
+        use crate::cache::Cache;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        // A real (if empty) git repo so `git_status::capture` returns
+        // Ok rather than erroring out the way a bare temp dir would.
+        gix::init(&repo_root).expect("gix init");
+
+        // Redirect the cache file into the tempdir. The env var is set
+        // only across `resolve()` — `ShokaPaths` owns `cache_dir` once
+        // resolved, so later load/save don't re-read the env and the
+        // global mutation window stays as small as possible. Holding
+        // `ENV_LOCK` for that window serializes against any concurrent
+        // `test_paths()` resolve so the getenv/setenv pair isn't a
+        // data race under multi-threaded `cargo test`.
+        let cache_dir = tmp.path().join("cache");
+        let paths = {
+            let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = std::env::var_os("SHOKA_CACHE_DIR");
+            unsafe {
+                std::env::set_var("SHOKA_CACHE_DIR", &cache_dir);
+                let p = ShokaPaths::resolve(None).expect("resolve paths");
+                match &prev {
+                    Some(v) => std::env::set_var("SHOKA_CACHE_DIR", v),
+                    None => std::env::remove_var("SHOKA_CACHE_DIR"),
+                }
+                p
+            }
+        };
+
+        let search_key = format!("github.com/yukimemi/repo {}", repo_root.display());
+        let row = DashRow {
+            slug: "github.com/yukimemi/repo".into(),
+            host: "github.com".into(),
+            owner: "yukimemi".into(),
+            name: "repo".into(),
+            path: repo_root.clone(),
+            repo_path: None,
+            search_key,
+            tags_display: String::new(),
+            status: None,
+            gh: None,
+        };
+        let mut app = App::new(vec![row], Vec::new(), paths.clone());
+        assert!(
+            app.rows[0].status.is_none(),
+            "precondition: no snapshot yet"
+        );
+
+        refresh_row_status_after_action(&mut app, 0);
+
+        assert!(
+            app.rows[0].status.is_some(),
+            "row status must be recaptured in memory so the redraw is current"
+        );
+
+        let cache = Cache::load(&paths).expect("load cache");
+        let entry = cache
+            .find("github.com", "yukimemi", "repo", None)
+            .expect("cache entry written for the acted-on repo");
+        assert!(
+            entry.git_status.is_some(),
+            "git_status must be persisted for the next run"
+        );
+        assert!(
+            entry.last_refreshed.is_some(),
+            "last_refreshed must be stamped so the TTL logic sees a fresh entry"
+        );
+        // Only the acted-on repo is touched — no full-shelf walk.
+        assert_eq!(cache.len(), 1, "exactly one repo's cache entry written");
     }
 
     #[test]
