@@ -48,7 +48,29 @@ pub struct GhSnapshot {
     /// silently dropping an unknown value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ci_status: Option<CiStatus>,
+
+    /// Recent weekly commit counts, oldest → newest, for the TUI
+    /// activity sparkline (at most [`ACTIVITY_WEEKS`] entries). `None`
+    /// means "not captured" — non-github host, no token, an API
+    /// error, or GitHub still computing the stat (the
+    /// `/stats/commit_activity` endpoint returns `202` with an empty
+    /// body on a cold cache). The TUI renders that as `-`, distinct
+    /// from a genuine all-zero (dormant) history.
+    ///
+    /// Additive `Option` field: an older cache loads it as `None` and
+    /// self-heals on the next `cache refresh`, so no `CACHE_VERSION`
+    /// bump is needed — that rule is for new `CiStatus` variants an
+    /// older reader couldn't parse, not for new optional fields it
+    /// can default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly_commits: Option<Vec<u32>>,
 }
+
+/// How many trailing weeks of commit activity [`capture_snapshot`]
+/// keeps for the sparkline. Twelve weeks (~3 months) reads a repo's
+/// recent rhythm without widening the dashboard column — and it's the
+/// width the TUI renders.
+pub const ACTIVITY_WEEKS: usize = 12;
 
 /// Workflow-run conclusion glyph the TUI cares about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,10 +152,56 @@ pub fn build_client(token: &str) -> Result<Octocrab> {
 pub async fn capture_snapshot(client: &Octocrab, owner: &str, name: &str) -> Result<GhSnapshot> {
     let open_pr_count = open_pr_count(client, owner, name).await?;
     let ci_status = latest_ci_status(client, owner, name).await?;
+    // Best-effort, unlike the PR/CI calls above: the activity
+    // sparkline is a softer signal, and `/stats/commit_activity` 202s
+    // (empty body) while GitHub warms the stat cache. Swallowing the
+    // error to `None` keeps a cold-cache 202 from blanking the whole
+    // snapshot — the graph fills in on a later refresh once the stat
+    // is ready. `.ok().flatten()` collapses both "errored" and "no
+    // data yet" to `None`.
+    let weekly_commits = recent_weekly_commits(client, owner, name)
+        .await
+        .ok()
+        .flatten();
     Ok(GhSnapshot {
         open_pr_count: Some(open_pr_count),
         ci_status,
+        weekly_commits,
     })
+}
+
+/// One element of `/stats/commit_activity` — a single week. Only
+/// `total` is read (the per-day `days` array and `week` timestamp are
+/// ignored), same minimal-struct discipline as [`RunMinimal`].
+#[derive(Debug, Clone, serde::Deserialize)]
+struct WeekActivity {
+    total: u32,
+}
+
+/// Trailing [`ACTIVITY_WEEKS`] weeks of commit counts (oldest →
+/// newest) from `/repos/{owner}/{name}/stats/commit_activity`.
+///
+/// GitHub computes this stat asynchronously: a request against a cold
+/// cache returns `202 Accepted` with an empty body while it builds,
+/// which octocrab surfaces as a deserialise error — the caller
+/// swallows that to `None` and retries next refresh. A warm `200`
+/// with `[]` (a repo with no commit history yet) likewise maps to
+/// `None` so the TUI shows "no data" rather than a flat dormant bar
+/// for a repo we simply haven't measured.
+async fn recent_weekly_commits(
+    client: &Octocrab,
+    owner: &str,
+    name: &str,
+) -> Result<Option<Vec<u32>>> {
+    let route = format!("/repos/{owner}/{name}/stats/commit_activity");
+    let weeks: Vec<WeekActivity> = client.get(route, None::<&()>).await?;
+    if weeks.is_empty() {
+        return Ok(None);
+    }
+    // Keep the last ACTIVITY_WEEKS, preserving oldest → newest order.
+    let start = weeks.len().saturating_sub(ACTIVITY_WEEKS);
+    let tail = weeks[start..].iter().map(|w| w.total).collect();
+    Ok(Some(tail))
 }
 
 async fn open_pr_count(client: &Octocrab, owner: &str, name: &str) -> Result<usize> {
@@ -479,6 +547,7 @@ mod tests {
         let snap = GhSnapshot {
             open_pr_count: Some(3),
             ci_status: Some(CiStatus::Failure),
+            weekly_commits: Some(vec![0, 1, 4, 2, 7]),
         };
         let s = toml::to_string(&snap).unwrap();
         let parsed: GhSnapshot = toml::from_str(&s).unwrap();
@@ -490,6 +559,7 @@ mod tests {
         let empty = GhSnapshot {
             open_pr_count: None,
             ci_status: None,
+            weekly_commits: None,
         };
         let s = toml::to_string(&empty).unwrap();
         let parsed: GhSnapshot = toml::from_str(&s).unwrap();
@@ -501,6 +571,10 @@ mod tests {
         assert!(
             !s.contains("ci_status"),
             "None ci_status shouldn't serialise, got: {s}"
+        );
+        assert!(
+            !s.contains("weekly_commits"),
+            "None weekly_commits shouldn't serialise, got: {s}"
         );
     }
 
@@ -554,6 +628,7 @@ mod tests {
         let s = toml::to_string(&GhSnapshot {
             open_pr_count: None,
             ci_status: Some(CiStatus::Success),
+            weekly_commits: None,
         })
         .unwrap();
         assert!(s.contains("\"success\""), "wire format = lowercase: {s}");
