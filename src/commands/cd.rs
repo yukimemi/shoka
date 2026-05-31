@@ -78,9 +78,10 @@ pub async fn run(ctx: &ShokaContext, args: CdArgs) -> Result<()> {
         );
     }
 
+    let page_size = resolved.ui.cd_page_size;
     let chosen = match args.repo.as_deref() {
-        Some(hint) => choose_by_hint(&tag_filtered, hint)?,
-        None => fuzzy_pick(&tag_filtered, "cd to:")?,
+        Some(hint) => choose_by_hint(&tag_filtered, hint, page_size)?,
+        None => fuzzy_pick(&tag_filtered, "cd to:", page_size)?,
     };
 
     let path = resolved.clone_path_for_one(chosen)?;
@@ -130,7 +131,7 @@ pub fn emit_path(path: &Path) -> Result<()> {
 /// Match `hint` against the candidate slugs (case-insensitive
 /// substring). One hit ⇒ return it directly. Multiple ⇒ open a
 /// fuzzy picker pre-seeded with the narrowed set. Zero ⇒ error out.
-fn choose_by_hint<'a>(candidates: &[&'a Repo], hint: &str) -> Result<&'a Repo> {
+fn choose_by_hint<'a>(candidates: &[&'a Repo], hint: &str, page_size: usize) -> Result<&'a Repo> {
     let hint_lc = hint.to_lowercase();
     let matches: Vec<&'a Repo> = candidates
         .iter()
@@ -144,7 +145,11 @@ fn choose_by_hint<'a>(candidates: &[&'a Repo], hint: &str) -> Result<&'a Repo> {
              try `shoka list` to see what's there"
         ),
         1 => Ok(matches[0]),
-        _ => fuzzy_pick(&matches, &format!("multiple matches for `{hint}`:")),
+        _ => fuzzy_pick(
+            &matches,
+            &format!("multiple matches for `{hint}`:"),
+            page_size,
+        ),
     }
 }
 
@@ -160,7 +165,10 @@ fn choose_by_hint<'a>(candidates: &[&'a Repo], hint: &str) -> Result<&'a Repo> {
 /// with `$HOME` tilde-shortened. Path-less entries (laid out by
 /// `shoka clone` against the configured layout) render slug only,
 /// matching the historic look.
-fn fuzzy_pick<'a>(candidates: &[&'a Repo], prompt: &str) -> Result<&'a Repo> {
+///
+/// `page_size` is the number of rows shown at once, sourced from
+/// `[global.ui].cd_page_size` (floored at 1 by the config resolver).
+fn fuzzy_pick<'a>(candidates: &[&'a Repo], prompt: &str, page_size: usize) -> Result<&'a Repo> {
     if candidates.is_empty() {
         // Defensive: callers already filter to non-empty, but in case
         // a future caller forgets, surface the empty-case explicitly.
@@ -184,7 +192,11 @@ fn fuzzy_pick<'a>(candidates: &[&'a Repo], prompt: &str) -> Result<&'a Repo> {
     }
 
     let items: Vec<RepoItem<'a>> = candidates.iter().copied().map(RepoItem).collect();
+    // `page_size` controls how many rows the picker shows at once.
+    // Configurable via `[global.ui].cd_page_size`; the resolver floors
+    // it at 1 so inquire (which panics on a zero page size) is safe.
     let chosen = Select::new(prompt, items)
+        .with_page_size(page_size)
         .prompt()
         .context("repo selection cancelled")?;
     Ok(chosen.0)
@@ -242,11 +254,11 @@ mod tests {
         let candidates: Vec<&Repo> = vec![&a, &b, &c];
 
         // Unique substring match → returns the unique candidate.
-        let picked = choose_by_hint(&candidates, "ren").unwrap();
+        let picked = choose_by_hint(&candidates, "ren", 15).unwrap();
         assert_eq!(picked.name, "renri");
 
         // Case-insensitive — uppercase hint still matches.
-        let picked = choose_by_hint(&candidates, "RENRI").unwrap();
+        let picked = choose_by_hint(&candidates, "RENRI", 15).unwrap();
         assert_eq!(picked.name, "renri");
     }
 
@@ -254,7 +266,7 @@ mod tests {
     fn hint_with_zero_matches_errors_cleanly() {
         let a = r("shoka");
         let candidates: Vec<&Repo> = vec![&a];
-        let err = choose_by_hint(&candidates, "no-such-thing").unwrap_err();
+        let err = choose_by_hint(&candidates, "no-such-thing", 15).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("no repos on the shelf match"),
@@ -270,7 +282,7 @@ mod tests {
         let a = r_owned("rust-org", "alpha");
         let b = r_owned("other-org", "beta");
         let candidates: Vec<&Repo> = vec![&a, &b];
-        let picked = choose_by_hint(&candidates, "rust-org").unwrap();
+        let picked = choose_by_hint(&candidates, "rust-org", 15).unwrap();
         assert_eq!(picked.name, "alpha");
     }
 
