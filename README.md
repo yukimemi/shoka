@@ -76,6 +76,7 @@ shoka exec --tag rust -- cargo check
 | Command | What it does |
 | :--- | :--- |
 | `shoka clone <spec>` | Clone a repo via `gix` (or `jj git clone` when `vcs = jj`). Accepts full URLs, `owner/name`, or `host/owner/name`. |
+| `shoka new [owner/name]` | Scaffold a new repo: `gh repo create` (public by default; `--private` to opt out) + clone onto the shelf + optional `kata init` (preset from `--preset` or `[global.new].preset`; `--no-kata` to skip). |
 | `shoka import <dir>` | Walk a directory, find existing `.git/` repos, and adopt them onto the shelf. |
 | `shoka list` | Print the shelf with optional `--tag` / `--has-agents` filters. |
 | `shoka cd [hint]` | Resolve a repo to its on-disk path (use the shell wrapper to actually `cd`). |
@@ -199,9 +200,10 @@ flow through [`teravars`](https://github.com/yukimemi/teravars) so
   fuzzy. Per-repo cached status (branch / ahead-behind / dirty)
   from `gix`, open PR count + CI status from `octocrab`. Done.
 - **Phase 3 — Polish.** OSC 7 cwd hint ✅ (`cd` / `tui` announce the
-  picked repo's dir so new tabs/splits inherit it). Still open:
-  per-profile route overrides, scaffolding via `shoka new`, bulk
-  org-move follow, contribution-graph column.
+  picked repo's dir so new tabs/splits inherit it). `shoka new`
+  scaffolding ✅ (`gh repo create` + clone + `kata init`). Still open:
+  per-profile route overrides, bulk org-move follow,
+  contribution-graph column.
 
 ## Development
 
