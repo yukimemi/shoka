@@ -116,6 +116,11 @@ pub struct UiConfig {
     /// is non-empty and offers `m` to toggle back to the full shelf;
     /// empty = no default filter and the toggle is hidden.
     pub own_owners: Vec<String>,
+    /// Number of candidate rows the `shoka cd` fuzzy picker shows at
+    /// once (inquire's "page size"). Larger values fill more of the
+    /// terminal, so fewer scrolls to find a repo. Floored at 1 by the
+    /// loader — inquire panics on a zero page size.
+    pub cd_page_size: usize,
 }
 
 impl Default for UiConfig {
@@ -124,6 +129,10 @@ impl Default for UiConfig {
             status_cache_ttl_secs: 60,
             tui_refresh_ms: 250,
             own_owners: Vec::new(),
+            // inquire's own default is 7, which barely fills a modern
+            // terminal. 15 is a roomier baseline that still fits an
+            // 80x24 window with the prompt + help line.
+            cd_page_size: 15,
         }
     }
 }
@@ -515,7 +524,12 @@ impl ShokaConfig {
             // and tokio::JoinSet sizing, where 0 typically panics or
             // deadlocks. 1 is the smallest safe sequential value.
             exec_concurrency: prof.exec_concurrency.unwrap_or(g.exec_concurrency).max(1),
-            ui: g.ui.clone(),
+            // Floor cd_page_size at 1 — inquire panics on a zero page
+            // size, same defensive flooring as exec_concurrency.
+            ui: UiConfig {
+                cd_page_size: g.ui.cd_page_size.max(1),
+                ..g.ui.clone()
+            },
             shell: g.shell.clone(),
             // Mirror the exec_concurrency reasoning: a configured
             // `parallel_repos = 0` would otherwise hand a zero-sized
@@ -734,6 +748,8 @@ root = "~/src"
 # # Owners treated as "yours" in the TUI. When non-empty the dashboard
 # # launches in mine-only mode and `m` toggles between mine and all.
 # own_owners = ["yukimemi"]
+# # Rows the `shoka cd` fuzzy picker shows at once (default 15).
+# cd_page_size = 15
 
 # [global.shell]
 # cd_command_name = "s"
@@ -1323,6 +1339,50 @@ exec_concurrency = 32
             err.to_string().contains("root"),
             "error should mention the missing root: {err}"
         );
+    }
+
+    #[test]
+    fn cd_page_size_parses_and_floors_at_one() {
+        // A user-set value round-trips through resolve …
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("config.toml"),
+            r#"
+[global]
+root = "/r"
+
+[global.ui]
+cd_page_size = 30
+"#,
+        )
+        .unwrap();
+        let cfg = ShokaConfig::load(&paths_at(tmp.path())).expect("load");
+        assert_eq!(cfg.global.ui.cd_page_size, 30);
+        let resolved = cfg.resolve(None).expect("resolve");
+        assert_eq!(resolved.ui.cd_page_size, 30);
+
+        // … and a zero is floored to 1 (inquire panics on 0).
+        let zeroed = ShokaConfig {
+            global: GlobalConfig {
+                root: Some("/r".into()),
+                ui: UiConfig {
+                    cd_page_size: 0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .resolve(None)
+        .expect("resolve");
+        assert_eq!(zeroed.ui.cd_page_size, 1);
+    }
+
+    #[test]
+    fn cd_page_size_defaults_to_fifteen() {
+        // Guards the documented default so a starter-config user gets
+        // the roomier picker without setting anything.
+        assert_eq!(UiConfig::default().cd_page_size, 15);
     }
 
     #[test]
