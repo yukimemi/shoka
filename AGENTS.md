@@ -72,8 +72,10 @@ and `shoka cd` is "pull a volume off the shelf".
 - **Phase 3 — Polish & power features.** OSC 7 cwd hint for
   terminals that support it — done (`cd` / `tui` emit it via the
   `SHOKA_CD_OUT` sidechannel branch in `commands::cd::emit_path`).
-  Still open: Profiles, scaffolding (`shoka new` = `gh repo create`
-  + clone + kata init), bulk org-move follow.
+  Scaffolding (`shoka new` = `gh repo create` + clone + kata init)
+  — done (`commands::new`; reuses `clone::clone_and_record`, preset
+  from `--preset` / `[global.new].preset`). Still open: Profiles,
+  bulk org-move follow.
 
 ## Open design questions
 

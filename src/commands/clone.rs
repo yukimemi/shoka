@@ -51,7 +51,7 @@ use owo_colors::OwoColorize;
 
 use crate::cli::CloneArgs;
 use crate::commands::ShokaContext;
-use crate::config::{ShokaConfig, VcsDefault};
+use crate::config::{ResolvedConfig, ShokaConfig, VcsDefault};
 use crate::gh;
 use crate::remote::parse_clone_input;
 use crate::state::{Repo, Shelf};
@@ -63,7 +63,29 @@ pub async fn run(ctx: &ShokaContext, args: CloneArgs) -> Result<()> {
         None => prompt_for_input(&cfg.ui.own_owners).await?,
     };
 
-    let (parts, url) = parse_clone_input(&input, &cfg.default_host, cfg.default_protocol)?;
+    clone_and_record(ctx, &cfg, &input).await?;
+
+    println!("{} done", "clone:".bold());
+    Ok(())
+}
+
+/// Parse `input`, clone it into the configured layout path, and record
+/// it on the shelf. The reusable core shared by `shoka clone` and
+/// `shoka new` — both end up needing the exact same "resolve a spec to
+/// a destination, fetch it, remember it" sequence, so it lives in one
+/// place to keep their path/routing/shelf behaviour identical.
+///
+/// Returns the recorded [`Repo`] (its resolved `host/owner/name`) so
+/// callers like `new` can report or post-process it (e.g. hand the
+/// clone path to `kata init`). Prints the `clone: <slug> → <dest>`
+/// progress line but NOT the trailing `done` — that's the caller's to
+/// emit, since `new` has its own multi-step completion message.
+pub async fn clone_and_record(
+    ctx: &ShokaContext,
+    cfg: &ResolvedConfig,
+    input: &str,
+) -> Result<Repo> {
+    let (parts, url) = parse_clone_input(input, &cfg.default_host, cfg.default_protocol)?;
 
     let repo = Repo::new(parts.host, parts.owner, parts.name);
     let dest = cfg.clone_path_for_one(&repo)?;
@@ -111,12 +133,13 @@ pub async fn run(ctx: &ShokaContext, args: CloneArgs) -> Result<()> {
             repo.slug()
         );
     } else {
-        shelf.add(repo).context("recording cloned repo on shelf")?;
+        shelf
+            .add(repo.clone())
+            .context("recording cloned repo on shelf")?;
         shelf.save(&ctx.paths)?;
     }
 
-    println!("{} done", "clone:".bold());
-    Ok(())
+    Ok(repo)
 }
 
 /// Interactive flow when the user calls `shoka clone` with no arg.

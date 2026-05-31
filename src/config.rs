@@ -70,6 +70,7 @@ pub struct GlobalConfig {
     pub ui: UiConfig,
     pub shell: ShellConfig,
     pub cache: CacheConfig,
+    pub new: NewConfig,
 }
 
 impl Default for GlobalConfig {
@@ -85,8 +86,27 @@ impl Default for GlobalConfig {
             ui: UiConfig::default(),
             shell: ShellConfig::default(),
             cache: CacheConfig::default(),
+            new: NewConfig::default(),
         }
     }
+}
+
+/// `[global.new]` — defaults for the `shoka new` scaffolding command.
+///
+/// Kept under `[global]` (not profile-overridable) because the
+/// scaffolding preset is a workflow-wide choice, not a per-workspace
+/// one — the same `pj-presets` template applies regardless of which
+/// `root` a profile points at.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NewConfig {
+    /// kata preset spec applied after create + clone, e.g.
+    /// `github.com/yukimemi/pj-presets:rust-cli`. When unset *and* no
+    /// `--preset` is passed, `shoka new` skips the kata step and just
+    /// creates + clones. The `--preset` CLI flag overrides this for a
+    /// single invocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -753,6 +773,12 @@ root = "~/src"
 
 # [global.shell]
 # cd_command_name = "s"
+
+# [global.new]
+# # kata preset spec `shoka new` applies after creating + cloning a
+# # repo. Overridable per-run with `--preset`; omit (and pass no
+# # --preset) to skip the kata step entirely.
+# preset = "github.com/yukimemi/pj-presets:rust-cli"
 
 # Routes — evaluated top-to-bottom at clone time; first hit wins.
 # Pattern syntax:

@@ -11,6 +11,7 @@ pub mod export;
 pub mod import;
 pub mod init_shell;
 pub mod list;
+pub mod new;
 pub mod note;
 pub mod prune;
 pub mod set;
@@ -50,6 +51,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
 
     let result = match cmd {
         Command::Clone(a) => clone::run(&ctx, a).await,
+        Command::New(a) => new::run(&ctx, a).await,
         Command::List(a) => list::run(&ctx, a).await,
         Command::Cd(a) => cd::run(&ctx, a).await,
         Command::Exec(a) => exec::run(&ctx, a).await,

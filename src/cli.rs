@@ -28,6 +28,9 @@ pub enum Command {
     /// Clone a repository (no arg ⇒ fuzzy-select from your gh repos).
     Clone(CloneArgs),
 
+    /// Scaffold a new repo: `gh repo create` + clone + optional kata init.
+    New(NewArgs),
+
     /// List repos on the shelf.
     List(ListArgs),
 
@@ -126,6 +129,37 @@ pub enum CacheCommand {
 pub struct CloneArgs {
     /// Repository URL or `owner/name`. Omitted ⇒ fuzzy-select.
     pub url: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct NewArgs {
+    /// New repo as `owner/name` or just `name` (owner defaults to
+    /// `[global.ui].own_owners[0]`, else your gh login). Omitted ⇒
+    /// prompt for the name interactively.
+    pub spec: Option<String>,
+
+    /// Create the GitHub repo private. Default is public (this repo's
+    /// `shoka new` is OSS-first); `gh repo create` itself requires an
+    /// explicit visibility, which shoka supplies from this flag.
+    #[arg(long)]
+    pub private: bool,
+
+    /// Repository description passed to `gh repo create`.
+    #[arg(long, value_name = "TEXT")]
+    pub description: Option<String>,
+
+    /// kata preset spec to scaffold with, overriding
+    /// `[global.new].preset` for this run (e.g.
+    /// `github.com/yukimemi/pj-presets:rust-cli`). Omitted ⇒ use the
+    /// configured preset, or skip kata when neither is set.
+    #[arg(long, value_name = "SPEC")]
+    pub preset: Option<String>,
+
+    /// Skip the kata scaffolding step even if a preset is configured.
+    /// Use when you just want the create + clone and will scaffold by
+    /// hand later.
+    #[arg(long)]
+    pub no_kata: bool,
 }
 
 #[derive(Debug, Args)]
