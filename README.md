@@ -180,6 +180,16 @@ root = "~/src"
 | `default_host` | `"github.com"` | Host assumed when a spec omits it (e.g. `owner/name`). |
 | `default_profile` | _(none)_ | Profile used when neither `--profile` nor `$SHOKA_PROFILE` is set. |
 | `exec_concurrency` | `8` | Max parallel jobs for `shoka exec`. Floored at 1. |
+| `auto_update` | `"install"` | Background auto-update behaviour. `"install"` (default) silently downloads + swaps the binary in the background; the new version applies on the next launch. `"notify"` only prints a one-line banner to stderr pointing at `shoka self-update` and never installs. `"off"` disables it entirely. Network / lock / config failures are silently swallowed. Overridden by the `SHOKA_NO_AUTOUPDATE` env var (see below). |
+| `update_check_interval` | `"24h"` | Minimum interval between background update checks. Humantime format (`"24h"`, `"12h"`, `"30m"`, `"1d"`). The last-check timestamp is persisted under the cache dir at `last_update_check.json`. Invalid values fall back to `"24h"`. |
+
+> **Disabling auto-update without editing config.** Set the
+> `SHOKA_NO_AUTOUPDATE` environment variable to any non-empty value
+> other than `0` / `false` to force background auto-update off
+> regardless of `auto_update`. This takes precedence over the config
+> and is handy for CI, packaged installs, or locked-down environments.
+> Development builds (`cargo run`, anything under `target/`) are never
+> auto-updated.
 
 #### `[global.ui]`
 
@@ -243,6 +253,8 @@ default_host = "github.com"
 default_protocol = "https"
 default_vcs = "auto"
 exec_concurrency = 8
+auto_update = "install"           # "off" | "notify" | "install"
+update_check_interval = "24h"
 
 [global.ui]
 own_owners = ["yukimemi"]
