@@ -71,6 +71,17 @@ pub struct GlobalConfig {
     pub shell: ShellConfig,
     pub cache: CacheConfig,
     pub new: NewConfig,
+    /// Background auto-update behaviour (`off` / `notify` / `install`).
+    /// Defaults to `install` (opt-out silent install). Overridden by
+    /// the `SHOKA_NO_AUTOUPDATE` env kill-switch.
+    #[serde(default)]
+    pub auto_update: AutoUpdateMode,
+    /// Minimum interval between background update checks, as a
+    /// humantime-ish string (e.g. `"24h"`, `"12h"`). Parsed via
+    /// [`kaishin::parse_interval`]; falls back to
+    /// [`kaishin::default_interval`] when unset or unparseable.
+    #[serde(default)]
+    pub update_check_interval: Option<String>,
 }
 
 impl Default for GlobalConfig {
@@ -87,7 +98,24 @@ impl Default for GlobalConfig {
             shell: ShellConfig::default(),
             cache: CacheConfig::default(),
             new: NewConfig::default(),
+            // Keep the parse-path (serde default) and the
+            // direct-construct path (this `Default`) in agreement:
+            // both must resolve to `Install`.
+            auto_update: AutoUpdateMode::default(),
+            update_check_interval: None,
         }
+    }
+}
+
+impl GlobalConfig {
+    /// Resolve the effective auto-update mode.
+    ///
+    /// shoka has no pre-existing `auto_update` boolean to reconcile,
+    /// so this is a trivial passthrough today. The method exists for
+    /// parity with the rest of the yukimemi/* fleet and to centralise
+    /// any future env / alias interplay in one place.
+    pub fn update_mode(&self) -> AutoUpdateMode {
+        self.auto_update
     }
 }
 
@@ -124,6 +152,29 @@ pub enum Protocol {
     #[default]
     Https,
     Ssh,
+}
+
+/// Background auto-update behaviour.
+///
+/// Mirrors the opt-out silent-install design shared by the yukimemi/*
+/// CLI fleet (rvpm / renri / …):
+///
+/// - `Off` — never check or install in the background.
+/// - `Notify` — check for a newer release and print a one-line banner;
+///   never download or swap the binary.
+/// - `Install` (default) — silently download + swap the binary in the
+///   background. The running process keeps the old binary; the new
+///   version applies on the next launch.
+///
+/// The `SHOKA_NO_AUTOUPDATE` env kill-switch takes precedence over
+/// this setting — see [`crate::updater::auto_update_disabled_by_env`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AutoUpdateMode {
+    Off,
+    Notify,
+    #[default]
+    Install,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -389,6 +440,13 @@ pub struct ResolvedConfig {
     /// routes don't get a chance to override (the user picked the
     /// profile, so honour it).
     pub profile_provided_root: bool,
+    /// Resolved background auto-update mode (carried verbatim from
+    /// `[global].auto_update`; not profile-overridable). Read by the
+    /// dispatcher to decide whether to spawn a background check.
+    pub auto_update: AutoUpdateMode,
+    /// Resolved `[global].update_check_interval` (carried verbatim).
+    /// Parsed by the dispatcher via [`kaishin::parse_interval`].
+    pub update_check_interval: Option<String>,
     pub raw: ShokaConfig,
 }
 
@@ -562,6 +620,10 @@ impl ShokaConfig {
             git_config: prof.git_config.clone(),
             active_profile,
             profile_provided_root,
+            // Auto-update is a workflow-wide concern, not profile-
+            // overridable: carry the `[global]` values verbatim.
+            auto_update: g.update_mode(),
+            update_check_interval: g.update_check_interval.clone(),
             raw: self,
         })
     }
@@ -761,6 +823,15 @@ root = "~/src"
 # default_host = "github.com"
 # default_profile = "personal"
 # exec_concurrency = 8
+
+# Background auto-update. By default shoka silently downloads + swaps
+# its own binary in the background (the new version applies on the
+# next launch). Set "notify" to only print a one-line banner, or
+# "off" to disable entirely. The SHOKA_NO_AUTOUPDATE env var (set to
+# any non-empty value other than "0" / "false") overrides this and
+# disables background auto-update regardless of the config.
+# auto_update = "install"            # "off" | "notify" | "install"
+# update_check_interval = "24h"      # min interval between checks
 
 # [global.ui]
 # status_cache_ttl_secs = 60
@@ -1551,7 +1622,104 @@ default_host = "gitlab.com"
         assert_eq!(cfg.global.root.as_deref(), Some("~/src"));
         assert_eq!(cfg.global.default_vcs, VcsDefault::Auto);
         assert_eq!(cfg.global.default_host, "github.com");
+        // auto_update keys stay commented in the starter, so the
+        // opt-out default (silent install) is what a fresh user gets.
+        assert_eq!(cfg.global.auto_update, AutoUpdateMode::Install);
+        assert_eq!(cfg.global.update_check_interval, None);
     }
+
+    // --- auto_update ----------------------------------------------
+
+    #[test]
+    fn auto_update_mode_default_is_install() {
+        // The Default impl and serde's #[default] must agree: both
+        // resolve to Install (the opt-out silent-install design).
+        assert_eq!(AutoUpdateMode::default(), AutoUpdateMode::Install);
+        assert_eq!(GlobalConfig::default().auto_update, AutoUpdateMode::Install);
+        assert_eq!(
+            GlobalConfig::default().update_mode(),
+            AutoUpdateMode::Install
+        );
+    }
+
+    #[test]
+    fn auto_update_defaults_to_install_when_key_absent() {
+        // Parse path: a config with no auto_update key must still
+        // resolve to Install, matching the direct-construct default.
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("config.toml"),
+            r#"
+[global]
+root = "/r"
+"#,
+        )
+        .unwrap();
+        let cfg = ShokaConfig::load(&paths_at(tmp.path())).expect("load");
+        assert_eq!(cfg.global.auto_update, AutoUpdateMode::Install);
+        assert_eq!(cfg.global.update_check_interval, None);
+        // And it carries through resolve() onto ResolvedConfig.
+        let resolved = cfg.resolve(None).expect("resolve");
+        assert_eq!(resolved.auto_update, AutoUpdateMode::Install);
+        assert_eq!(resolved.update_check_interval, None);
+    }
+
+    #[test]
+    fn auto_update_parses_each_mode() {
+        for (raw, expected) in [
+            ("off", AutoUpdateMode::Off),
+            ("notify", AutoUpdateMode::Notify),
+            ("install", AutoUpdateMode::Install),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            fs::write(
+                tmp.path().join("config.toml"),
+                format!(
+                    r#"
+[global]
+root = "/r"
+auto_update = "{raw}"
+"#
+                ),
+            )
+            .unwrap();
+            let cfg = ShokaConfig::load(&paths_at(tmp.path())).expect("load");
+            assert_eq!(
+                cfg.global.auto_update, expected,
+                "auto_update = \"{raw}\" should parse to {expected:?}"
+            );
+            assert_eq!(cfg.global.update_mode(), expected);
+        }
+    }
+
+    #[test]
+    fn update_check_interval_parses_and_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("config.toml"),
+            r#"
+[global]
+root = "/r"
+auto_update = "notify"
+update_check_interval = "12h"
+"#,
+        )
+        .unwrap();
+        let cfg = ShokaConfig::load(&paths_at(tmp.path())).expect("load");
+        assert_eq!(cfg.global.auto_update, AutoUpdateMode::Notify);
+        assert_eq!(
+            cfg.global.update_check_interval.as_deref(),
+            Some("12h"),
+            "interval string should round-trip verbatim"
+        );
+        let resolved = cfg.resolve(None).expect("resolve");
+        assert_eq!(resolved.auto_update, AutoUpdateMode::Notify);
+        assert_eq!(resolved.update_check_interval.as_deref(), Some("12h"));
+        // And the string is a valid kaishin interval.
+        assert!(kaishin::parse_interval("12h").is_ok());
+    }
+
+    // --- end auto_update ------------------------------------------
 
     #[test]
     fn user_named_override_displaces_sibling_default_config_toml() {
