@@ -34,6 +34,13 @@ Set Height 700
 Set Padding 20
 Set TypingSpeed 50ms
 Set Theme "Catppuccin Mocha"
+# Sync on the shell prompt instead of guessing with fixed sleeps —
+# `cache refresh` hits the live gh API (commit_activity can 202-spin
+# while GitHub computes stats) and `import` walks real clones, so
+# wall time varies run to run. A 2026-06 re-record desynced badly
+# enough that the tui keystrokes landed in the shell and the
+# dashboard never appeared in the GIF.
+Set WaitTimeout 120s
 
 # ── sandbox setup (hidden) ──
 # Point shoka at /tmp/shoka-demo for the whole tape. The Dockerfile
@@ -63,35 +70,43 @@ Sleep 500ms
 Type "shoka --version"
 Sleep 500ms
 Enter
+Wait
 Sleep 1200ms
 
 # ── 2. import the fixture tree ──
 Type "shoka import /tmp/shoka-demo/root"
 Sleep 500ms
 Enter
-Sleep 2500ms
+Wait
+Sleep 1500ms
 
 # ── 3. list shows the shelf ──
 Type "shoka list"
 Sleep 500ms
 Enter
-Sleep 3500ms
+Wait
+# Hold so the viewer can actually read the shelf summary.
+Sleep 3000ms
 
 # ── 4. cache refresh populates git_status + gh ──
 # With GITHUB_TOKEN set, this also fetches open PR count + CI status
-# for the github.com/yukimemi/* repos.
+# for the github.com/yukimemi/* repos. `Wait` (not a fixed sleep)
+# because the per-repo API round-trips dominate and vary wildly.
 Type "shoka cache refresh --force"
 Sleep 500ms
 Enter
-# Cache refresh hits the gh API per repo — gives it a beat to land.
-Sleep 5000ms
+Wait
+Sleep 1000ms
 
 # ── 5. tui — the headline feature ──
+# No prompt to `Wait` on once the alternate screen opens, so this
+# section stays sleep-driven — but the shell is prompt-synced at
+# this point, so the only latency left is the tui's own startup.
 Type "shoka tui"
 Sleep 500ms
 Enter
 # Let the dashboard settle so the viewer sees the populated columns.
-Sleep 2500ms
+Sleep 3000ms
 
 # Navigate down through the shelf.
 Type "j"
