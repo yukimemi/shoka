@@ -1039,13 +1039,21 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-/// Fixed width the table consumes outside the repo column: 2 block
-/// borders + 3 highlight symbol (`" ▶ "`) + 8 column gaps (9 columns
-/// at the default `column_spacing` of 1) + the fixed-width columns
-/// (branch 14 + ↑↓ 8 + dirty 2 + PR 4 + CI 2 + activity 13 + tags 14
-/// = 57) + the path column's `Min(20)`. Must stay in sync with the
-/// `widths` array in [`render_table`].
-const REPO_COL_RESERVED: u16 = 2 + 3 + 8 + 57 + 20;
+/// Minimum width of the path column — the `Constraint::Min` in
+/// [`render_table`]'s widths array.
+const PATH_COL_MIN: u16 = 20;
+
+/// Fixed width the table consumes outside the repo and path columns:
+/// 2 block borders + 3 highlight symbol (`" ▶ "`) + 8 column gaps (9
+/// columns at the default `column_spacing` of 1) + the fixed-width
+/// columns (branch 14 + ↑↓ 8 + dirty 2 + PR 4 + CI 2 + activity 13 +
+/// tags 14 = 57). Must stay in sync with the `widths` array in
+/// [`render_table`].
+const COLS_FIXED: u16 = 2 + 3 + 8 + 57;
+
+/// Everything reserved away from the repo column: the fixed-width
+/// elements plus the path column's guaranteed minimum.
+const REPO_COL_RESERVED: u16 = COLS_FIXED + PATH_COL_MIN;
 
 /// Don't let the repo column collapse below this even on absurdly
 /// narrow terminals — `…/name` tails stop being legible. ratatui's
@@ -1067,16 +1075,19 @@ fn repo_column_width(area_width: u16, longest_slug: u16) -> u16 {
         .max(REPO_COL_FLOOR)
 }
 
-/// Left-elide `slug` to at most `max_chars` characters, keeping the
-/// tail. Slugs are `host/owner/name`, so when something has to go
-/// it's the shared prefix — the name tail is what identifies the
-/// row. Char-count width is fine here: hosts / owners / repo names
-/// are ASCII on every forge shoka talks to.
-fn elide_slug_left(slug: &str, max_chars: u16) -> String {
+/// Left-elide `s` to at most `max_chars` characters, keeping the
+/// tail. Used for the repo slug (`host/owner/name`) and the path
+/// cell — in both, every row shares a long common prefix and the
+/// tail is the part that tells rows apart, so when something has to
+/// go it's the prefix. Char-count width is fine here: slugs are
+/// ASCII on every forge shoka talks to, and shelf paths are
+/// overwhelmingly so (a non-ASCII path segment only costs a
+/// slightly-too-wide cell, which the Table then clips).
+fn elide_left(s: &str, max_chars: u16) -> String {
     let max = max_chars as usize;
-    let len = slug.chars().count();
+    let len = s.chars().count();
     if len <= max {
-        return slug.to_string();
+        return s.to_string();
     }
     if max == 0 {
         return String::new();
@@ -1085,12 +1096,24 @@ fn elide_slug_left(slug: &str, max_chars: u16) -> String {
     // a temporary String — one allocation (the `format!`) instead of
     // two, and still UTF-8-safe via `char_indices`.
     let skip_chars = len - (max - 1);
-    let byte_idx = slug
+    let byte_idx = s
         .char_indices()
         .nth(skip_chars)
         .map(|(idx, _)| idx)
-        .unwrap_or(slug.len());
-    format!("…{}", &slug[byte_idx..])
+        .unwrap_or(s.len());
+    format!("…{}", &s[byte_idx..])
+}
+
+/// Width the layout actually hands the path column once the repo
+/// column has taken `repo_w`: the leftover after every fixed-width
+/// element, floored at the column's `Min(PATH_COL_MIN)`. Mirrors the
+/// solve ratatui performs so [`elide_left`] can pre-truncate to the
+/// real budget instead of letting the Table cut the tail.
+fn path_column_width(area_width: u16, repo_w: u16) -> u16 {
+    area_width
+        .saturating_sub(COLS_FIXED)
+        .saturating_sub(repo_w)
+        .max(PATH_COL_MIN)
 }
 
 fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
@@ -1101,6 +1124,10 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
     // App (slugs never change mid-session), so this stays O(1) per
     // frame.
     let repo_w = repo_column_width(area.width, app.longest_slug);
+    // Path gets whatever the repo column left behind — same
+    // pre-truncation treatment so its tail (the directory name)
+    // survives narrow terminals too.
+    let path_w = path_column_width(area.width, repo_w);
 
     let header_row = Row::new(vec![
         Cell::from("  repo "),
@@ -1151,7 +1178,7 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
                     Span::raw(" "),
                     // `repo_w - 1` budgets for the pad span above.
                     Span::styled(
-                        elide_slug_left(&row.slug, repo_w.saturating_sub(1)),
+                        elide_left(&row.slug, repo_w.saturating_sub(1)),
                         Style::default().fg(theme::TEXT),
                     ),
                 ])),
@@ -1162,7 +1189,7 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
                 Cell::from(style_ci(&ci)),
                 Cell::from(Line::from(vec![Span::raw(" "), style_activity(activity)])),
                 Cell::from(Span::styled(
-                    row.path.to_string_lossy(),
+                    elide_left(&row.path.to_string_lossy(), path_w),
                     Style::default().fg(theme::OVERLAY),
                 )),
                 Cell::from(Span::styled(
@@ -2438,39 +2465,39 @@ mod tests {
     }
 
     #[test]
-    fn elide_slug_left_keeps_short_slug_unchanged() {
+    fn elide_left_keeps_short_slug_unchanged() {
         assert_eq!(
-            elide_slug_left("github.com/yukimemi/shoka", 30),
+            elide_left("github.com/yukimemi/shoka", 30),
             "github.com/yukimemi/shoka"
         );
     }
 
     #[test]
-    fn elide_slug_left_exact_fit_is_unchanged() {
+    fn elide_left_exact_fit_is_unchanged() {
         // "github.com/yukimemi/shoka" is 25 chars — exactly at the
         // budget means no elision (the `…` would only eat a char).
         assert_eq!(
-            elide_slug_left("github.com/yukimemi/shoka", 25),
+            elide_left("github.com/yukimemi/shoka", 25),
             "github.com/yukimemi/shoka"
         );
     }
 
     #[test]
-    fn elide_slug_left_drops_the_prefix_not_the_name() {
+    fn elide_left_drops_the_prefix_not_the_name() {
         // The whole point of left-elision: every row shares the
         // `host/owner/` prefix, so the *name* tail is what
         // distinguishes them — it must survive truncation.
         assert_eq!(
-            elide_slug_left("github.com/yukimemi/shoka", 15),
+            elide_left("github.com/yukimemi/shoka", 15),
             "…yukimemi/shoka"
         );
-        assert_eq!(elide_slug_left("github.com/yukimemi/shoka", 8), "…i/shoka");
+        assert_eq!(elide_left("github.com/yukimemi/shoka", 8), "…i/shoka");
     }
 
     #[test]
-    fn elide_slug_left_handles_degenerate_widths() {
-        assert_eq!(elide_slug_left("github.com/yukimemi/shoka", 1), "…");
-        assert_eq!(elide_slug_left("github.com/yukimemi/shoka", 0), "");
+    fn elide_left_handles_degenerate_widths() {
+        assert_eq!(elide_left("github.com/yukimemi/shoka", 1), "…");
+        assert_eq!(elide_left("github.com/yukimemi/shoka", 0), "");
     }
 
     #[test]
@@ -2490,6 +2517,32 @@ mod tests {
         let w = repo_column_width(110, 60);
         assert_eq!(w, 110 - REPO_COL_RESERVED);
         assert!(w < 61);
+    }
+
+    #[test]
+    fn elide_left_keeps_path_tails_visible() {
+        // The path column has the same shape as the slug column:
+        // every row shares the `<root>/<host>/<owner>/` prefix, so
+        // the tail is the part worth keeping.
+        assert_eq!(
+            elide_left("C:/Users/yukimemi/src/github.com/yukimemi/shoka", 20),
+            "….com/yukimemi/shoka"
+        );
+    }
+
+    #[test]
+    fn path_column_width_takes_the_leftover_when_roomy() {
+        // Wide terminal: path absorbs everything the fixed columns
+        // and the (content-sized) repo column don't use.
+        assert_eq!(path_column_width(200, 26), 200 - COLS_FIXED - 26);
+    }
+
+    #[test]
+    fn path_column_width_floors_at_its_min_constraint() {
+        // Narrow terminal: mirror the widths array's Min(20) — the
+        // elision budget never drops below what ratatui guarantees
+        // the column.
+        assert_eq!(path_column_width(80, 30), PATH_COL_MIN);
     }
 
     #[test]
