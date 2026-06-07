@@ -117,6 +117,67 @@ Version lives only in `Cargo.toml`. `cargo check` refreshes
 `<type>: <summary> (vX.Y.Z)` (e.g. `feat: add cd subcommand
 (v0.2.0)`) so the release surface is traceable from `git log`.
 
+## Regenerating the demo GIF (`vhs/`)
+
+The README GIF is recorded with [vhs](https://github.com/charmbracelet/vhs)
+from `vhs/demo.tape`. **Always record through the Docker image**
+(`vhs/Dockerfile`) — native vhs hangs on Windows at `Set Theme`,
+and the image also bakes in the sandbox fixtures (four shallow
+`yukimemi/*` clones + a pre-staged config) so recordings are
+reproducible. Entry point:
+
+```sh
+cargo make vhs-regen      # builds the shoka-vhs image if needed, then records
+```
+
+On Windows the cargo-make tasks shell out via `wsl -- docker ...`
+(Docker Engine inside WSL2; Docker Desktop not required).
+
+Checklist when re-recording:
+
+1. **Bump `ARG SHOKA_VERSION` in `vhs/Dockerfile`** to the latest
+   released version (it's pinned in lockstep with release tags;
+   the image `cargo install`s that version from crates.io). A
+   stale pin re-records yesterday's binary. Image rebuild takes
+   ~5 min.
+2. **Forward `GITHUB_TOKEN`** so the dashboard's PR / CI columns
+   populate instead of rendering `-`. From PowerShell in one
+   shot (WSLENV makes the var cross the WSL boundary):
+
+   ```powershell
+   $env:GITHUB_TOKEN = (gh auth token); $env:WSLENV += ":GITHUB_TOKEN/u"; cargo make vhs-regen
+   ```
+
+   (Append with `+=` — overwriting `WSLENV` would drop any other
+   var-forwarding rules already configured in the session; a
+   leading `:` when it was unset is harmless. Same form as the
+   `$PROFILE` snippet documented in `Makefile.toml`.)
+
+   `regen.sh` forwards the token conditionally — never pass
+   `-e GITHUB_TOKEN=""` to a raw `docker run` (empty-but-set is
+   not the same as unset).
+3. **Don't replace the tape's `Wait` lines with fixed sleeps.**
+   The shell sections sync on the prompt via `Wait` (with
+   `Set WaitTimeout 120s`) because `shoka cache refresh` duration
+   varies wildly — the gh `/stats/commit_activity` endpoint can
+   202-spin for a while. Fixed sleeps desync and produce a
+   garbage recording (typeahead bleeding into the next command).
+   The TUI section has no prompt to `Wait` on, so it stays
+   sleep-driven by design.
+4. **Verify the GIF before committing.** Sanity-check the file
+   size against the previous `demo.gif` (a broken recording once
+   came out at ~150 KB vs ~565 KB), and extract a few frames to
+   eyeball — e.g. via dockerized ffmpeg:
+
+   ```sh
+   # from the repo root — demo.gif lands in vhs/, so mount that
+   docker run --rm -v "$PWD/vhs:/work" -w /work linuxserver/ffmpeg \
+     -i demo.gif -vf "select='not(mod(n,60))'" -vsync 0 frame_%02d.png
+   ```
+5. **Reclaim disk afterwards** — the image is multi-GB and cheap
+   to rebuild: `docker rmi shoka-vhs` (plus
+   `docker builder prune` if space is tight).
+
 <!-- kata:agents:base:begin -->
 ## Shared conventions
 
