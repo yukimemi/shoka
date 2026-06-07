@@ -23,7 +23,7 @@
 #   3. shoka cache refresh --force — populate git_status + gh
 #   4. shoka tui    — dashboard tour (j/k, /, Enter)
 #
-# Total runtime ~70s.
+# Total runtime ~62s (the cache-refresh wait is hidden, see §4).
 
 Output demo.gif
 Set Shell "bash"
@@ -90,13 +90,19 @@ Sleep 3000ms
 
 # ── 4. cache refresh populates git_status + gh ──
 # With GITHUB_TOKEN set, this also fetches open PR count + CI status
-# for the github.com/yukimemi/* repos. `Wait` (not a fixed sleep)
-# because the per-repo API round-trips dominate and vary wildly.
+# for the github.com/yukimemi/* repos. The wait is wrapped in
+# Hide/Show: the per-repo gh round-trips (commit_activity can
+# 202-spin for tens of seconds) are real wall time but dead air in
+# the GIF, so the viewer sees "command → done" while `Wait` still
+# prompt-syncs the recording under the hood.
 Type "shoka cache refresh --force"
 Sleep 500ms
 Enter
+Hide
 Wait
-Sleep 1000ms
+Show
+# Hold the completed output just long enough to read it.
+Sleep 1500ms
 
 # ── 5. tui — the headline feature ──
 # No prompt to `Wait` on once the alternate screen opens, so this
