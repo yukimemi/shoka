@@ -11,13 +11,18 @@
 //! Layout (3 rows):
 //!
 //! 1. Header — counts + active filter prefix.
-//! 2. Table — slug / branch / ↑↓ / ✓ / PR / CI / path / tags,
-//!    current selection highlighted. Status columns read the
-//!    cached `git_status` + `gh` snapshots off `cache.toml`;
-//!    entries that haven't been refreshed yet render `?` (git) /
-//!    `-` (gh) so users can tell "unchecked" or "no data" apart
-//!    from a definite zero.
-//! 3. Footer — mode-specific key hints, or the live filter input.
+//! 2. Table — repo / branch / ↑↓ / ✓ / PR / CI / activity / tags,
+//!    current selection highlighted. The repo cell is fall.vim-style:
+//!    bright bold name first, dimmed provenance (`owner`, or
+//!    `host/owner` off the default host) padded into a shared column
+//!    after it. Status columns read the cached `git_status` + `gh`
+//!    snapshots off `cache.toml`; entries that haven't been refreshed
+//!    yet render `?` (git) / `-` (gh) so users can tell "unchecked"
+//!    or "no data" apart from a definite zero.
+//! 3. Footer — mode-specific key hints plus the selected row's
+//!    `~`-contracted path right-aligned (the table dropped its path
+//!    column: the path only matters for the row about to be cd'd
+//!    into), or a transient action status banner.
 //!
 //! The OSC 7 cwd hint is emitted on Enter-to-cd via the shared
 //! [`emit_path`] sidechannel, so a tab/split opened after picking a
@@ -159,6 +164,14 @@ struct DashRow {
     /// Name segment (the `<name>` in `<host>/<owner>/<name>`). Other
     /// half of the cache identity, see `host`.
     name: String,
+    /// Dimmed context rendered after `name` in the repo cell —
+    /// fall.vim-style "name first, provenance second". `owner` alone
+    /// for repos on the configured default host (the overwhelmingly
+    /// common case, where repeating the host is pure noise),
+    /// `host/owner` otherwise so off-host repos stay unambiguous.
+    /// Cached at construction so the per-frame render doesn't
+    /// re-branch on host equality.
+    ctx: String,
     path: PathBuf,
     /// The shelf [`Repo::path`] override (`None` for layout-derived
     /// repos). This — not the resolved clone `path` above — is the
@@ -223,6 +236,7 @@ fn build_rows(
             host: repo.host.clone(),
             owner: repo.owner.clone(),
             name: repo.name.clone(),
+            ctx: ctx_for(&repo.host, &repo.owner, &resolved.default_host),
             path,
             repo_path: repo.path.clone(),
             search_key,
@@ -236,6 +250,17 @@ fn build_rows(
 
 fn has_all_tags(repo: &Repo, wanted: &[String]) -> bool {
     wanted.iter().all(|w| repo.tags.iter().any(|t| t == w))
+}
+
+/// Dimmed provenance for the repo cell: `owner` when the repo lives
+/// on the configured default host, `host/owner` otherwise. Host
+/// comparison is case-insensitive because DNS hostnames are.
+fn ctx_for(host: &str, owner: &str, default_host: &str) -> String {
+    if host.eq_ignore_ascii_case(default_host) {
+        owner.to_string()
+    } else {
+        format!("{host}/{owner}")
+    }
 }
 
 /// Case-insensitive owner membership check used by the mine-only
@@ -255,12 +280,18 @@ enum Mode {
 
 struct App {
     rows: Vec<DashRow>,
-    /// Char count of the longest slug in [`rows`], precomputed once
-    /// at construction so [`render_table`] doesn't redo an O(N)
+    /// Char count of the longest repo `name` in [`rows`], precomputed
+    /// once at construction so [`render_table`] doesn't redo an O(N)
     /// character-count sweep on every frame. Safe to cache: rows are
     /// fixed for the lifetime of the TUI session — post-action
-    /// refreshes rewrite `status` / `gh`, never the slug set.
-    longest_slug: u16,
+    /// refreshes rewrite `status` / `gh`, never the name set. Sized
+    /// to *all* rows (not the live matches) so the name column
+    /// doesn't jitter while the user types a filter.
+    longest_name: u16,
+    /// Char count of the longest [`DashRow::ctx`] in [`rows`]; same
+    /// caching rationale as [`longest_name`]. The two together drive
+    /// [`repo_column_width`].
+    longest_ctx: u16,
     /// Owners (`<owner>` in `<host>/<owner>/<name>`) the user counts
     /// as "theirs" — sourced from `[ui].own_owners`. Empty disables
     /// the mine-only feature entirely (no toggle pill, `m` is a
@@ -308,6 +339,11 @@ struct App {
     /// repo that was acted on — no full-shelf walk, just the row the
     /// user pressed `f` / `P` on.
     paths: ShokaPaths,
+    /// The user's home directory, resolved once so the footer's
+    /// selected-row path can `~`-contract per frame without
+    /// re-querying the OS. `None` when the OS can't say (the footer
+    /// then shows the full path — graceful, just longer).
+    home: Option<PathBuf>,
 }
 
 /// Result of an `f` / `P` keystroke. Holds the captured stdout +
@@ -588,15 +624,22 @@ impl App {
         table_state.select(if matches.is_empty() { None } else { Some(0) });
         // Sized to *all* rows, not the current matches, so the repo
         // column doesn't jitter while the user types a filter.
-        let longest_slug = rows
+        let longest_name = rows
             .iter()
-            .map(|r| r.slug.chars().count())
+            .map(|r| r.name.chars().count())
+            .max()
+            .unwrap_or(0)
+            .min(usize::from(u16::MAX)) as u16;
+        let longest_ctx = rows
+            .iter()
+            .map(|r| r.ctx.chars().count())
             .max()
             .unwrap_or(0)
             .min(usize::from(u16::MAX)) as u16;
         Self {
             rows,
-            longest_slug,
+            longest_name,
+            longest_ctx,
             own_owners,
             mine_only,
             filter: String::new(),
@@ -610,7 +653,17 @@ impl App {
             table_state,
             matcher: Matcher::default(),
             paths,
+            home: directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf()),
         }
+    }
+
+    /// `~`-contracted path of the currently-highlighted row, for the
+    /// footer. `None` when the filter matched nothing (no selection
+    /// to describe).
+    fn selected_path_display(&self) -> Option<String> {
+        let idx = *self.matches.get(self.cursor)?;
+        let row = self.rows.get(idx)?;
+        Some(display_path(&row.path, self.home.as_deref()))
     }
 
     /// True when [`row`] belongs to one of the configured
@@ -1039,50 +1092,53 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-/// Minimum width of the path column — the `Constraint::Min` in
-/// [`render_table`]'s widths array.
-const PATH_COL_MIN: u16 = 20;
+/// Gap (in columns) between the repo name and its dimmed ctx within
+/// the repo cell — wide enough to read as two fields, narrow enough
+/// not to waste width.
+const NAME_CTX_GAP: u16 = 2;
 
-/// Fixed width the table consumes outside the repo and path columns:
-/// 2 block borders + 3 highlight symbol (`" ▶ "`) + 8 column gaps (9
-/// columns at the default `column_spacing` of 1) + the fixed-width
-/// columns (branch 14 + ↑↓ 8 + dirty 2 + PR 4 + CI 2 + activity 13 +
-/// tags 14 = 57). Must stay in sync with the `widths` array in
+/// Fixed width the table consumes outside the repo column: 2 block
+/// borders + 3 highlight symbol (`" ▶ "`) + 7 column gaps (8 columns
+/// at the default `column_spacing` of 1) + the fixed-width columns
+/// (branch 14 + ↑↓ 8 + dirty 2 + PR 4 + CI 2 + activity 13 + tags
+/// 14 = 57). Must stay in sync with the `widths` array in
 /// [`render_table`].
-const COLS_FIXED: u16 = 2 + 3 + 8 + 57;
-
-/// Everything reserved away from the repo column: the fixed-width
-/// elements plus the path column's guaranteed minimum.
-const REPO_COL_RESERVED: u16 = COLS_FIXED + PATH_COL_MIN;
+const COLS_FIXED: u16 = 2 + 3 + 7 + 57;
 
 /// Don't let the repo column collapse below this even on absurdly
-/// narrow terminals — `…/name` tails stop being legible. ratatui's
+/// narrow terminals — truncated names stop being legible. ratatui's
 /// layout solver squeezes further on its own when even the floor
 /// doesn't fit.
 const REPO_COL_FLOOR: u16 = 10;
 
-/// Width for the repo column: hug the longest slug (+1 for the
-/// leading pad span) when the terminal is wide, hand width back to
-/// the path column's `Min(20)` when it isn't. The previous
-/// `Percentage(28)` sizing truncated the *tail* of every slug on
-/// narrow terminals — and since every row shares the `host/owner/`
-/// prefix, the tail is exactly the part that tells repos apart.
-fn repo_column_width(area_width: u16, longest_slug: u16) -> u16 {
-    let available = area_width.saturating_sub(REPO_COL_RESERVED);
-    longest_slug
+/// Skip the footer path entirely when fewer columns than this
+/// remain after the key pills — `…` plus a handful of characters
+/// reads as noise, not a path. 12 ≈ the elide marker + one
+/// meaningful path segment.
+const FOOTER_PATH_MIN_WIDTH: usize = 12;
+
+/// Width for the repo column: hug the widest `name + gap + ctx`
+/// combination (+1 for the leading pad span) when the terminal is
+/// wide, shrink down to the floor when it isn't. The column holds
+/// fall.vim-style cells — bright repo name first, dimmed provenance
+/// after — so the name (the part that tells rows apart) is always
+/// the first thing the eye lands on.
+fn repo_column_width(area_width: u16, longest_name: u16, longest_ctx: u16) -> u16 {
+    let available = area_width.saturating_sub(COLS_FIXED);
+    longest_name
+        .saturating_add(NAME_CTX_GAP)
+        .saturating_add(longest_ctx)
         .saturating_add(1)
         .min(available)
         .max(REPO_COL_FLOOR)
 }
 
 /// Left-elide `s` to at most `max_chars` characters, keeping the
-/// tail. Used for the repo slug (`host/owner/name`) and the path
-/// cell — in both, every row shares a long common prefix and the
-/// tail is the part that tells rows apart, so when something has to
-/// go it's the prefix. Char-count width is fine here: slugs are
-/// ASCII on every forge shoka talks to, and shelf paths are
-/// overwhelmingly so (a non-ASCII path segment only costs a
-/// slightly-too-wide cell, which the Table then clips).
+/// tail. Used for the footer's selected-row path, where every shelf
+/// path shares a long common prefix and the tail (the directory
+/// name) is the part that matters. Char-count width is fine here:
+/// shelf paths are overwhelmingly ASCII (a non-ASCII segment only
+/// costs a slightly-too-wide line, which the terminal clips).
 fn elide_left(s: &str, max_chars: u16) -> String {
     let max = max_chars as usize;
     let len = s.chars().count();
@@ -1104,30 +1160,98 @@ fn elide_left(s: &str, max_chars: u16) -> String {
     format!("…{}", &s[byte_idx..])
 }
 
-/// Width the layout actually hands the path column once the repo
-/// column has taken `repo_w`: the leftover after every fixed-width
-/// element, floored at the column's `Min(PATH_COL_MIN)`. Mirrors the
-/// solve ratatui performs so [`elide_left`] can pre-truncate to the
-/// real budget instead of letting the Table cut the tail.
-fn path_column_width(area_width: u16, repo_w: u16) -> u16 {
-    area_width
-        .saturating_sub(COLS_FIXED)
-        .saturating_sub(repo_w)
-        .max(PATH_COL_MIN)
+/// Right-elide `s` to at most `max_chars` characters, keeping the
+/// head. The repo-cell counterpart of [`elide_left`]: names and
+/// owners differ at the *start* (no shared prefix), so when one has
+/// to lose characters it's the tail that goes.
+fn elide_right(s: &str, max_chars: u16) -> String {
+    let max = max_chars as usize;
+    let len = s.chars().count();
+    if len <= max {
+        return s.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let byte_idx = s
+        .char_indices()
+        .nth(max - 1)
+        .map(|(idx, _)| idx)
+        .unwrap_or(s.len());
+    format!("{}…", &s[..byte_idx])
+}
+
+/// Split the repo cell's text budget between the bright name and the
+/// dimmed ctx: name comes back space-padded to the shared ctx start
+/// column (so ctx forms a clean visual column across rows), ctx
+/// comes back right-elided to whatever budget remains. Returns
+/// `(padded_name, ctx)`; `ctx` is empty when the width can't fit a
+/// meaningful fragment (under 2 chars) — a lone `…` would be noise,
+/// not information.
+fn repo_cell_parts(name: &str, ctx: &str, longest_name: u16, repo_w: u16) -> (String, String) {
+    // The leading pad span in the cell costs 1 of `repo_w`.
+    let budget = usize::from(repo_w.saturating_sub(1));
+    if name.chars().count() > budget {
+        return (elide_right(name, budget as u16), String::new());
+    }
+    let ctx_start = usize::from(longest_name)
+        .min(budget)
+        .saturating_add(usize::from(NAME_CTX_GAP));
+    let ctx_budget = budget.saturating_sub(ctx_start);
+    if ctx_budget < 2 || ctx.is_empty() {
+        return (name.to_string(), String::new());
+    }
+    (
+        format!("{name:<ctx_start$}"),
+        elide_right(ctx, ctx_budget as u16),
+    )
+}
+
+/// Display form of a shelf path: the user's home directory prefix
+/// contracted to `~`. Purely cosmetic — shortens almost every row
+/// (shelf roots live under home in practice) without losing the
+/// distinguishing tail the footer is there to show.
+///
+/// Deliberately string-based rather than `Path::strip_prefix`: this
+/// is a display transform, and the component-wise alternative either
+/// normalizes separators through `MAIN_SEPARATOR` (mixed-separator
+/// output for foreign-style paths) or parses foreign-OS separators
+/// platform-dependently (`\` is not a separator on Unix), both of
+/// which are worse for a footer than the string surgery below.
+fn display_path(path: &std::path::Path, home: Option<&std::path::Path>) -> String {
+    let raw = path.to_string_lossy();
+    if let Some(home) = home {
+        let home_s = home.to_string_lossy();
+        if let Some(rest) = raw.strip_prefix(home_s.as_ref()) {
+            if rest.is_empty() {
+                return "~".to_string();
+            }
+            if rest.starts_with(['/', '\\']) {
+                return format!("~{rest}");
+            }
+            // Home itself ends with a separator (e.g. `HOME=/`):
+            // `rest` then starts mid-segment, so re-add the
+            // separator after `~` instead of bailing — without this
+            // branch a root home never contracts.
+            if home_s.ends_with(['/', '\\']) {
+                let sep = home_s.chars().last().expect("non-empty by ends_with");
+                return format!("~{sep}{rest}");
+            }
+            // Anything else (`/home/u2` against home `/home/u`) is a
+            // sibling sharing a string prefix, not a child — leave it.
+        }
+    }
+    raw.into_owned()
 }
 
 fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
     use ratatui::text::Span;
     use ratatui::widgets::Cell;
 
-    // Content-driven repo column width. `longest_slug` is cached on
-    // App (slugs never change mid-session), so this stays O(1) per
-    // frame.
-    let repo_w = repo_column_width(area.width, app.longest_slug);
-    // Path gets whatever the repo column left behind — same
-    // pre-truncation treatment so its tail (the directory name)
-    // survives narrow terminals too.
-    let path_w = path_column_width(area.width, repo_w);
+    // Content-driven repo column width. `longest_name` /
+    // `longest_ctx` are cached on App (the row set never changes
+    // mid-session), so this stays O(1) per frame.
+    let repo_w = repo_column_width(area.width, app.longest_name, app.longest_ctx);
 
     let header_row = Row::new(vec![
         Cell::from("  repo "),
@@ -1137,7 +1261,6 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
         Cell::from(" PR "),
         Cell::from(" CI "),
         Cell::from(" activity "),
-        Cell::from(" path "),
         Cell::from(" tags "),
     ])
     .style(
@@ -1173,14 +1296,22 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
             // styling is the *unselected* look — the highlight
             // overrides only `bg` and `fg`, leaving span colors
             // for non-current rows intact.
+            // fall.vim-style repo cell: bright bold name first, then
+            // the dimmed provenance (`owner`, or `host/owner` off
+            // the default host) padded into a shared column so the
+            // eye can scan straight down the name list.
+            let (name_part, ctx_part) =
+                repo_cell_parts(&row.name, &row.ctx, app.longest_name, repo_w);
             Row::new(vec![
                 Cell::from(Line::from(vec![
                     Span::raw(" "),
-                    // `repo_w - 1` budgets for the pad span above.
                     Span::styled(
-                        elide_left(&row.slug, repo_w.saturating_sub(1)),
-                        Style::default().fg(theme::TEXT),
+                        name_part,
+                        Style::default()
+                            .fg(theme::TEXT)
+                            .add_modifier(Modifier::BOLD),
                     ),
+                    Span::styled(ctx_part, Style::default().fg(theme::OVERLAY)),
                 ])),
                 Cell::from(Span::styled(branch, Style::default().fg(theme::SKY))),
                 Cell::from(style_ahead_behind(&ahead_behind)),
@@ -1188,10 +1319,6 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
                 Cell::from(style_pr(&pr)),
                 Cell::from(style_ci(&ci)),
                 Cell::from(Line::from(vec![Span::raw(" "), style_activity(activity)])),
-                Cell::from(Span::styled(
-                    elide_left(&row.path.to_string_lossy(), path_w),
-                    Style::default().fg(theme::OVERLAY),
-                )),
                 Cell::from(Span::styled(
                     &row.tags_display,
                     Style::default().fg(theme::TEAL),
@@ -1209,7 +1336,6 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
         Constraint::Length(4),      // PR count (e.g. "99+")
         Constraint::Length(2),      // CI glyph
         Constraint::Length(13),     // activity sparkline (1 lead + up to 12 weeks)
-        Constraint::Min(20),        // path
         Constraint::Length(14),     // tags
     ];
     let table = Table::new(rows, widths)
@@ -1426,7 +1552,7 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let line = match app.mode {
+    let mut spans = match app.mode {
         Mode::Normal => {
             // Build pill set dynamically: the `m` toggle only makes
             // sense when `[ui].own_owners` is configured, so hide it
@@ -1450,17 +1576,39 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
                 ("?", "help"),
                 ("q", "quit"),
             ]);
-            Line::from(footer_pills(&pills))
+            footer_pills(&pills)
         }
-        Mode::Filter => Line::from(footer_pills(&[
+        Mode::Filter => footer_pills(&[
             ("type", "filter"),
             ("⌫", "del"),
             ("⏎", "accept"),
             ("esc", "clear"),
-        ])),
+        ]),
     };
+
+    // Selected row's path, right-aligned in whatever the pills left
+    // over. The table no longer carries a path column (it was the
+    // noisiest cell on every row for a value that's only interesting
+    // for *one* row at a time — the one about to be cd'd into), so
+    // the footer shows it for the current selection only. Left-elide
+    // keeps the distinguishing tail; skip entirely when the leftover
+    // is too narrow to be useful.
+    if let Some(path) = app.selected_path_display() {
+        let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+        // Reserve 3 columns: a 2-char gap between the pills and the
+        // path, plus a 1-char right margin (the `+ 2` in `pad` below
+        // re-spends the gap so the path lands flush at width - 1).
+        let avail = usize::from(area.width).saturating_sub(used + 3);
+        if avail >= FOOTER_PATH_MIN_WIDTH {
+            let shown = elide_left(&path, avail as u16);
+            let pad = avail.saturating_sub(shown.chars().count()) + 2;
+            spans.push(Span::raw(" ".repeat(pad)));
+            spans.push(Span::styled(shown, Style::default().fg(theme::OVERLAY)));
+        }
+    }
+
     f.render_widget(
-        Paragraph::new(line).style(Style::default().bg(theme::MANTLE)),
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::MANTLE)),
         area,
     );
 }
@@ -2267,6 +2415,9 @@ mod tests {
                     host,
                     owner: owner_from_slug(s),
                     name,
+                    // Fixtures behave as if every row sits on the
+                    // default host (production's common case).
+                    ctx: owner_from_slug(s),
                     path,
                     repo_path: None,
                     search_key,
@@ -2303,6 +2454,7 @@ mod tests {
                     host,
                     owner: owner_from_slug(slug),
                     name,
+                    ctx: owner_from_slug(slug),
                     path,
                     repo_path: None,
                     search_key,
@@ -2496,29 +2648,33 @@ mod tests {
     }
 
     #[test]
-    fn repo_column_width_tracks_longest_slug_when_roomy() {
-        // Wide terminal: the column hugs the longest slug (+1 for the
-        // leading pad span) instead of hoarding a fixed percentage,
-        // leaving the leftover width for the path column.
-        assert_eq!(repo_column_width(200, 25), 26);
+    fn repo_column_width_hugs_name_plus_ctx_when_roomy() {
+        // Wide terminal: the column hugs `1 (lead pad) + name + gap
+        // + ctx` instead of hoarding a fixed percentage.
+        assert_eq!(repo_column_width(200, 10, 8), 1 + 10 + NAME_CTX_GAP + 8);
     }
 
     #[test]
-    fn repo_column_width_clamps_so_path_keeps_its_minimum() {
-        // Narrow terminal: everything except the repo column is
-        // reserved (REPO_COL_RESERVED, which embeds the path column's
-        // Min(20)) — the repo column gets whatever is left rather
-        // than its full ask.
-        let w = repo_column_width(110, 60);
-        assert_eq!(w, 110 - REPO_COL_RESERVED);
-        assert!(w < 61);
+    fn repo_column_width_clamps_to_the_leftover_when_narrow() {
+        // Narrow terminal: the repo column gets whatever the fixed
+        // columns leave behind rather than its full ask.
+        let w = repo_column_width(100, 30, 20);
+        assert_eq!(w, 100 - COLS_FIXED);
+        assert!(w < 1 + 30 + NAME_CTX_GAP + 20);
+    }
+
+    #[test]
+    fn repo_column_width_never_collapses_below_floor() {
+        // Degenerate terminal: keep a usable floor so names stay
+        // legible; ratatui squeezes further on its own if even the
+        // floor doesn't fit.
+        assert_eq!(repo_column_width(40, 25, 10), REPO_COL_FLOOR);
     }
 
     #[test]
     fn elide_left_keeps_path_tails_visible() {
-        // The path column has the same shape as the slug column:
-        // every row shares the `<root>/<host>/<owner>/` prefix, so
-        // the tail is the part worth keeping.
+        // The footer path has a long shared `<root>/<host>/<owner>/`
+        // prefix, so the tail is the part worth keeping.
         assert_eq!(
             elide_left("C:/Users/yukimemi/src/github.com/yukimemi/shoka", 20),
             "….com/yukimemi/shoka"
@@ -2526,26 +2682,177 @@ mod tests {
     }
 
     #[test]
-    fn path_column_width_takes_the_leftover_when_roomy() {
-        // Wide terminal: path absorbs everything the fixed columns
-        // and the (content-sized) repo column don't use.
-        assert_eq!(path_column_width(200, 26), 200 - COLS_FIXED - 26);
+    fn elide_right_keeps_the_head() {
+        // Names / owners differ at the start, so right-elision keeps
+        // the distinguishing part.
+        assert_eq!(elide_right("family-tree-main", 10), "family-tr…");
+        assert_eq!(elide_right("shoka", 10), "shoka");
+        assert_eq!(elide_right("shoka", 5), "shoka");
     }
 
     #[test]
-    fn path_column_width_floors_at_its_min_constraint() {
-        // Narrow terminal: mirror the widths array's Min(20) — the
-        // elision budget never drops below what ratatui guarantees
-        // the column.
-        assert_eq!(path_column_width(80, 30), PATH_COL_MIN);
+    fn elide_right_handles_degenerate_widths() {
+        assert_eq!(elide_right("shoka", 1), "…");
+        assert_eq!(elide_right("shoka", 0), "");
     }
 
     #[test]
-    fn repo_column_width_never_collapses_below_floor() {
-        // Degenerate terminal: keep a usable floor so `…/name` tails
-        // stay legible; ratatui squeezes further on its own if even
-        // the floor doesn't fit.
-        assert_eq!(repo_column_width(40, 25), REPO_COL_FLOOR);
+    fn ctx_for_drops_the_default_host() {
+        // On the default host the host segment is pure noise — every
+        // row would repeat it.
+        assert_eq!(ctx_for("github.com", "yukimemi", "github.com"), "yukimemi");
+        // DNS hostnames are case-insensitive.
+        assert_eq!(ctx_for("GitHub.com", "yukimemi", "github.com"), "yukimemi");
+    }
+
+    #[test]
+    fn ctx_for_keeps_offhost_repos_unambiguous() {
+        assert_eq!(ctx_for("gitlab.com", "foo", "github.com"), "gitlab.com/foo");
+    }
+
+    #[test]
+    fn repo_cell_parts_pads_name_into_a_shared_ctx_column() {
+        // longest_name 10, gap 2 → ctx starts at column 12 for every
+        // row, regardless of the row's own name length.
+        let (name, ctx) = repo_cell_parts("shoka", "yukimemi", 10, 40);
+        assert_eq!(name, "shoka       "); // 5 + 7 pad = 12
+        assert_eq!(name.chars().count(), 12);
+        assert_eq!(ctx, "yukimemi");
+    }
+
+    #[test]
+    fn repo_cell_parts_elides_ctx_first_when_narrow() {
+        // The ctx is the dimmed, secondary field — it loses width
+        // before the name does. budget = 20 - 1 = 19; ctx starts at
+        // 12, leaving 7 for an 8-char owner.
+        let (name, ctx) = repo_cell_parts("shoka", "yukimemi", 10, 20);
+        assert_eq!(name.chars().count(), 12);
+        assert_eq!(ctx, "yukime…");
+    }
+
+    #[test]
+    fn repo_cell_parts_drops_ctx_entirely_when_it_cannot_help() {
+        // Under 2 ctx chars a lone `…` is noise, not information —
+        // give the row back to the name.
+        let (name, ctx) = repo_cell_parts("shoka", "yukimemi", 10, 13);
+        assert_eq!(name, "shoka");
+        assert_eq!(ctx, "");
+    }
+
+    #[test]
+    fn repo_cell_parts_elides_the_name_only_as_a_last_resort() {
+        // Even the name doesn't fit: right-elide it and skip ctx.
+        let (name, ctx) = repo_cell_parts("family-tree-main", "yukimemi", 16, 11);
+        assert_eq!(name, "family-tr…");
+        assert_eq!(ctx, "");
+    }
+
+    #[test]
+    fn display_path_contracts_home_to_tilde() {
+        use std::path::Path;
+        assert_eq!(
+            display_path(
+                Path::new("/home/u/src/github.com/yukimemi/shoka"),
+                Some(Path::new("/home/u"))
+            ),
+            "~/src/github.com/yukimemi/shoka"
+        );
+        // Windows separators contract too.
+        assert_eq!(
+            display_path(
+                Path::new(r"C:\Users\u\src\shoka"),
+                Some(Path::new(r"C:\Users\u"))
+            ),
+            r"~\src\shoka"
+        );
+    }
+
+    #[test]
+    fn ui_renders_fall_style_repo_cell_and_footer_path() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = app(rows_with_paths(&[
+            (
+                "github.com/yukimemi/shoka",
+                "/home/u/src/github.com/yukimemi/shoka",
+            ),
+            (
+                "github.com/yukimemi/family-tree-main",
+                "/home/u/src/github.com/yukimemi/family-tree-main",
+            ),
+        ]));
+        // Pin home so the footer's `~` contraction is deterministic
+        // on every machine the test runs on.
+        app.home = Some(PathBuf::from("/home/u"));
+
+        let backend = TestBackend::new(140, 8);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal.draw(|f| ui(f, &mut app)).expect("draw");
+
+        let buf = terminal.backend().buffer();
+        let lines: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf.cell((x, y)).expect("cell").symbol())
+                    .collect()
+            })
+            .collect();
+
+        // Table body (between the 1-line header and 1-line footer):
+        // fall.vim-style cells show the bare name + owner — never
+        // the full `host/owner/name` slug, and no path column.
+        let body = lines[1..lines.len() - 1].join("\n");
+        assert!(body.contains("shoka"), "name missing:\n{body}");
+        assert!(body.contains("yukimemi"), "ctx missing:\n{body}");
+        assert!(
+            !body.contains("github.com/yukimemi"),
+            "table should not render slugs or paths:\n{body}"
+        );
+
+        // Footer carries the selected row's ~-contracted path.
+        let footer = lines.last().expect("footer line");
+        assert!(
+            footer.contains("~/src/github.com/yukimemi/shoka"),
+            "footer should show the selected path: {footer}"
+        );
+    }
+
+    #[test]
+    fn display_path_leaves_foreign_prefixes_alone() {
+        use std::path::Path;
+        // Not under home → untouched.
+        assert_eq!(
+            display_path(Path::new("/srv/repos/shoka"), Some(Path::new("/home/u"))),
+            "/srv/repos/shoka"
+        );
+        // Sibling dir sharing home as a *string* prefix must not
+        // contract: `/home/u2` is not inside `/home/u`.
+        assert_eq!(
+            display_path(Path::new("/home/u2/shoka"), Some(Path::new("/home/u"))),
+            "/home/u2/shoka"
+        );
+        // No home at all → untouched.
+        assert_eq!(
+            display_path(Path::new("/home/u/shoka"), None),
+            "/home/u/shoka"
+        );
+    }
+
+    #[test]
+    fn display_path_contracts_even_a_root_home() {
+        use std::path::Path;
+        // HOME=/ — the prefix strip leaves no leading separator, so
+        // the contraction must re-add one instead of bailing.
+        assert_eq!(
+            display_path(Path::new("/srv/repos/shoka"), Some(Path::new("/"))),
+            "~/srv/repos/shoka"
+        );
+        // Same shape with a trailing-separator home.
+        assert_eq!(
+            display_path(Path::new("/home/u/shoka"), Some(Path::new("/home/u/"))),
+            "~/shoka"
+        );
     }
 
     #[test]
@@ -3278,6 +3585,7 @@ mod tests {
             host: "local".into(),
             owner: "test".into(),
             name: "repo".into(),
+            ctx: "test".into(),
             path,
             repo_path: None,
             search_key,
@@ -3328,6 +3636,7 @@ mod tests {
             host: "github.com".into(),
             owner: "yukimemi".into(),
             name: "repo".into(),
+            ctx: "yukimemi".into(),
             path: repo_root.clone(),
             repo_path: None,
             search_key,
