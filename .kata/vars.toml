@@ -29,3 +29,4 @@ checkout = "v6.0.3"
 # renovate: datasource=github-tags depName=peter-evans/create-pull-request
 create_pull_request = "v7.0.11"
 swatinem_rust_cache = "v2"
+claude_code_action = "v1"

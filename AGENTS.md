@@ -142,10 +142,15 @@ here so each tool's auto-load behaviour still finds something.
 
 ### PR review cycle
 
-- Every PR runs reviews from **Gemini Code Assist** and
+- Every PR runs reviews from **Claude Code**
+  (`.github/workflows/claude-review.yml`, kata-managed) and
   **CodeRabbit**. Wait for both bots to post, address their
   comments (push fixes to the PR branch), and merge only after
-  feedback is resolved.
+  feedback is resolved. The claude-review workflow skips
+  review-exempt PRs by itself (its job-level `if:` excludes
+  `chore/release-*`, `kata-apply/auto`, `apm-bump/auto`, and
+  Renovate / Dependabot authors) — a missing Claude review on
+  those PRs is expected, not a failure.
 - **After opening a PR, immediately enter the review-monitoring
   loop — do not ask the user whether to start it.** Drive the
   cadence with `/loop` — fixed-interval mode (e.g.
@@ -159,8 +164,8 @@ here so each tool's auto-load behaviour still finds something.
   watchers (background `gh` polls, file watchers, hooks) cannot
   trigger active follow-up, so they are not a substitute —
   without an active wake-up the agent never re-reads the PR.
-- **Default polling interval: 60s.** Gemini Code Assist /
-  CodeRabbit historically reply within ~1–3 minutes of a push or
+- **Default polling interval: 60s.** Claude Code review /
+  CodeRabbit typically reply within ~1–5 minutes of a push or
   thread reply, so a 60s tick catches them on the next wake-up
   without burning cache: 60s sits well inside the 5-minute
   prompt-cache TTL, so the conversation context stays cached
@@ -187,8 +192,13 @@ here so each tool's auto-load behaviour still finds something.
   the rate-limit exception below.)
 - **Reply to reviewers after pushing a fix.** Reply on the
   corresponding review thread with an **@-mention**
-  (`@gemini-code-assist` / `@coderabbitai`). Silent fixes are
-  invisible to reviewers and cost the audit trail.
+  (`@claude` / `@coderabbitai`). Silent fixes are invisible to
+  reviewers and cost the audit trail. Note `@claude` also
+  triggers the interactive responder
+  (`.github/workflows/claude.yml`, kata-managed) — it will
+  re-check the fix and reply on the thread; that re-check is the
+  point, but don't @-mention it for pure FYI notes that need no
+  verification.
 - A review thread is **settled** the moment the latest bot reply
   is ack-only ("Thank you" / "Understood" / a re-review summary
   with no new findings) or 30 minutes elapse with no actionable
@@ -217,13 +227,23 @@ Use [`renri`](https://github.com/yukimemi/renri) for any
 commit-bound change. From the main checkout:
 
 ```sh
-renri add <branch-name>            # create a worktree (jj-first)
-renri --vcs git add <branch-name>  # force a git worktree
+renri add <branch-name> --from main@origin            # create a worktree (jj-first), off latest upstream main
+renri --vcs git add <branch-name> --from origin/main  # force a git worktree, off latest upstream main
 renri remove <branch-name> -y --non-interactive  # cleanup after merge (agent-safe; see note)
 renri prune                        # GC stale worktrees
 ```
 
 Read-only inspection can stay on the main checkout.
+
+**Always pass `--from <upstream main>`** (`main@origin` for jj,
+`origin/main` for git). Without it, `renri add` forks off the *cwd
+worktree's current HEAD* — in a long-lived main checkout that often
+lags upstream, so the PR later shows up CONFLICTING against a `main`
+that had already moved (e.g. a refactor merged upstream before the
+branch was cut), forcing a manual re-port of the whole change.
+`renri add` does fetch first, but fetching only updates `main@origin`
+— it never moves the checkout's HEAD, so an explicit `--from` is what
+guarantees a fresh base.
 
 **Agents / non-interactive shells:** `renri remove` prints a details
 panel and waits for a confirmation prompt — without `-y` it **hangs**,
