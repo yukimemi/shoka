@@ -948,12 +948,13 @@ mod tests {
     use std::path::Path;
     use tempfile::TempDir;
 
-    /// Build a [`ShokaPaths`] whose config_dir points at the given
-    /// directory. Lets tests stage a config tree without polluting the
-    /// real `$XDG_CONFIG_HOME/shoka`.
+    /// Build a [`ShokaPaths`] fully rooted under the given directory
+    /// (config at `<dir>/config.toml` so tests can stage
+    /// `config.*.toml` siblings next to it, state/cache in subdirs).
+    /// Unlike the old `resolve(Some(...))` shape, this never leaves
+    /// state/cache pointed at the developer's real OS directories.
     fn paths_at(dir: &Path) -> ShokaPaths {
-        ShokaPaths::resolve(Some(&dir.join("config.toml")))
-            .expect("ShokaPaths::resolve with override")
+        ShokaPaths::rooted_at(dir)
     }
 
     #[test]
