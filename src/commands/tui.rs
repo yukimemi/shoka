@@ -255,6 +255,12 @@ enum Mode {
 
 struct App {
     rows: Vec<DashRow>,
+    /// Char count of the longest slug in [`rows`], precomputed once
+    /// at construction so [`render_table`] doesn't redo an O(N)
+    /// character-count sweep on every frame. Safe to cache: rows are
+    /// fixed for the lifetime of the TUI session — post-action
+    /// refreshes rewrite `status` / `gh`, never the slug set.
+    longest_slug: u16,
     /// Owners (`<owner>` in `<host>/<owner>/<name>`) the user counts
     /// as "theirs" — sourced from `[ui].own_owners`. Empty disables
     /// the mine-only feature entirely (no toggle pill, `m` is a
@@ -580,8 +586,17 @@ impl App {
         }
         let mut table_state = TableState::default();
         table_state.select(if matches.is_empty() { None } else { Some(0) });
+        // Sized to *all* rows, not the current matches, so the repo
+        // column doesn't jitter while the user types a filter.
+        let longest_slug = rows
+            .iter()
+            .map(|r| r.slug.chars().count())
+            .max()
+            .unwrap_or(0)
+            .min(usize::from(u16::MAX)) as u16;
         Self {
             rows,
+            longest_slug,
             own_owners,
             mine_only,
             filter: String::new(),
@@ -1024,9 +1039,95 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+/// Minimum width of the path column — the `Constraint::Min` in
+/// [`render_table`]'s widths array.
+const PATH_COL_MIN: u16 = 20;
+
+/// Fixed width the table consumes outside the repo and path columns:
+/// 2 block borders + 3 highlight symbol (`" ▶ "`) + 8 column gaps (9
+/// columns at the default `column_spacing` of 1) + the fixed-width
+/// columns (branch 14 + ↑↓ 8 + dirty 2 + PR 4 + CI 2 + activity 13 +
+/// tags 14 = 57). Must stay in sync with the `widths` array in
+/// [`render_table`].
+const COLS_FIXED: u16 = 2 + 3 + 8 + 57;
+
+/// Everything reserved away from the repo column: the fixed-width
+/// elements plus the path column's guaranteed minimum.
+const REPO_COL_RESERVED: u16 = COLS_FIXED + PATH_COL_MIN;
+
+/// Don't let the repo column collapse below this even on absurdly
+/// narrow terminals — `…/name` tails stop being legible. ratatui's
+/// layout solver squeezes further on its own when even the floor
+/// doesn't fit.
+const REPO_COL_FLOOR: u16 = 10;
+
+/// Width for the repo column: hug the longest slug (+1 for the
+/// leading pad span) when the terminal is wide, hand width back to
+/// the path column's `Min(20)` when it isn't. The previous
+/// `Percentage(28)` sizing truncated the *tail* of every slug on
+/// narrow terminals — and since every row shares the `host/owner/`
+/// prefix, the tail is exactly the part that tells repos apart.
+fn repo_column_width(area_width: u16, longest_slug: u16) -> u16 {
+    let available = area_width.saturating_sub(REPO_COL_RESERVED);
+    longest_slug
+        .saturating_add(1)
+        .min(available)
+        .max(REPO_COL_FLOOR)
+}
+
+/// Left-elide `s` to at most `max_chars` characters, keeping the
+/// tail. Used for the repo slug (`host/owner/name`) and the path
+/// cell — in both, every row shares a long common prefix and the
+/// tail is the part that tells rows apart, so when something has to
+/// go it's the prefix. Char-count width is fine here: slugs are
+/// ASCII on every forge shoka talks to, and shelf paths are
+/// overwhelmingly so (a non-ASCII path segment only costs a
+/// slightly-too-wide cell, which the Table then clips).
+fn elide_left(s: &str, max_chars: u16) -> String {
+    let max = max_chars as usize;
+    let len = s.chars().count();
+    if len <= max {
+        return s.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    // Slice at the char boundary instead of `.chars().collect()`ing
+    // a temporary String — one allocation (the `format!`) instead of
+    // two, and still UTF-8-safe via `char_indices`.
+    let skip_chars = len - (max - 1);
+    let byte_idx = s
+        .char_indices()
+        .nth(skip_chars)
+        .map(|(idx, _)| idx)
+        .unwrap_or(s.len());
+    format!("…{}", &s[byte_idx..])
+}
+
+/// Width the layout actually hands the path column once the repo
+/// column has taken `repo_w`: the leftover after every fixed-width
+/// element, floored at the column's `Min(PATH_COL_MIN)`. Mirrors the
+/// solve ratatui performs so [`elide_left`] can pre-truncate to the
+/// real budget instead of letting the Table cut the tail.
+fn path_column_width(area_width: u16, repo_w: u16) -> u16 {
+    area_width
+        .saturating_sub(COLS_FIXED)
+        .saturating_sub(repo_w)
+        .max(PATH_COL_MIN)
+}
+
 fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
     use ratatui::text::Span;
     use ratatui::widgets::Cell;
+
+    // Content-driven repo column width. `longest_slug` is cached on
+    // App (slugs never change mid-session), so this stays O(1) per
+    // frame.
+    let repo_w = repo_column_width(area.width, app.longest_slug);
+    // Path gets whatever the repo column left behind — same
+    // pre-truncation treatment so its tail (the directory name)
+    // survives narrow terminals too.
+    let path_w = path_column_width(area.width, repo_w);
 
     let header_row = Row::new(vec![
         Cell::from("  repo "),
@@ -1075,7 +1176,11 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
             Row::new(vec![
                 Cell::from(Line::from(vec![
                     Span::raw(" "),
-                    Span::styled(&row.slug, Style::default().fg(theme::TEXT)),
+                    // `repo_w - 1` budgets for the pad span above.
+                    Span::styled(
+                        elide_left(&row.slug, repo_w.saturating_sub(1)),
+                        Style::default().fg(theme::TEXT),
+                    ),
                 ])),
                 Cell::from(Span::styled(branch, Style::default().fg(theme::SKY))),
                 Cell::from(style_ahead_behind(&ahead_behind)),
@@ -1084,7 +1189,7 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
                 Cell::from(style_ci(&ci)),
                 Cell::from(Line::from(vec![Span::raw(" "), style_activity(activity)])),
                 Cell::from(Span::styled(
-                    row.path.to_string_lossy(),
+                    elide_left(&row.path.to_string_lossy(), path_w),
                     Style::default().fg(theme::OVERLAY),
                 )),
                 Cell::from(Span::styled(
@@ -1097,7 +1202,7 @@ fn render_table(f: &mut Frame, area: Rect, app: &mut App) {
         .collect();
 
     let widths = [
-        Constraint::Percentage(28), // repo
+        Constraint::Length(repo_w), // repo (content-driven; see repo_column_width)
         Constraint::Length(14),     // branch
         Constraint::Length(8),      // ↑N ↓N
         Constraint::Length(2),      // dirty glyph
@@ -2357,6 +2462,95 @@ mod tests {
         // Width tracks the input length (the column is sized for up to
         // ACTIVITY_WEEKS); a short young-repo history stays short.
         assert_eq!(sparkline(Some(&[1, 2, 3, 4, 5])).chars().count(), 5);
+    }
+
+    #[test]
+    fn elide_left_keeps_short_slug_unchanged() {
+        assert_eq!(
+            elide_left("github.com/yukimemi/shoka", 30),
+            "github.com/yukimemi/shoka"
+        );
+    }
+
+    #[test]
+    fn elide_left_exact_fit_is_unchanged() {
+        // "github.com/yukimemi/shoka" is 25 chars — exactly at the
+        // budget means no elision (the `…` would only eat a char).
+        assert_eq!(
+            elide_left("github.com/yukimemi/shoka", 25),
+            "github.com/yukimemi/shoka"
+        );
+    }
+
+    #[test]
+    fn elide_left_drops_the_prefix_not_the_name() {
+        // The whole point of left-elision: every row shares the
+        // `host/owner/` prefix, so the *name* tail is what
+        // distinguishes them — it must survive truncation.
+        assert_eq!(
+            elide_left("github.com/yukimemi/shoka", 15),
+            "…yukimemi/shoka"
+        );
+        assert_eq!(elide_left("github.com/yukimemi/shoka", 8), "…i/shoka");
+    }
+
+    #[test]
+    fn elide_left_handles_degenerate_widths() {
+        assert_eq!(elide_left("github.com/yukimemi/shoka", 1), "…");
+        assert_eq!(elide_left("github.com/yukimemi/shoka", 0), "");
+    }
+
+    #[test]
+    fn repo_column_width_tracks_longest_slug_when_roomy() {
+        // Wide terminal: the column hugs the longest slug (+1 for the
+        // leading pad span) instead of hoarding a fixed percentage,
+        // leaving the leftover width for the path column.
+        assert_eq!(repo_column_width(200, 25), 26);
+    }
+
+    #[test]
+    fn repo_column_width_clamps_so_path_keeps_its_minimum() {
+        // Narrow terminal: everything except the repo column is
+        // reserved (REPO_COL_RESERVED, which embeds the path column's
+        // Min(20)) — the repo column gets whatever is left rather
+        // than its full ask.
+        let w = repo_column_width(110, 60);
+        assert_eq!(w, 110 - REPO_COL_RESERVED);
+        assert!(w < 61);
+    }
+
+    #[test]
+    fn elide_left_keeps_path_tails_visible() {
+        // The path column has the same shape as the slug column:
+        // every row shares the `<root>/<host>/<owner>/` prefix, so
+        // the tail is the part worth keeping.
+        assert_eq!(
+            elide_left("C:/Users/yukimemi/src/github.com/yukimemi/shoka", 20),
+            "….com/yukimemi/shoka"
+        );
+    }
+
+    #[test]
+    fn path_column_width_takes_the_leftover_when_roomy() {
+        // Wide terminal: path absorbs everything the fixed columns
+        // and the (content-sized) repo column don't use.
+        assert_eq!(path_column_width(200, 26), 200 - COLS_FIXED - 26);
+    }
+
+    #[test]
+    fn path_column_width_floors_at_its_min_constraint() {
+        // Narrow terminal: mirror the widths array's Min(20) — the
+        // elision budget never drops below what ratatui guarantees
+        // the column.
+        assert_eq!(path_column_width(80, 30), PATH_COL_MIN);
+    }
+
+    #[test]
+    fn repo_column_width_never_collapses_below_floor() {
+        // Degenerate terminal: keep a usable floor so `…/name` tails
+        // stay legible; ratatui squeezes further on its own if even
+        // the floor doesn't fit.
+        assert_eq!(repo_column_width(40, 25), REPO_COL_FLOOR);
     }
 
     #[test]
