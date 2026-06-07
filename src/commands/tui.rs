@@ -2322,24 +2322,19 @@ mod tests {
         App::new(rows, Vec::new(), test_paths())
     }
 
-    /// Serializes every test in this module that reads or writes a
-    /// process-global environment variable through `ShokaPaths::
-    /// resolve`. `cargo test` runs tests on multiple threads, and a
-    /// concurrent getenv/setenv pair is a data race (UB — segfaults
-    /// or flaky failures), so any code path that touches the env must
-    /// hold this lock first.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Throwaway [`ShokaPaths`] for `App` construction in tests. The
-    /// tests that exercise post-action behaviour never reach a
-    /// successful capture (no-VCS temp dir / empty shelf), so these
-    /// paths are never actually written to — `resolve(None)` just
-    /// computes the OS default locations without creating anything.
-    /// Holds [`ENV_LOCK`] because `resolve` reads `SHOKA_CACHE_DIR` /
-    /// `SHOKA_STATE_DIR`, which another test may be mid-`set_var` on.
+    /// Throwaway [`ShokaPaths`] for `App` construction in tests,
+    /// rooted under a fixed (never-created) subdir of the system temp
+    /// dir — these tests only carry the paths around, so no physical
+    /// directory is needed. Previously this resolved the *real* OS
+    /// default locations and relied on no test ever writing through
+    /// them — a one-bad-test-away setup (the sibling hole in
+    /// `commands::cache`'s helper did wipe a real cache.toml on
+    /// 2026-06-07). `rooted_at` also reads no env vars, so the old
+    /// `ENV_LOCK` getenv/setenv serialization went with it.
     fn test_paths() -> ShokaPaths {
-        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        ShokaPaths::resolve(None).expect("resolve default paths for test")
+        static ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        let root = ROOT.get_or_init(|| std::env::temp_dir().join("shoka-tui-tests"));
+        ShokaPaths::rooted_at(root)
     }
 
     #[test]
@@ -3321,27 +3316,11 @@ mod tests {
         // Ok rather than erroring out the way a bare temp dir would.
         gix::init(&repo_root).expect("gix init");
 
-        // Redirect the cache file into the tempdir. The env var is set
-        // only across `resolve()` — `ShokaPaths` owns `cache_dir` once
-        // resolved, so later load/save don't re-read the env and the
-        // global mutation window stays as small as possible. Holding
-        // `ENV_LOCK` for that window serializes against any concurrent
-        // `test_paths()` resolve so the getenv/setenv pair isn't a
-        // data race under multi-threaded `cargo test`.
-        let cache_dir = tmp.path().join("cache");
-        let paths = {
-            let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let prev = std::env::var_os("SHOKA_CACHE_DIR");
-            unsafe {
-                std::env::set_var("SHOKA_CACHE_DIR", &cache_dir);
-                let p = ShokaPaths::resolve(None).expect("resolve paths");
-                match &prev {
-                    Some(v) => std::env::set_var("SHOKA_CACHE_DIR", v),
-                    None => std::env::remove_var("SHOKA_CACHE_DIR"),
-                }
-                p
-            }
-        };
+        // Root every shoka path inside the tempdir — no env-var
+        // round-trip needed (the old SHOKA_CACHE_DIR set/restore
+        // dance under ENV_LOCK existed only because `resolve` was
+        // the sole constructor).
+        let paths = ShokaPaths::rooted_at(tmp.path());
 
         let search_key = format!("github.com/yukimemi/repo {}", repo_root.display());
         let row = DashRow {

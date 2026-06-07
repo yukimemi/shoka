@@ -25,9 +25,13 @@
 //! - `SHOKA_STATE_DIR` — directory holding `state.toml`.
 //! - `SHOKA_CACHE_DIR` — directory holding `cache.toml`.
 //!
-//! Both are intended for integration tests that must not write into
-//! the user's real OS data directory; they're also documented for any
-//! advanced caller who deliberately wants non-default locations.
+//! Both are intended for CLI integration tests (assert_cmd-style
+//! tests that spawn the shoka binary as an external process, where
+//! in-process construction isn't reachable); they're also documented
+//! for any advanced caller who deliberately wants non-default
+//! locations. In-process unit tests must use [`ShokaPaths::rooted_at`]
+//! instead — it isolates *all* paths under one directory with no
+//! env-var or OS-default fallback.
 //!
 //! [pd]: https://docs.rs/directories/latest/directories/struct.ProjectDirs.html
 
@@ -85,6 +89,32 @@ impl ShokaPaths {
         })
     }
 
+    /// Build a `ShokaPaths` rooted *entirely* under `root`: config at
+    /// `<root>/config.toml` (so callers can stage `config.*.toml`
+    /// siblings next to it), state under `<root>/state`, cache under
+    /// `<root>/cache`. No env-var fallback, no OS defaults.
+    ///
+    /// This is the constructor test helpers must use. `resolve(Some(
+    /// config))` pins only the *config* path — state/cache silently
+    /// fall back to `SHOKA_*_DIR` or the user's real OS directories,
+    /// which is how a unit test's `Cache::default().save()` once
+    /// wiped the developer's real `cache.toml` on every `cargo test`
+    /// run (2026-06-07). Production startup still goes through
+    /// [`ShokaPaths::resolve`]; nothing here creates directories —
+    /// `save_to` does that on first write, same as resolve'd paths.
+    pub fn rooted_at(root: &Path) -> Self {
+        // Defensively absolutise so a test that later changes the
+        // process cwd (common in VCS-heavy tests) can't silently
+        // retarget a relative root — mirrors `resolve`'s handling.
+        let root = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
+        Self {
+            config_file: root.join("config.toml"),
+            config_dir: root.clone(),
+            state_dir: root.join("state"),
+            cache_dir: root.join("cache"),
+        }
+    }
+
     /// Directory the layered loader scans for `config.toml` +
     /// `config.*.toml` siblings.
     pub fn config_dir(&self) -> &Path {
@@ -132,6 +162,23 @@ fn env_override(var: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rooted_at_isolates_every_path_under_the_root() {
+        // The whole point of `rooted_at`: nothing escapes `root` — no
+        // env-var fallback, no OS default. A test helper that builds
+        // its paths this way can never clobber the developer's real
+        // state.toml / cache.toml the way `resolve(Some(config))`
+        // silently could (config pinned, state/cache still real —
+        // that exact hole let `cargo test` wipe a real cache.toml,
+        // 2026-06-07).
+        let root = std::env::temp_dir().join("shoka-rooted-at-test");
+        let p = ShokaPaths::rooted_at(&root);
+        assert_eq!(p.config_file(), root.join("config.toml"));
+        assert_eq!(p.config_dir(), root.as_path());
+        assert!(p.state_file().starts_with(&root), "{:?}", p.state_file());
+        assert!(p.cache_file().starts_with(&root), "{:?}", p.cache_file());
+    }
 
     #[test]
     fn resolve_default_paths_contain_shoka() {

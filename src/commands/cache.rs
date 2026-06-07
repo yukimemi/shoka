@@ -375,12 +375,33 @@ mod tests {
     use tempfile::TempDir;
 
     fn paths_at(tmp: &Path) -> crate::paths::ShokaPaths {
-        crate::paths::ShokaPaths::resolve(Some(&tmp.join("config.toml")))
-            .expect("ShokaPaths::resolve")
+        crate::paths::ShokaPaths::rooted_at(tmp)
     }
 
     fn sample(name: &str) -> Repo {
         Repo::new("github.com", "yukimemi", name)
+    }
+
+    #[test]
+    fn paths_at_never_points_at_the_real_cache() {
+        // Regression guard for the 2026-06-07 incident: the old
+        // helper pinned only the *config* path via
+        // `resolve(Some(...))`, leaving state/cache on the OS
+        // defaults — so `clear_empties_cache_file_atomically`'s
+        // `Cache::default().save()` wiped the developer's real
+        // cache.toml on every `cargo test` run.
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_at(tmp.path());
+        assert!(
+            paths.cache_file().starts_with(tmp.path()),
+            "cache must stay under the tempdir, got {:?}",
+            paths.cache_file()
+        );
+        assert!(
+            paths.state_file().starts_with(tmp.path()),
+            "state must stay under the tempdir, got {:?}",
+            paths.state_file()
+        );
     }
 
     #[test]
