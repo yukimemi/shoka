@@ -77,7 +77,7 @@ walkdir = "2.5.0"
 ratatui = "0.30.1"
 crossterm = "0.29"
 nucleo = "0.5"
-octocrab = "0.53.0"
+octocrab = "0.53.1"
 kaishin = "0.6.1"
 open = "5.3.5"
 
