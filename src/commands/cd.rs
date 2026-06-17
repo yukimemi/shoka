@@ -62,15 +62,7 @@ pub async fn run(ctx: &ShokaContext, args: CdArgs) -> Result<()> {
 
     // Tag filter first, then hint filter — mirrors `shoka list`'s
     // order so the two commands stay predictable together.
-    let tag_filtered: Vec<&Repo> = if args.tags.is_empty() {
-        shelf.repos.iter().collect()
-    } else {
-        shelf
-            .repos
-            .iter()
-            .filter(|r| args.tags.iter().all(|t| r.tags.iter().any(|rt| rt == t)))
-            .collect()
-    };
+    let tag_filtered = shelf.filter_by_tags(&args.tags);
     if tag_filtered.is_empty() {
         bail!(
             "no repos matched the tag filter ({} on the shelf total)",

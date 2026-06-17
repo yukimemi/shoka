@@ -333,6 +333,21 @@ impl Shelf {
         Some(self.repos.remove(pos))
     }
 
+    /// Borrow the repos carrying *every* tag in `tags` (AND semantics).
+    /// An empty `tags` slice matches the whole shelf. Shared by the
+    /// commands that narrow candidates by `--tag` (`cd`, `rm`, …) so the
+    /// filter rule stays identical across them.
+    pub fn filter_by_tags(&self, tags: &[String]) -> Vec<&Repo> {
+        if tags.is_empty() {
+            self.repos.iter().collect()
+        } else {
+            self.repos
+                .iter()
+                .filter(|r| tags.iter().all(|t| r.tags.iter().any(|rt| rt == t)))
+                .collect()
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.repos.len()
     }
@@ -629,6 +644,38 @@ mod tests {
                 .is_none()
         );
         assert_eq!(shelf.len(), 1);
+    }
+
+    #[test]
+    fn filter_by_tags_matches_and_semantics() {
+        let mut shelf = Shelf::default();
+        let mut a = sample_repo("a");
+        a.tags = vec!["rust".into(), "cli".into()];
+        let mut b = sample_repo("b");
+        b.tags = vec!["rust".into()];
+        let c = sample_repo("c"); // no tags
+        shelf.add(a).unwrap();
+        shelf.add(b).unwrap();
+        shelf.add(c).unwrap();
+
+        // Empty filter → whole shelf.
+        assert_eq!(shelf.filter_by_tags(&[]).len(), 3);
+
+        // Single tag → every repo carrying it.
+        let rust: Vec<_> = shelf
+            .filter_by_tags(&["rust".to_string()])
+            .iter()
+            .map(|r| r.name.clone())
+            .collect();
+        assert_eq!(rust, vec!["a".to_string(), "b".to_string()]);
+
+        // AND across tags → only the repo with both.
+        let both = shelf.filter_by_tags(&["rust".to_string(), "cli".to_string()]);
+        assert_eq!(both.len(), 1);
+        assert_eq!(both[0].name, "a");
+
+        // A tag nobody carries → empty.
+        assert!(shelf.filter_by_tags(&["ghost".to_string()]).is_empty());
     }
 
     #[test]

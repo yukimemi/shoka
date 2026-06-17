@@ -45,15 +45,7 @@ pub async fn run(ctx: &ShokaContext, args: RmArgs) -> Result<()> {
 
     // Tag filter first, then hint filter — same order as `shoka cd` /
     // `shoka list` so the three commands narrow candidates identically.
-    let tag_filtered: Vec<&Repo> = if args.tags.is_empty() {
-        shelf.repos.iter().collect()
-    } else {
-        shelf
-            .repos
-            .iter()
-            .filter(|r| args.tags.iter().all(|t| r.tags.iter().any(|rt| rt == t)))
-            .collect()
-    };
+    let tag_filtered = shelf.filter_by_tags(&args.tags);
     if tag_filtered.is_empty() {
         bail!(
             "no repos matched the tag filter ({} on the shelf total)",
@@ -210,8 +202,17 @@ impl RepoId {
     }
 }
 
-/// Delete the working tree (unless `keep_files`) and drop the entry
-/// from the shelf. Returns what happened to the directory.
+/// Drop the entry from the shelf and delete the working tree (unless
+/// `keep_files`). Returns what happened to the directory.
+///
+/// Order matters: the shelf entry is removed from the in-memory shelf
+/// **first**, before any destructive disk I/O. The chosen repo came
+/// straight off this shelf, so a miss is a logic bug — surfacing it
+/// here means we bail *before* deleting anything rather than after, so
+/// a (should-never-happen) disagreement can't leave files gone while
+/// the entry lingers. And because the caller only `save()`s the shelf
+/// on `Ok`, a failed or partial `delete_tree` leaves the on-disk shelf
+/// untouched — the entry survives and the user can simply retry.
 ///
 /// A missing directory is **not** an error: the user's goal is "this
 /// repo is gone", and a clone someone already `rm -rf`'d by hand
@@ -219,16 +220,6 @@ impl RepoId {
 /// so. Any other I/O error (permission denied, busy, …) propagates so
 /// we never silently report success while the files are still there.
 fn remove_entry(shelf: &mut Shelf, id: &RepoId, path: &Path, keep_files: bool) -> Result<Outcome> {
-    let outcome = if keep_files {
-        Outcome::KeptFiles
-    } else {
-        delete_tree(path)?
-    };
-
-    // The chosen repo came straight off this shelf a few lines ago, so
-    // the lookup must hit — a miss means the in-memory shelf and our
-    // captured identity disagree, which is a logic bug worth surfacing
-    // rather than silently saving an unchanged shelf.
     if shelf
         .remove_by_path(&id.host, &id.owner, &id.name, id.path.as_deref())
         .is_none()
@@ -239,7 +230,11 @@ fn remove_entry(shelf: &mut Shelf, id: &RepoId, path: &Path, keep_files: bool) -
         );
     }
 
-    Ok(outcome)
+    if keep_files {
+        Ok(Outcome::KeptFiles)
+    } else {
+        delete_tree(path)
+    }
 }
 
 /// Delete whatever sits at the clone path. Almost always a directory
@@ -308,11 +303,12 @@ async fn cleanliness(path: &Path) -> Cleanliness {
 /// inconclusive rather than fatal — the caller treats Unknown as
 /// "proceed with the normal confirmation".
 async fn jj_cleanliness(path: &Path) -> Cleanliness {
-    let jj = match which::which("jj") {
-        Ok(p) => p,
-        Err(_) => return Cleanliness::Unknown("jj not found on PATH".into()),
-    };
-    let mut cmd = tokio::process::Command::new(&jj);
+    // Spawn `jj` directly and let the OS resolve it on PATH, rather than
+    // a synchronous `which::which` lookup — that would do blocking disk
+    // I/O on the async executor. A `NotFound` spawn error is the
+    // "jj isn't installed" case, mapped to Unknown so it never blocks a
+    // removal.
+    let mut cmd = tokio::process::Command::new("jj");
     cmd.arg("diff")
         .arg("--summary")
         .current_dir(path)
@@ -334,6 +330,9 @@ async fn jj_cleanliness(path: &Path) -> Cleanliness {
             out.status,
             String::from_utf8_lossy(&out.stderr).trim()
         )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Cleanliness::Unknown("jj not found on PATH".into())
+        }
         Err(e) => Cleanliness::Unknown(format!("spawning `jj diff` failed: {e}")),
     }
 }

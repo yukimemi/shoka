@@ -81,11 +81,13 @@ jobs:
           macos_arm="${FORMULA}-aarch64-apple-darwin.tar.gz"
           linux_x86="${FORMULA}-x86_64-unknown-linux-musl.tar.gz"
 
-          # Pull the release tarballs and checksum them. --retry rides
-          # over the brief window where a just-published release's assets
-          # are still settling on the CDN.
-          curl -fsSL --retry 5 --retry-delay 5 "${base}/${macos_arm}" -o "${macos_arm}"
-          curl -fsSL --retry 5 --retry-delay 5 "${base}/${linux_x86}" -o "${linux_x86}"
+          # Pull the release tarballs and checksum them. --retry-all-errors
+          # is essential alongside --retry: plain --retry only covers
+          # network-level failures, but a just-published asset still
+          # settling on GitHub's CDN returns HTTP 404, which --retry alone
+          # would abort on immediately.
+          curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors "${base}/${macos_arm}" -o "${macos_arm}"
+          curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors "${base}/${linux_x86}" -o "${linux_x86}"
           macos_sha="$(sha256sum "${macos_arm}" | cut -d' ' -f1)"
           linux_sha="$(sha256sum "${linux_x86}" | cut -d' ' -f1)"
 
