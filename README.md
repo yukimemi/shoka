@@ -46,11 +46,20 @@ git-only and stop at `list` / `look`. shoka picks up from there:
 ## Install
 
 ```sh
+# crates.io
 cargo install shoka
+
+# Homebrew (macOS Apple Silicon / Linux x86_64)
+brew install yukimemi/tap/shoka
 ```
 
 Pre-built binaries for Linux / macOS / Windows are attached to each
-[GitHub release](https://github.com/yukimemi/shoka/releases).
+[GitHub release](https://github.com/yukimemi/shoka/releases). The
+Homebrew formula is published to
+[`yukimemi/homebrew-tap`](https://github.com/yukimemi/homebrew-tap)
+automatically on every release (see
+`.github/workflows/homebrew.yml`); Intel macOS / Windows users install
+via `cargo install` or the release archives.
 
 ## Quick start
 

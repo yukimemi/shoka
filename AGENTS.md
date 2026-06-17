@@ -178,6 +178,26 @@ Checklist when re-recording:
    to rebuild: `docker rmi shoka-vhs` (plus
    `docker builder prune` if space is tight).
 
+## Homebrew tap
+
+`brew install yukimemi/tap/shoka` is served by a formula in the
+`yukimemi/homebrew-tap` repo, kept current by the consumer-owned
+`.github/workflows/homebrew.yml` (NOT kata-managed, so edits there
+survive `kata apply`). On every published release it checksums the
+Apple-Silicon + Linux-x86_64 tarballs, renders `Formula/shoka.rb`, and
+pushes it to the tap. Two one-time prerequisites — without them the job
+logs a warning and no-ops, so a release is never blocked:
+
+1. The tap repo `yukimemi/homebrew-tap` must exist (an empty repo is
+   enough; the first run creates `Formula/shoka.rb`).
+2. A `HOMEBREW_TAP_TOKEN` secret on this repo — a PAT (classic, `repo`
+   scope, or fine-grained with `contents: write` on the tap) so the
+   workflow can push cross-repo. Set once with
+   `gh secret set HOMEBREW_TAP_TOKEN`.
+
+To backfill the formula for a release cut before the workflow existed,
+run it manually: `gh workflow run homebrew.yml -f tag=vX.Y.Z`.
+
 <!-- kata:agents:base:begin -->
 ## Shared conventions
 
