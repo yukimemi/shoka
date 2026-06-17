@@ -852,6 +852,182 @@ fn prune_yes_removes_stale_entries() {
     );
 }
 
+#[test]
+fn rm_empty_shelf_errors_cleanly() {
+    let (mut cmd, _tmp) = cmd_with_isolated_config();
+    let assertion = cmd.args(["rm", "shoka", "--yes"]).assert().failure();
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("shelf is empty"),
+        "expected empty-shelf error, got: {stderr}"
+    );
+}
+
+#[test]
+fn rm_no_matching_hint_errors_cleanly() {
+    let (mut cmd, tmp) = cmd_with_isolated_config();
+    seed_shelf(
+        &tmp.path().join("state"),
+        &[("github.com", "yukimemi", "shoka")],
+    );
+    let assertion = cmd.args(["rm", "no-such-repo", "--yes"]).assert().failure();
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("no repos on the shelf match"),
+        "expected no-match error, got: {stderr}"
+    );
+}
+
+#[test]
+fn rm_unique_hint_deletes_tree_and_drops_entry() {
+    let (mut cmd, tmp) = cmd_with_isolated_config();
+    let state_dir = tmp.path().join("state");
+    seed_shelf(
+        &state_dir,
+        &[
+            ("github.com", "yukimemi", "shoka"),
+            ("github.com", "yukimemi", "renri"),
+        ],
+    );
+    let clone = tmp.path().join("root/github.com/yukimemi/shoka");
+    std::fs::create_dir_all(&clone).unwrap();
+    std::fs::write(clone.join("README.md"), "hi").unwrap();
+
+    let assertion = cmd.args(["rm", "shoka", "--yes"]).assert().success();
+    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).to_string();
+    assert!(
+        stdout.contains("working tree deleted"),
+        "expected deletion summary, got: {stdout}"
+    );
+    assert!(!clone.exists(), "working tree should be deleted on disk");
+
+    let body = std::fs::read_to_string(state_dir.join("state.toml")).unwrap();
+    assert!(
+        !body.contains("shoka"),
+        "shoka entry should be gone: {body}"
+    );
+    assert!(body.contains("renri"), "renri should remain: {body}");
+}
+
+#[test]
+fn rm_keep_files_drops_entry_but_leaves_tree() {
+    let (mut cmd, tmp) = cmd_with_isolated_config();
+    let state_dir = tmp.path().join("state");
+    seed_shelf(&state_dir, &[("github.com", "yukimemi", "shoka")]);
+    let clone = tmp.path().join("root/github.com/yukimemi/shoka");
+    std::fs::create_dir_all(&clone).unwrap();
+
+    let assertion = cmd
+        .args(["rm", "shoka", "--yes", "--keep-files"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).to_string();
+    assert!(
+        stdout.contains("files kept on disk"),
+        "expected keep-files summary, got: {stdout}"
+    );
+    assert!(clone.exists(), "--keep-files must leave the working tree");
+
+    let body = std::fs::read_to_string(state_dir.join("state.toml")).unwrap();
+    assert!(!body.contains("shoka"), "entry should be dropped: {body}");
+}
+
+#[test]
+fn rm_refuses_dirty_tree_under_yes_then_force_overrides() {
+    // The safety gate: a working tree with uncommitted changes must not
+    // be deleted by a scripted `rm -y`; `--force` is the explicit
+    // override. Uses the real `git` CLI to stage a committed-then-
+    // modified file (gix needs a HEAD to compare against); skips if git
+    // isn't installed so the suite still runs on a gix-only box.
+    if std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+    let (mut cmd, tmp) = cmd_with_isolated_config();
+    let state_dir = tmp.path().join("state");
+    seed_shelf(&state_dir, &[("github.com", "yukimemi", "shoka")]);
+    let clone = tmp.path().join("root/github.com/yukimemi/shoka");
+    std::fs::create_dir_all(&clone).unwrap();
+
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&clone)
+            .output()
+            .expect("run git")
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@example.com"]);
+    git(&["config", "user.name", "tester"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(clone.join("tracked.txt"), "v1\n").unwrap();
+    git(&["add", "."]);
+    let committed = git(&["commit", "-q", "--no-gpg-sign", "-m", "init"]);
+    if !committed.status.success() {
+        return; // couldn't commit in this env — can't stage a dirty tree.
+    }
+    // Modify the tracked file → dirty working tree.
+    std::fs::write(clone.join("tracked.txt"), "v2 — edited\n").unwrap();
+
+    // `rm -y` refuses, and leaves both the tree and the shelf entry.
+    let assertion = cmd.args(["rm", "shoka", "--yes"]).assert().failure();
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("uncommitted changes"),
+        "expected dirty-tree refusal, got: {stderr}"
+    );
+    assert!(clone.exists(), "refused rm must not delete the tree");
+    let body = std::fs::read_to_string(state_dir.join("state.toml")).unwrap();
+    assert!(
+        body.contains("shoka"),
+        "refused rm must not touch the shelf"
+    );
+
+    // `--force` overrides the guard and removes it.
+    let (mut cmd2, _) = {
+        // Rebuild a command against the same dirs (assert_cmd commands
+        // are single-use). Reuse the existing tmp paths via env.
+        let mut c = Command::cargo_bin("shoka").expect("binary built");
+        c.env("SHOKA_CONFIG", tmp.path().join("config.toml"))
+            .env("SHOKA_STATE_DIR", &state_dir)
+            .env("SHOKA_CACHE_DIR", tmp.path().join("cache"))
+            .env_remove("SHOKA_PROFILE");
+        (c, ())
+    };
+    cmd2.args(["rm", "shoka", "--yes", "--force"])
+        .assert()
+        .success();
+    assert!(!clone.exists(), "--force must delete the dirty tree");
+    let body = std::fs::read_to_string(state_dir.join("state.toml")).unwrap();
+    assert!(!body.contains("shoka"), "--force must drop the shelf entry");
+}
+
+#[test]
+fn rm_dry_run_changes_nothing() {
+    let (mut cmd, tmp) = cmd_with_isolated_config();
+    let state_dir = tmp.path().join("state");
+    seed_shelf(&state_dir, &[("github.com", "yukimemi", "shoka")]);
+    let clone = tmp.path().join("root/github.com/yukimemi/shoka");
+    std::fs::create_dir_all(&clone).unwrap();
+
+    let assertion = cmd.args(["rm", "shoka", "--dry-run"]).assert().success();
+    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).to_string();
+    assert!(
+        stdout.contains("would") && stdout.contains("dry run"),
+        "expected dry-run preview, got: {stdout}"
+    );
+    assert!(clone.exists(), "dry run must not delete the working tree");
+
+    let body = std::fs::read_to_string(state_dir.join("state.toml")).unwrap();
+    assert!(
+        body.contains("shoka"),
+        "dry run must not touch the shelf: {body}"
+    );
+}
+
 /// Smoke test that the binary builds, parses args, and exits cleanly
 /// for `--help`. Catches surface-level clap regressions early without
 /// poking at any specific subcommand.
@@ -861,7 +1037,15 @@ fn help_prints_subcommands_and_exits_zero() {
     let mut cmd = Command::new(bin);
     let assertion = cmd.arg("--help").assert().success();
     let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).to_string();
-    for expected in ["clone", "list", "import", "cache", "doctor", "self-update"] {
+    for expected in [
+        "clone",
+        "list",
+        "import",
+        "cache",
+        "doctor",
+        "self-update",
+        "rm",
+    ] {
         assert!(
             stdout.contains(expected),
             "--help should mention `{expected}` subcommand, got: {stdout}"

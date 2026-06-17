@@ -241,7 +241,11 @@ fn hex_upper(nibble: u8) -> char {
 /// Match `hint` against the candidate slugs (case-insensitive
 /// substring). One hit ⇒ return it directly. Multiple ⇒ open a
 /// fuzzy picker pre-seeded with the narrowed set. Zero ⇒ error out.
-fn choose_by_hint<'a>(candidates: &[&'a Repo], hint: &str, page_size: usize) -> Result<&'a Repo> {
+pub(crate) fn choose_by_hint<'a>(
+    candidates: &[&'a Repo],
+    hint: &str,
+    page_size: usize,
+) -> Result<&'a Repo> {
     let hint_lc = hint.to_lowercase();
     let matches: Vec<&'a Repo> = candidates
         .iter()
@@ -278,7 +282,11 @@ fn choose_by_hint<'a>(candidates: &[&'a Repo], hint: &str, page_size: usize) -> 
 ///
 /// `page_size` is the number of rows shown at once, sourced from
 /// `[global.ui].cd_page_size` (floored at 1 by the config resolver).
-fn fuzzy_pick<'a>(candidates: &[&'a Repo], prompt: &str, page_size: usize) -> Result<&'a Repo> {
+pub(crate) fn fuzzy_pick<'a>(
+    candidates: &[&'a Repo],
+    prompt: &str,
+    page_size: usize,
+) -> Result<&'a Repo> {
     if candidates.is_empty() {
         // Defensive: callers already filter to non-empty, but in case
         // a future caller forgets, surface the empty-case explicitly.

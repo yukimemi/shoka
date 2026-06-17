@@ -46,6 +46,10 @@ pub enum Command {
     /// Propose stale / merged repo candidates for cleanup.
     Prune(PruneArgs),
 
+    /// Remove a repo: delete its working tree and drop it from the shelf
+    /// (no arg ⇒ fuzzy-select).
+    Rm(RmArgs),
+
     /// Adopt an existing ghq tree (or any directory hierarchy in
     /// `<root>/<host>/<owner>/<name>` shape).
     Import(ImportArgs),
@@ -209,6 +213,39 @@ pub struct PruneArgs {
     /// habit). No-op when combined with `--dry-run`.
     #[arg(long, short)]
     pub yes: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct RmArgs {
+    /// Repository hint (URL or owner/name fragment). Omitted ⇒ fuzzy-select.
+    pub repo: Option<String>,
+
+    /// Restrict fuzzy candidates by tag (repeatable; AND semantics).
+    #[arg(long = "tag", value_name = "TAG")]
+    pub tags: Vec<String>,
+
+    /// Don't remove anything; just print what would be removed.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Skip the interactive confirmation. Since `rm` deletes a working
+    /// tree, the prompt defaults to "no" — pass this only when you're
+    /// sure (a `--dry-run` first is a good habit). A repo with
+    /// uncommitted changes still refuses under `--yes` unless `--force`
+    /// is also given, so a scripted `rm -y` can't silently lose work.
+    #[arg(long, short)]
+    pub yes: bool,
+
+    /// Delete even when the working tree has uncommitted git / jj
+    /// changes. Bypasses the dirty-tree safety check.
+    #[arg(long, short)]
+    pub force: bool,
+
+    /// Drop the shelf entry but leave the working tree on disk. The
+    /// shelf-only "forget this repo" mode — handy when you've already
+    /// moved the clone elsewhere by hand.
+    #[arg(long)]
+    pub keep_files: bool,
 }
 
 #[derive(Debug, Args)]

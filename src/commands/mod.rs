@@ -15,6 +15,7 @@ pub mod list;
 pub mod new;
 pub mod note;
 pub mod prune;
+pub mod rm;
 pub mod set;
 pub mod tag;
 pub mod tui;
@@ -70,6 +71,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Cd(a) => cd::run(&ctx, a).await,
         Command::Exec(a) => exec::run(&ctx, a).await,
         Command::Prune(a) => prune::run(&ctx, a).await,
+        Command::Rm(a) => rm::run(&ctx, a).await,
         Command::Import(a) => import::run(&ctx, a).await,
         Command::Export(a) => export::run(&ctx, a).await,
         Command::Tag(t) => match t {
