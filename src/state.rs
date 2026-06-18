@@ -313,6 +313,41 @@ impl Shelf {
         Some(self.repos.remove(pos))
     }
 
+    /// Remove and return a repo by the full `(host, owner, name, path)`
+    /// identity. The path-aware counterpart to [`remove`](Self::remove):
+    /// when the shelf carries multiple checkouts of one remote (same
+    /// triple, distinct `path` overrides), this targets exactly the one
+    /// the caller resolved rather than [`remove`]'s first-match. Same
+    /// `Some`/`None` path-matching rule as
+    /// [`find_by_path`](Self::find_by_path).
+    pub fn remove_by_path(
+        &mut self,
+        host: &str,
+        owner: &str,
+        name: &str,
+        path: Option<&Path>,
+    ) -> Option<Repo> {
+        let pos = self.repos.iter().position(|r| {
+            r.host == host && r.owner == owner && r.name == name && r.path.as_deref() == path
+        })?;
+        Some(self.repos.remove(pos))
+    }
+
+    /// Borrow the repos carrying *every* tag in `tags` (AND semantics).
+    /// An empty `tags` slice matches the whole shelf. Shared by the
+    /// commands that narrow candidates by `--tag` (`cd`, `rm`, …) so the
+    /// filter rule stays identical across them.
+    pub fn filter_by_tags(&self, tags: &[String]) -> Vec<&Repo> {
+        if tags.is_empty() {
+            self.repos.iter().collect()
+        } else {
+            self.repos
+                .iter()
+                .filter(|r| tags.iter().all(|t| r.tags.iter().any(|rt| rt == t)))
+                .collect()
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.repos.len()
     }
@@ -569,6 +604,91 @@ mod tests {
             shelf.remove("github.com", "yukimemi", "ghost").is_none(),
             "removing a non-existent repo returns None, not an error"
         );
+    }
+
+    #[test]
+    fn remove_by_path_targets_the_matching_checkout() {
+        // Two checkouts of the same remote, distinguished by path.
+        // `remove_by_path` must drop exactly the one whose path matches
+        // and leave the other in place — first-match `remove` can't.
+        let mut shelf = Shelf::default();
+        let mut a = sample_repo("admintask");
+        let pa = PathBuf::from("/a/DeviceManagement");
+        a.path = Some(pa.clone());
+        let mut b = sample_repo("admintask");
+        let pb = PathBuf::from("/b/admintask-backup");
+        b.path = Some(pb.clone());
+        shelf.add(a).unwrap();
+        shelf.add(b).unwrap();
+
+        let removed = shelf
+            .remove_by_path("github.com", "yukimemi", "admintask", Some(&pb))
+            .expect("path-pinned entry removed");
+        assert_eq!(removed.path.as_deref(), Some(pb.as_path()));
+        assert_eq!(shelf.len(), 1);
+        assert_eq!(
+            shelf.repos[0].path.as_deref(),
+            Some(pa.as_path()),
+            "the other checkout must survive"
+        );
+
+        // A path that matches no entry returns None without mutating.
+        assert!(
+            shelf
+                .remove_by_path(
+                    "github.com",
+                    "yukimemi",
+                    "admintask",
+                    Some(Path::new("/nope"))
+                )
+                .is_none()
+        );
+        assert_eq!(shelf.len(), 1);
+    }
+
+    #[test]
+    fn filter_by_tags_matches_and_semantics() {
+        let mut shelf = Shelf::default();
+        let mut a = sample_repo("a");
+        a.tags = vec!["rust".into(), "cli".into()];
+        let mut b = sample_repo("b");
+        b.tags = vec!["rust".into()];
+        let c = sample_repo("c"); // no tags
+        shelf.add(a).unwrap();
+        shelf.add(b).unwrap();
+        shelf.add(c).unwrap();
+
+        // Empty filter → whole shelf.
+        assert_eq!(shelf.filter_by_tags(&[]).len(), 3);
+
+        // Single tag → every repo carrying it.
+        let rust: Vec<_> = shelf
+            .filter_by_tags(&["rust".to_string()])
+            .iter()
+            .map(|r| r.name.clone())
+            .collect();
+        assert_eq!(rust, vec!["a".to_string(), "b".to_string()]);
+
+        // AND across tags → only the repo with both.
+        let both = shelf.filter_by_tags(&["rust".to_string(), "cli".to_string()]);
+        assert_eq!(both.len(), 1);
+        assert_eq!(both[0].name, "a");
+
+        // A tag nobody carries → empty.
+        assert!(shelf.filter_by_tags(&["ghost".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn remove_by_path_with_none_matches_layout_entry() {
+        // A layout-derived entry (path = None) is removable by passing
+        // `None` — the same None-matches-None rule `find_by_path` uses.
+        let mut shelf = Shelf::default();
+        shelf.add(sample_repo("shoka")).unwrap();
+        let removed = shelf
+            .remove_by_path("github.com", "yukimemi", "shoka", None)
+            .expect("path-less entry removed");
+        assert_eq!(removed.name, "shoka");
+        assert!(shelf.is_empty());
     }
 
     #[test]

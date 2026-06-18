@@ -46,11 +46,22 @@ git-only and stop at `list` / `look`. shoka picks up from there:
 ## Install
 
 ```sh
+# crates.io
 cargo install shoka
+
+# Homebrew (macOS Apple Silicon / Linux x86_64)
+brew install yukimemi/tap/shoka
 ```
 
 Pre-built binaries for Linux / macOS / Windows are attached to each
-[GitHub release](https://github.com/yukimemi/shoka/releases).
+[GitHub release](https://github.com/yukimemi/shoka/releases). The
+Homebrew formula is published to
+[`yukimemi/homebrew-tap`](https://github.com/yukimemi/homebrew-tap)
+automatically on every release (see
+`.github/workflows/homebrew.yml`); Intel macOS / Windows users install
+via `cargo install` or the release archives. (The same tap also serves
+other `yukimemi` tools, so `brew tap yukimemi/tap` once and they're all
+a `brew install` away.)
 
 ## Quick start
 
@@ -82,6 +93,7 @@ shoka exec --tag rust -- cargo check
 | `shoka cd [hint]` | Resolve a repo to its on-disk path (use the shell wrapper to actually `cd`). |
 | `shoka exec -- <cmd>` | Run `<cmd>` in each matching repo in parallel; output is captured + banner-headed per repo. |
 | `shoka prune` | Drop shelf entries whose clone path is missing on disk. `--dry-run` to rehearse; `--yes` to skip the prompt. |
+| `shoka rm [hint]` | Remove one repo: delete its working tree **and** drop it from the shelf (no arg ⇒ fuzzy-select). Confirmation defaults to "no"; `--dry-run` to preview, `--yes` to skip the prompt, `--keep-files` to forget it without deleting on disk. Refuses a tree with uncommitted git/jj changes unless `--force`. |
 | `shoka cache {refresh,show,clear}` | Per-repo volatile cache. Auto-refreshed in the background after most commands. |
 | `shoka doctor` | Diagnose environment + config. |
 | `shoka init-shell <shell>` | Print a shell wrapper that claims the `shoka` name and chdirs the parent shell on `cd` / `tui` (see below). |

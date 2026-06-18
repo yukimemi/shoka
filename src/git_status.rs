@@ -84,6 +84,19 @@ fn head_branch(repo: &gix::Repository) -> Option<String> {
     }
 }
 
+/// Best-effort working-tree dirtiness for the repo at `repo_root`.
+///
+/// A focused entry point for callers (e.g. `shoka rm`'s pre-delete
+/// safety gate) that need only the clean/dirty bit, not the full
+/// [`capture`] snapshot with its ahead/behind walk. Mirrors
+/// [`capture`]'s `dirty` semantics exactly — it shares the same
+/// [`is_dirty`] core — so the two never drift. Errors propagate so the
+/// caller can decide how cautious to be when the repo can't be read.
+pub fn is_dirty_at(repo_root: &Path) -> Result<bool> {
+    let repo = gix::open(repo_root)?;
+    is_dirty(&repo)
+}
+
 /// Is the working tree dirty? Errors are treated as "couldn't
 /// tell" — gix's status path can fail on weird repo states (broken
 /// symlinks, permission issues on a single file) and we'd rather

@@ -62,15 +62,7 @@ pub async fn run(ctx: &ShokaContext, args: CdArgs) -> Result<()> {
 
     // Tag filter first, then hint filter — mirrors `shoka list`'s
     // order so the two commands stay predictable together.
-    let tag_filtered: Vec<&Repo> = if args.tags.is_empty() {
-        shelf.repos.iter().collect()
-    } else {
-        shelf
-            .repos
-            .iter()
-            .filter(|r| args.tags.iter().all(|t| r.tags.iter().any(|rt| rt == t)))
-            .collect()
-    };
+    let tag_filtered = shelf.filter_by_tags(&args.tags);
     if tag_filtered.is_empty() {
         bail!(
             "no repos matched the tag filter ({} on the shelf total)",
@@ -241,7 +233,11 @@ fn hex_upper(nibble: u8) -> char {
 /// Match `hint` against the candidate slugs (case-insensitive
 /// substring). One hit ⇒ return it directly. Multiple ⇒ open a
 /// fuzzy picker pre-seeded with the narrowed set. Zero ⇒ error out.
-fn choose_by_hint<'a>(candidates: &[&'a Repo], hint: &str, page_size: usize) -> Result<&'a Repo> {
+pub(crate) fn choose_by_hint<'a>(
+    candidates: &[&'a Repo],
+    hint: &str,
+    page_size: usize,
+) -> Result<&'a Repo> {
     let hint_lc = hint.to_lowercase();
     let matches: Vec<&'a Repo> = candidates
         .iter()
@@ -278,7 +274,11 @@ fn choose_by_hint<'a>(candidates: &[&'a Repo], hint: &str, page_size: usize) -> 
 ///
 /// `page_size` is the number of rows shown at once, sourced from
 /// `[global.ui].cd_page_size` (floored at 1 by the config resolver).
-fn fuzzy_pick<'a>(candidates: &[&'a Repo], prompt: &str, page_size: usize) -> Result<&'a Repo> {
+pub(crate) fn fuzzy_pick<'a>(
+    candidates: &[&'a Repo],
+    prompt: &str,
+    page_size: usize,
+) -> Result<&'a Repo> {
     if candidates.is_empty() {
         // Defensive: callers already filter to non-empty, but in case
         // a future caller forgets, surface the empty-case explicitly.
