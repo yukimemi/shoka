@@ -185,15 +185,23 @@ Checklist when re-recording:
 `.github/workflows/homebrew.yml` (NOT kata-managed, so edits there
 survive `kata apply`). On every published release it checksums the
 Apple-Silicon + Linux-x86_64 tarballs, renders `Formula/shoka.rb`, and
-pushes it to the tap. Two one-time prerequisites — without them the job
-logs a warning and no-ops, so a release is never blocked:
+pushes it to the tap.
 
-1. The tap repo `yukimemi/homebrew-tap` must exist (an empty repo is
-   enough; the first run creates `Formula/shoka.rb`).
-2. A `HOMEBREW_TAP_TOKEN` secret on this repo — a PAT (classic, `repo`
-   scope, or fine-grained with `contents: write` on the tap) so the
-   workflow can push cross-repo. Set once with
-   `gh secret set HOMEBREW_TAP_TOKEN`.
+The tap repo already exists — `shun` publishes a GUI Cask
+(`Casks/shun.rb`) there via the same pattern, and shoka's CLI
+`Formula/shoka.rb` coexists with it. The only prerequisite is a
+`HOMEBREW_TAP_PAT` secret on this repo (a PAT with `contents: write` on
+the tap). **The name matches `shun`'s release workflow on purpose** so
+one PAT covers both; if it's set at the org/user level it's inherited,
+otherwise `gh secret set HOMEBREW_TAP_PAT`. Without it the job logs a
+warning and no-ops, so a release is never blocked.
+
+shun bumps its single-`.dmg` cask in place with `perl`; shoka renders
+the whole formula instead, because its two platform blocks (macOS arm64
++ Linux x86_64) carry distinct `sha256`s that a blanket in-place
+substitution would clobber. shun also inlines the tap push into its own
+`release.yml`; shoka can't (its `release.yml` is kata-managed), hence
+the standalone `homebrew.yml`.
 
 To backfill the formula for a release cut before the workflow existed,
 run it manually: `gh workflow run homebrew.yml -f tag=vX.Y.Z`.

@@ -11,12 +11,17 @@ name: Homebrew
 # Silicon) + Linux (x86_64 musl) tarballs, renders `Formula/shoka.rb`,
 # and pushes it to the tap.
 #
-# Prerequisites (one-time):
-#   1. A tap repo at `yukimemi/homebrew-tap` (an empty repo is fine —
-#      the first run creates `Formula/shoka.rb`).
-#   2. A `HOMEBREW_TAP_TOKEN` secret on THIS repo: a PAT (or fine-grained
-#      token) with `contents: write` on the tap repo. Without it the job
-#      logs a warning and no-ops, so a release is never blocked on setup.
+# The tap repo `yukimemi/homebrew-tap` already exists (shun publishes a
+# Cask there); this job just adds `Formula/shoka.rb` alongside it — a
+# CLI formula coexists with shun's GUI cask in the same tap. The secret
+# name `HOMEBREW_TAP_PAT` is shared with shun's release workflow on
+# purpose, so the same PAT covers both.
+#
+# Prerequisite (one-time): a `HOMEBREW_TAP_PAT` secret on THIS repo — a
+# PAT (or fine-grained token) with `contents: write` on the tap. If it's
+# already an org/user-level secret it's inherited; otherwise set it with
+# `gh secret set HOMEBREW_TAP_PAT`. Without it the job logs a warning and
+# no-ops, so a release is never blocked on setup.
 
 on:
   release:
@@ -47,10 +52,10 @@ jobs:
       - name: Check tap token
         id: check
         env:
-          TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TOKEN: ${{ secrets.HOMEBREW_TAP_PAT }}
         run: |
           if [ -z "${TOKEN}" ]; then
-            echo "::warning::HOMEBREW_TAP_TOKEN is not set — skipping tap update. Add a PAT with contents:write on ${TAP_REPO} to enable it."
+            echo "::warning::HOMEBREW_TAP_PAT is not set — skipping tap update. Add a PAT with contents:write on ${TAP_REPO} to enable it."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -140,7 +145,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: ${{ env.TAP_REPO }}
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          token: ${{ secrets.HOMEBREW_TAP_PAT }}
           path: tap
 
       - name: Commit and push formula

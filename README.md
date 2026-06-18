@@ -59,7 +59,9 @@ Homebrew formula is published to
 [`yukimemi/homebrew-tap`](https://github.com/yukimemi/homebrew-tap)
 automatically on every release (see
 `.github/workflows/homebrew.yml`); Intel macOS / Windows users install
-via `cargo install` or the release archives.
+via `cargo install` or the release archives. (The same tap also serves
+other `yukimemi` tools, so `brew tap yukimemi/tap` once and they're all
+a `brew install` away.)
 
 ## Quick start
 
