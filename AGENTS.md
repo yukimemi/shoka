@@ -183,7 +183,13 @@ Checklist when re-recording:
 `brew install yukimemi/tap/shoka` is served by a formula in the
 `yukimemi/homebrew-tap` repo, kept current by the consumer-owned
 `.github/workflows/homebrew.yml` (NOT kata-managed, so edits there
-survive `kata apply`). On every published release it checksums the
+survive `kata apply`). It triggers on `workflow_run` after the
+`Release` workflow finishes — **not** `release: published`: release.yml
+creates the GitHub Release with the default `GITHUB_TOKEN`, and GitHub
+won't let a `GITHUB_TOKEN`-authored event trigger another workflow (the
+same recursion guard that makes `auto-tag.yml` push its tag with a PAT),
+so a `release`-triggered job would never fire. By the time `Release`
+reports success its assets are uploaded, so the job checksums the
 Apple-Silicon + Linux-x86_64 tarballs, renders `Formula/shoka.rb`, and
 pushes it to the tap.
 

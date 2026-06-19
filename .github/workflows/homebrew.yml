@@ -7,9 +7,19 @@ name: Homebrew
 # This file is consumer-owned (NOT kata-managed), so edits here survive
 # `kata apply`. It deliberately lives apart from the kata-managed
 # `release.yml`: that workflow builds + uploads the binaries; this one
-# reacts to the finished GitHub Release, checksums the macOS (Apple
-# Silicon) + Linux (x86_64 musl) tarballs, renders `Formula/shoka.rb`,
-# and pushes it to the tap.
+# reacts to its completion, checksums the macOS (Apple Silicon) + Linux
+# (x86_64 musl) tarballs, renders `Formula/shoka.rb`, and pushes it to
+# the tap.
+#
+# Trigger: `workflow_run` after the "Release" workflow finishes — NOT
+# `release: published`. release.yml creates the GitHub Release with the
+# default `GITHUB_TOKEN`, and GitHub deliberately does NOT let a
+# `GITHUB_TOKEN`-authored event (the published release) trigger another
+# workflow — the same recursion guard that makes `auto-tag.yml` push its
+# tag with a PAT. A `release`-triggered job would therefore never fire.
+# `workflow_run` chains off the upstream run regardless of token, and by
+# the time "Release" reports success its assets are already uploaded, so
+# the checksums below resolve.
 #
 # The tap repo `yukimemi/homebrew-tap` already exists (shun publishes a
 # Cask there); this job just adds `Formula/shoka.rb` alongside it — a
@@ -24,8 +34,9 @@ name: Homebrew
 # no-ops, so a release is never blocked on setup.
 
 on:
-  release:
-    types: [published]
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
   # Manual re-publish for an existing tag (e.g. after fixing the tap, or
   # backfilling the formula for a release cut before this workflow
   # existed).
@@ -48,6 +59,13 @@ jobs:
   formula:
     name: publish formula to tap
     runs-on: ubuntu-latest
+    # On the `workflow_run` path, only act on a *successful* Release run
+    # for a version tag (`head_branch` is the tag, e.g. `v0.21.0`). A
+    # manual `workflow_dispatch` always proceeds.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
     steps:
       - name: Check tap token
         id: check
@@ -68,7 +86,9 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             tag="${{ inputs.tag }}"
           else
-            tag="${{ github.event.release.tag_name }}"
+            # workflow_run: the upstream Release run's head_branch is the
+            # tag it was pushed for (e.g. v0.21.0).
+            tag="${{ github.event.workflow_run.head_branch }}"
           fi
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
