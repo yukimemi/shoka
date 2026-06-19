@@ -74,7 +74,7 @@ walkdir = "2.5.0"
 # TUI (Phase 2 dashboard). nucleo carries the fuzzy-match algorithm
 # only — inquire still handles the CLI single-shot pickers (`cd` no-arg
 # etc.); nucleo lives entirely inside the ratatui app.
-ratatui = "0.30.1"
+ratatui = "0.30.2"
 crossterm = "0.29"
 nucleo = "0.5"
 octocrab = "0.53.1"
