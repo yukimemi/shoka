@@ -240,12 +240,23 @@ mod tests {
         // variable: status`, breaking `shoka cd` under zsh (#146).
         // Guard against the reserved name creeping back in.
         let body = rendered(SupportedShell::Zsh, "shoka");
+        // Match the *usage* of a `status` variable (declaration,
+        // assignment, or reference) rather than the bare substring, so
+        // an unrelated future comment or command name containing
+        // "status" doesn't trip a false positive.
+        let uses_status = body.contains("status=")
+            || body.contains("$status")
+            || body.lines().any(|l| {
+                l.trim_start().starts_with("local ") && l.split_whitespace().any(|w| w == "status")
+            });
         assert!(
-            !body.contains("status"),
-            "posix wrapper must not use the zsh-readonly `status` variable: {body}"
+            !uses_status,
+            "posix wrapper must not declare, assign, or reference the zsh-readonly `status` variable: {body}"
         );
+        // The exit code lives in `rc`. Order-independent so adding or
+        // reordering locals doesn't break the guard.
         assert!(
-            body.contains("local tmp dest rc"),
+            body.contains("local ") && body.contains(" rc"),
             "posix wrapper should hold the exit code in `rc`: {body}"
         );
     }
