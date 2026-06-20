@@ -49,6 +49,12 @@ fn posix_wrapper(name: &str) -> String {
     // common action (drop into the dashboard) is a single keystroke.
     // `set -- tui` rewrites the positional args; the `cd|tui` case
     // arm below then routes correctly.
+    //
+    // The exit code is held in `rc`, not `status`: this wrapper is
+    // shared with zsh, where `status` is a readonly special parameter
+    // (an alias for `$?`), so `local ... status` / `status=$?` would
+    // abort with `read-only variable: status` (#146). `rc` is plain
+    // in both bash and zsh.
     format!(
         r#"{name}() {{
     if [ $# -eq 0 ]; then
@@ -56,16 +62,16 @@ fn posix_wrapper(name: &str) -> String {
     fi
     case "$1" in
         cd|tui)
-            local tmp dest status
+            local tmp dest rc
             tmp=$(mktemp) || return 1
             {env}="$tmp" command shoka "$@"
-            status=$?
-            if [ "$status" -eq 0 ]; then
+            rc=$?
+            if [ "$rc" -eq 0 ]; then
                 dest=$(cat "$tmp")
             fi
             rm -f "$tmp"
-            [ "$status" -eq 0 ] && [ -n "$dest" ] && cd -- "$dest"
-            return $status
+            [ "$rc" -eq 0 ] && [ -n "$dest" ] && cd -- "$dest"
+            return $rc
             ;;
         *)
             command shoka "$@"
@@ -223,6 +229,24 @@ mod tests {
         assert!(
             !body.contains("$(command shoka cd"),
             "wrapper must not capture stdout via command substitution: {body}"
+        );
+    }
+
+    #[test]
+    fn posix_wrapper_avoids_zsh_readonly_status_variable() {
+        // The posix wrapper is shared with zsh, where `status` is a
+        // readonly special parameter (an alias for `$?`). Declaring or
+        // assigning to it aborts the function with `read-only
+        // variable: status`, breaking `shoka cd` under zsh (#146).
+        // Guard against the reserved name creeping back in.
+        let body = rendered(SupportedShell::Zsh, "shoka");
+        assert!(
+            !body.contains("status"),
+            "posix wrapper must not use the zsh-readonly `status` variable: {body}"
+        );
+        assert!(
+            body.contains("local tmp dest rc"),
+            "posix wrapper should hold the exit code in `rc`: {body}"
         );
     }
 
