@@ -180,7 +180,7 @@ jobs:
 
       - name: Checkout tap
         if: steps.check.outputs.skip != 'true'
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ env.TAP_REPO }}
           token: ${{ secrets.HOMEBREW_TAP_PAT }}
