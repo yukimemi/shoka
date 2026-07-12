@@ -31,7 +31,7 @@ path = "src/main.rs"
 
 [dependencies]
 # config / templating
-teravars = { version = "0.2.0", features = ["merge", "std-helpers"] }
+teravars = { version = "0.2.1", features = ["merge", "std-helpers"] }
 serde = { version = "1.0.228", features = ["derive"] }
 toml = "1.1.2"
 
