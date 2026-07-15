@@ -45,7 +45,7 @@ tokio = { version = "1.52.3", features = ["full"] }
 
 # misc
 directories = "6.0.0"
-which = "8.0.4"
+which = "8.0.5"
 anyhow = "1.0.103"
 thiserror = "2.0.18"
 tracing = "0.1.44"
