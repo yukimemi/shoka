@@ -41,7 +41,7 @@ clap_complete = "4.6.7"
 inquire = "0.9.4"
 
 # async / parallel exec
-tokio = { version = "1.52.3", features = ["full"] }
+tokio = { version = "1.52.4", features = ["full"] }
 
 # misc
 directories = "6.0.0"
