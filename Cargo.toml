@@ -47,7 +47,7 @@ tokio = { version = "1.53.0", features = ["full"] }
 directories = "6.0.0"
 which = "8.0.5"
 anyhow = "1.0.104"
-thiserror = "2.0.18"
+thiserror = "2.0.19"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 owo-colors = "4.3.0"
