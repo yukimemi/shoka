@@ -46,7 +46,7 @@ tokio = { version = "1.53.0", features = ["full"] }
 # misc
 directories = "6.0.0"
 which = "8.0.5"
-anyhow = "1.0.103"
+anyhow = "1.0.104"
 thiserror = "2.0.18"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
