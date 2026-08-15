@@ -2,7 +2,9 @@
 //!
 //! A ratatui app over the shelf. Each row is a repo with its slug,
 //! tags, and resolved clone path. Navigation is j/k (or arrow keys),
-//! `/` opens a filter input that nucleo scores in real time, Enter
+//! `/` opens a filter input that nucleo scores in real time, `s`
+//! cycles the row sort (shelf order / name / activity / dirty / PRs /
+//! issues), Enter
 //! exits the TUI and emits the chosen repo's path via the same
 //! `SHOKA_CD_OUT` sidechannel contract `shoka cd` uses — the shell
 //! wrapper that already services `cd` picks up TUI's output without
@@ -278,6 +280,107 @@ enum Mode {
     Filter,
 }
 
+/// Active row ordering for the dashboard table. [`SortMode::Identity`]
+/// is shelf order (insertion order of `shelf.repos`, which the shelf
+/// makes no guarantee about); the other modes rank rows by repo name,
+/// recent commit activity, working-tree dirtiness, or open-PR count.
+/// Applied to `matches` when the filter is empty, and as the
+/// tie-breaker when fuzzy scores come out equal. Cycled by `s`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortMode {
+    Identity,
+    Name,
+    Activity,
+    Dirty,
+    Prs,
+    Issues,
+}
+
+impl SortMode {
+    /// Cycle order for `s`: default first so the first press gives a
+    /// visible reorder and the mode wraps back to shelf order.
+    const ALL: [SortMode; 6] = [
+        SortMode::Identity,
+        SortMode::Name,
+        SortMode::Activity,
+        SortMode::Dirty,
+        SortMode::Prs,
+        SortMode::Issues,
+    ];
+
+    fn next(self) -> SortMode {
+        let i = Self::ALL.iter().position(|&m| m == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+
+    /// Short label for the header chip + the `s` status banner. The
+    /// arrow is rank direction: `↑` ascending (A→Z at top), `↓`
+    /// descending (most interesting at top). `Identity` has no arrow
+    /// because shelf order has no comparable direction.
+    fn label(self) -> &'static str {
+        match self {
+            SortMode::Identity => "shelf",
+            SortMode::Name => "name ↑",
+            SortMode::Activity => "activity ↓",
+            SortMode::Dirty => "dirty ↓",
+            SortMode::Prs => "prs ↓",
+            SortMode::Issues => "issues ↓",
+        }
+    }
+}
+
+/// Total committed in the snapshot's activity window (at most
+/// [`crate::gh::ACTIVITY_WEEKS`] entries). `None` when the gh
+/// snapshot is absent — non-github host, no token, or not refreshed
+/// yet. Summed as `u64` so a pathological high-throughput repo can't
+/// wrap the sort key.
+fn weekly_total(row: &DashRow) -> Option<u64> {
+    row.gh
+        .as_ref()
+        .and_then(|g| g.weekly_commits.as_deref())
+        .map(|w| w.iter().map(|&c| u64::from(c)).sum())
+}
+
+/// Dirtiness tier for sorting: 0 = dirty (uncommitted changes), 1 =
+/// clean, 2 = unknown (never refreshed). Ranked ascending so dirty
+/// rows float to the top; `None` is deliberately last — "don't know"
+/// is not "clean".
+fn dirty_tier(row: &DashRow) -> u8 {
+    match row.status.as_ref() {
+        Some(s) if s.dirty => 0,
+        Some(_) => 1,
+        None => 2,
+    }
+}
+
+/// Order two rows per `sort`. `Identity` compares equal so the caller's
+/// stable sort keeps shelf order intact. `Name` is case-insensitive
+/// (repo names are conventionally lowercase but owners aren't) with a
+/// slug tie-break for same-named repos under different owners.
+/// `Activity` / `Prs` wrap the key in `Reverse` so the *most* active /
+/// most-PR'd rows rank first and unmeasured rows (None) sink last.
+fn cmp_rows(a: &DashRow, b: &DashRow, sort: SortMode) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match sort {
+        SortMode::Identity => Ordering::Equal,
+        SortMode::Name => a
+            .name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
+            .then_with(|| a.slug.cmp(&b.slug)),
+        SortMode::Activity => {
+            std::cmp::Reverse(weekly_total(a)).cmp(&std::cmp::Reverse(weekly_total(b)))
+        }
+        SortMode::Dirty => dirty_tier(a).cmp(&dirty_tier(b)),
+        SortMode::Prs => std::cmp::Reverse(a.gh.as_ref().and_then(|g| g.open_pr_count)).cmp(
+            &std::cmp::Reverse(b.gh.as_ref().and_then(|g| g.open_pr_count)),
+        ),
+        SortMode::Issues => std::cmp::Reverse(a.gh.as_ref().and_then(|g| g.open_issue_count)).cmp(
+            &std::cmp::Reverse(b.gh.as_ref().and_then(|g| g.open_issue_count)),
+        ),
+    }
+}
+
 struct App {
     rows: Vec<DashRow>,
     /// Char count of the longest repo `name` in [`rows`], precomputed
@@ -301,6 +404,11 @@ struct App {
     /// [`own_owners`]. Initialised to `!own_owners.is_empty()` so a
     /// configured user lands directly on their shelf; toggled by `m`.
     mine_only: bool,
+    /// Active row ordering for the table — see [`SortMode`]. Applied
+    /// to `matches` when the filter is empty (the fuzzy view keeps
+    /// nucleo's score ordering and consults this only on ties).
+    /// Cycled by `s`.
+    sort: SortMode,
     /// Filter query (the live input). Empty in normal mode.
     filter: String,
     /// Indices into `rows`, sorted by nucleo score (highest first).
@@ -642,6 +750,7 @@ impl App {
             longest_ctx,
             own_owners,
             mine_only,
+            sort: SortMode::Identity,
             filter: String::new(),
             matches,
             cursor: 0,
@@ -694,11 +803,21 @@ impl App {
         });
     }
 
+    /// Advance to the next [`SortMode`] and re-rank the table. The
+    /// status banner names the mode that's now active (with its rank
+    /// direction), mirroring the header chip.
+    fn cycle_sort(&mut self) {
+        self.sort = self.sort.next();
+        self.refilter();
+        self.status_message = Some(format!("sort: {}", self.sort.label()));
+    }
+
     /// Recompute `matches` against `filter` + the mine-only scope.
-    /// Empty filter = identity (everything in shelf order, restricted
-    /// to mine when [`mine_only`] is set); otherwise nucleo scores
-    /// each row's `search_key` (slug + path) and we keep the matches
-    /// sorted by score descending. Path is in the haystack so that
+    /// Empty filter = the sort-mode ordering (default: shelf order,
+    /// restricted to mine when [`mine_only`] is set); otherwise nucleo
+    /// scores each row's `search_key` (slug + path) and we keep the
+    /// matches sorted by score descending, with the sort mode as the
+    /// tie-breaker for equal scores. Path is in the haystack so that
     /// multiple path-pinned checkouts of the same remote can be
     /// distinguished by typing part of the dir name. The mine-only
     /// gate is applied *before* scoring so non-owned rows never enter
@@ -710,6 +829,12 @@ impl App {
             self.matches = (0..self.rows.len())
                 .filter(|&i| !self.mine_only || self.is_mine(&self.rows[i]))
                 .collect();
+            // `sort_by` is stable, so `Identity` (which compares
+            // equal) preserves the shelf's insertion order.
+            if self.sort != SortMode::Identity {
+                self.matches
+                    .sort_by(|&a, &b| cmp_rows(&self.rows[a], &self.rows[b], self.sort));
+            }
         } else {
             let pattern = Pattern::parse(&self.filter, CaseMatching::Smart, Normalization::Smart);
             let mut scored: Vec<(usize, u32)> = Vec::new();
@@ -724,9 +849,13 @@ impl App {
                     scored.push((idx, score));
                 }
             }
-            // Sort by score descending — Reverse so `sort_by_key`
-            // gives the natural "best match first" ordering.
-            scored.sort_by_key(|&(_, score)| std::cmp::Reverse(score));
+            // Score descending first — relevance is the point of the
+            // fuzzy view; the sort mode breaks ties between equal
+            // scores so `s` still has a visible effect mid-filter.
+            scored.sort_by(|&(ia, sa), &(ib, sb)| {
+                sb.cmp(&sa)
+                    .then_with(|| cmp_rows(&self.rows[ia], &self.rows[ib], self.sort))
+            });
             self.matches = scored.into_iter().map(|(idx, _)| idx).collect();
         }
         self.cursor = 0;
@@ -946,6 +1075,7 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<O
                     KeyCode::Char('y') => yank_selected_slug(app),
                     KeyCode::Char('o') => open_selected_repo_home(app),
                     KeyCode::Char('m') => app.toggle_mine_only(),
+                    KeyCode::Char('s') => app.cycle_sort(),
                     KeyCode::Char('j') | KeyCode::Down => app.move_down(),
                     KeyCode::Char('k') | KeyCode::Up => app.move_up(),
                     KeyCode::Char('g') => {
@@ -1069,6 +1199,17 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
                     theme::PEACH
                 })
                 .add_modifier(Modifier::BOLD),
+        ));
+    }
+    // Surface the active sort mode when it isn't the default (shelf
+    // order) — the same chip idiom as the scope marker, reading as
+    // "the table is deliberately not in shelf order right now".
+    // Sky distinguishes it from the teal/peach scope chip at a glance.
+    if app.sort != SortMode::Identity {
+        spans.push(Span::styled("  ◇ ", Style::default().fg(theme::OVERLAY)));
+        spans.push(Span::styled(
+            app.sort.label(),
+            Style::default().fg(theme::SKY).add_modifier(Modifier::BOLD),
         ));
     }
     if !app.filter.is_empty() {
@@ -1566,6 +1707,7 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
             if !app.own_owners.is_empty() {
                 pills.push(("m", if app.mine_only { "all" } else { "mine" }));
             }
+            pills.push(("s", "sort"));
             pills.extend_from_slice(&[
                 ("i", "iss"),
                 ("p", "PR"),
@@ -1668,6 +1810,10 @@ fn render_help(f: &mut Frame, area: Rect) {
                 ("G", "jump to bottom"),
                 ("/", "filter — type to narrow, esc to clear"),
                 ("m", "toggle mine / all (needs [ui].own_owners)"),
+                (
+                    "s",
+                    "cycle sort — shelf / name / activity / dirty / PRs / issues",
+                ),
                 ("Enter", "select (emit path for the shell wrapper to cd)"),
             ],
         ),
@@ -2535,6 +2681,7 @@ mod tests {
         };
         let shared_gh = GhSnapshot {
             open_pr_count: Some(7),
+            open_issue_count: Some(2),
             ci_status: Some(CiStatus::Success),
             weekly_commits: Some(vec![1, 0, 3, 2]),
         };
@@ -2819,6 +2966,40 @@ mod tests {
     }
 
     #[test]
+    fn ui_header_shows_sort_chip_only_when_not_default() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let header_line = |app: &mut App| -> String {
+            let backend = TestBackend::new(100, 4);
+            let mut terminal = Terminal::new(backend).expect("test terminal");
+            terminal.draw(|f| ui(f, app)).expect("draw");
+            let buf = terminal.backend().buffer();
+            (0..buf.area.width)
+                .map(|x| buf.cell((x, 0)).expect("cell").symbol())
+                .collect()
+        };
+
+        // Default (shelf) sort: no chip — the header only advertises
+        // deliberate deviations from shelf order.
+        let mut app = app(rows(&["a", "b"]));
+        let default = header_line(&mut app);
+        assert!(
+            !default.contains("shelf"),
+            "identity sort must not render a chip: {default}"
+        );
+
+        // A non-default mode surfaces the chip, direction arrow and
+        // all — the same at-a-glance marker the scope chip provides.
+        app.cycle_sort();
+        let sorted = header_line(&mut app);
+        assert!(
+            sorted.contains("name ↑"),
+            "header should show the active sort after `s`: {sorted}"
+        );
+    }
+
+    #[test]
     fn display_path_leaves_foreign_prefixes_alone() {
         use std::path::Path;
         // Not under home → untouched.
@@ -2859,6 +3040,7 @@ mod tests {
     fn gh_cells_renders_count_and_status_glyph() {
         let snap = GhSnapshot {
             open_pr_count: Some(5),
+            open_issue_count: None,
             ci_status: Some(CiStatus::Success),
             weekly_commits: None,
         };
@@ -2871,6 +3053,7 @@ mod tests {
     fn gh_cells_clamps_pr_count_at_99_plus() {
         let snap = GhSnapshot {
             open_pr_count: Some(150),
+            open_issue_count: None,
             ci_status: None,
             weekly_commits: None,
         };
@@ -2884,6 +3067,7 @@ mod tests {
         // The cell strings must differ so the user can tell.
         let zero = GhSnapshot {
             open_pr_count: Some(0),
+            open_issue_count: None,
             ci_status: None,
             weekly_commits: None,
         };
@@ -2905,6 +3089,7 @@ mod tests {
         ] {
             let snap = GhSnapshot {
                 open_pr_count: None,
+                open_issue_count: None,
                 ci_status: Some(status),
                 weekly_commits: None,
             };
@@ -2976,6 +3161,184 @@ mod tests {
         let mut app = app(rows(&["alpha", "beta", "gamma"]));
         app.refilter();
         assert_eq!(app.matches, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn sort_identity_preserves_shelf_order() {
+        // `Identity` compares rows equal, so the stable sort must
+        // leave insertion order untouched whatever the shelf held.
+        let mut app = app(rows(&["zeta", "alpha", "mid"]));
+        app.sort = SortMode::Identity;
+        app.refilter();
+        assert_eq!(app.matches, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn sort_name_orders_case_insensitively_with_slug_tiebreak() {
+        // `Beta` vs `beta` tie on the lowercased name — the slug
+        // (`x/Beta` < `x/beta` byte-wise) breaks it, deterministically.
+        let mut app = app(rows(&["x/Beta", "x/alpha", "x/Gamma", "x/beta"]));
+        app.sort = SortMode::Name;
+        app.refilter();
+        let names: Vec<&str> = app
+            .matches
+            .iter()
+            .map(|&i| app.rows[i].name.as_str())
+            .collect();
+        assert_eq!(names, ["alpha", "Beta", "beta", "Gamma"]);
+    }
+
+    #[test]
+    fn sort_activity_most_commits_first_unknown_last() {
+        use crate::gh::GhSnapshot;
+        let mut app = app(rows(&["a", "b", "c", "d"]));
+        app.rows[0].gh = Some(GhSnapshot {
+            open_pr_count: None,
+            open_issue_count: None,
+            ci_status: None,
+            weekly_commits: Some(vec![1, 2]),
+        }); // 3
+        app.rows[1].gh = None; // unknown — must sink below every measured row
+        app.rows[2].gh = Some(GhSnapshot {
+            open_pr_count: None,
+            open_issue_count: None,
+            ci_status: None,
+            weekly_commits: Some(vec![10, 20]),
+        }); // 30
+        app.rows[3].gh = Some(GhSnapshot {
+            open_pr_count: None,
+            open_issue_count: None,
+            ci_status: None,
+            weekly_commits: Some(vec![0, 0]),
+        }); // 0 — measured-but-dormant still beats unknown
+        app.sort = SortMode::Activity;
+        app.refilter();
+        let slugs: Vec<&str> = app
+            .matches
+            .iter()
+            .map(|&i| app.rows[i].slug.as_str())
+            .collect();
+        assert_eq!(slugs, ["c", "a", "d", "b"]);
+    }
+
+    #[test]
+    fn sort_dirty_ranks_dirty_first_unknown_last() {
+        use crate::git_status::GitStatusSnapshot;
+        let clean = |dirty: bool| GitStatusSnapshot {
+            branch: None,
+            dirty,
+            ahead: None,
+            behind: None,
+        };
+        let mut app = app(rows(&["a", "b", "c", "d"]));
+        app.rows[0].status = Some(clean(false)); // clean
+        app.rows[1].status = None; // unknown
+        app.rows[2].status = Some(clean(true)); // dirty
+        app.rows[3].status = Some(clean(false)); // clean
+        app.sort = SortMode::Dirty;
+        app.refilter();
+        let slugs: Vec<&str> = app
+            .matches
+            .iter()
+            .map(|&i| app.rows[i].slug.as_str())
+            .collect();
+        // c (dirty) first, then the two clean rows in shelf order,
+        // then the never-refreshed row at the bottom.
+        assert_eq!(slugs, ["c", "a", "d", "b"]);
+    }
+
+    #[test]
+    fn sort_prs_most_open_first_unknown_last() {
+        use crate::gh::GhSnapshot;
+        let snap = |n: Option<usize>| GhSnapshot {
+            open_pr_count: n,
+            open_issue_count: None,
+            ci_status: None,
+            weekly_commits: None,
+        };
+        let mut app = app(rows(&["a", "b", "c", "d"]));
+        app.rows[0].gh = Some(snap(Some(5)));
+        app.rows[1].gh = Some(snap(Some(5))); // ties with a → shelf order
+        app.rows[2].gh = Some(snap(Some(9)));
+        app.rows[3].gh = None;
+        app.sort = SortMode::Prs;
+        app.refilter();
+        let slugs: Vec<&str> = app
+            .matches
+            .iter()
+            .map(|&i| app.rows[i].slug.as_str())
+            .collect();
+        assert_eq!(slugs, ["c", "a", "b", "d"]);
+    }
+
+    #[test]
+    fn cycle_sort_walks_all_modes_and_wraps() {
+        let mut app = app(rows(&["beta", "alpha", "gamma"]));
+        app.cycle_sort();
+        assert_eq!(app.sort, SortMode::Name);
+        assert_eq!(app.status_message.as_deref(), Some("sort: name ↑"));
+        // The re-rank is live, not just a label.
+        let names: Vec<&str> = app
+            .matches
+            .iter()
+            .map(|&i| app.rows[i].name.as_str())
+            .collect();
+        assert_eq!(names, ["alpha", "beta", "gamma"]);
+        app.cycle_sort();
+        assert_eq!(app.sort, SortMode::Activity);
+        app.cycle_sort();
+        assert_eq!(app.sort, SortMode::Dirty);
+        app.cycle_sort();
+        assert_eq!(app.sort, SortMode::Prs);
+        app.cycle_sort();
+        assert_eq!(app.sort, SortMode::Issues);
+        // Sixth press wraps back to shelf order.
+        app.cycle_sort();
+        assert_eq!(app.sort, SortMode::Identity);
+        assert_eq!(app.matches, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn sort_issues_most_open_first_unknown_last() {
+        use crate::gh::GhSnapshot;
+        let snap = |n: Option<usize>| GhSnapshot {
+            open_pr_count: None,
+            open_issue_count: n,
+            ci_status: None,
+            weekly_commits: None,
+        };
+        let mut app = app(rows(&["a", "b", "c", "d"]));
+        app.rows[0].gh = Some(snap(Some(5)));
+        app.rows[1].gh = Some(snap(Some(1)));
+        app.rows[2].gh = Some(snap(Some(9)));
+        app.rows[3].gh = None;
+        app.sort = SortMode::Issues;
+        app.refilter();
+        let slugs: Vec<&str> = app
+            .matches
+            .iter()
+            .map(|&i| app.rows[i].slug.as_str())
+            .collect();
+        assert_eq!(slugs, ["c", "a", "b", "d"]);
+    }
+
+    #[test]
+    fn sort_tiebreaks_equal_fuzzy_scores_in_filtered_view() {
+        let mut app = app(rows(&["x/beta", "x/alpha"]));
+        // Identical haystacks force identical nucleo scores, so the
+        // active sort mode is the only discriminator — proving `s`
+        // still has an effect while a filter is active.
+        app.rows[0].search_key = "same haystack".into();
+        app.rows[1].search_key = "same haystack".into();
+        app.sort = SortMode::Name;
+        app.filter = "same".into();
+        app.refilter();
+        let names: Vec<&str> = app
+            .matches
+            .iter()
+            .map(|&i| app.rows[i].name.as_str())
+            .collect();
+        assert_eq!(names, ["alpha", "beta"]);
     }
 
     #[test]
