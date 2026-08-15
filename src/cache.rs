@@ -627,6 +627,7 @@ mod tests {
         use crate::gh::{CiStatus, GhSnapshot};
         let populated = GhSnapshot {
             open_pr_count: Some(3),
+            open_issue_count: None,
             ci_status: Some(CiStatus::Success),
             weekly_commits: None,
         };

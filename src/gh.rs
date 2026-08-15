@@ -17,6 +17,8 @@
 //! What [`capture_snapshot`] populates, per repo:
 //!
 //! - `open_pr_count` — open pull requests against the default branch.
+//! - `open_issue_count` — open issues (PRs excluded — GitHub folds
+//!   them into the `/issues` listing).
 //! - `ci_status` — most recent workflow run conclusion on the
 //!   default branch (Success / Failure / Pending / Skipped / …).
 //!   `None` when there are no runs or the Actions API returned no
@@ -41,6 +43,14 @@ pub struct GhSnapshot {
     /// Open pull-request count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_pr_count: Option<usize>,
+
+    /// Open issue count, PRs excluded (GitHub folds pull requests
+    /// into the `/issues` listing, so the count filters them out).
+    /// Additive `Option` field — an older cache loads it as `None`
+    /// and self-heals on the next `cache refresh`, so no
+    /// `CACHE_VERSION` bump is needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_issue_count: Option<usize>,
 
     /// Conclusion of the most recent workflow run. Wire-stable
     /// variants — bumping `CACHE_VERSION` is required when adding
@@ -151,6 +161,18 @@ pub fn build_client(token: &str) -> Result<Octocrab> {
 /// "API errored", which is now a hard fail.
 pub async fn capture_snapshot(client: &Octocrab, owner: &str, name: &str) -> Result<GhSnapshot> {
     let open_pr_count = open_pr_count(client, owner, name).await?;
+    // Best-effort like the activity sparkline, not hard-fail like the
+    // PR/CI calls: `/issues` returns a *permanent* `410 Gone` for
+    // repos with the Issues feature disabled in their settings.
+    // Propagating that with `?` would wedge the whole snapshot (PR
+    // count / CI / activity included) for that repo on every refresh
+    // forever — the 410 never heals, so the hard-fail contract
+    // ("error → keep the previous snapshot, retry next refresh")
+    // becomes a permanent outage instead of a transient skip.
+    // Collapsing to `None` keeps the other fields fresh and sorts
+    // the repo last in the TUI's issues mode — the right visible
+    // outcome for "this repo has no issues data".
+    let open_issue_count = open_issue_count(client, owner, name).await.ok();
     let ci_status = latest_ci_status(client, owner, name).await?;
     // Best-effort, unlike the PR/CI calls above: the activity
     // sparkline is a softer signal, and `/stats/commit_activity` 202s
@@ -165,6 +187,7 @@ pub async fn capture_snapshot(client: &Octocrab, owner: &str, name: &str) -> Res
         .flatten();
     Ok(GhSnapshot {
         open_pr_count: Some(open_pr_count),
+        open_issue_count,
         ci_status,
         weekly_commits,
     })
@@ -230,6 +253,20 @@ async fn open_pr_count(client: &Octocrab, owner: &str, name: &str) -> Result<usi
         .get(route, Some(&[("state", "open"), ("per_page", "100")]))
         .await?;
     Ok(prs.len())
+}
+
+/// Open issue count for `owner/name`, pull requests excluded.
+///
+/// Thin wrapper over the picker's [`list_open_issues`] — same
+/// endpoint, same PR-exclusion-by-`pull_request`-presence filter,
+/// same `per_page(100)` cap (and its accepted under-count, mirroring
+/// [`open_pr_count`]). Kept as a one-line function so the caller in
+/// [`capture_snapshot`] reads as "this is a single snapshot field",
+/// and so its best-effort error handling lives in exactly one place
+/// rather than spelling the `list_open_issues(...).await.len()` chain
+/// inline.
+async fn open_issue_count(client: &Octocrab, owner: &str, name: &str) -> Result<usize> {
+    Ok(list_open_issues(client, owner, name).await?.len())
 }
 
 /// Minimal subset of GitHub's workflow-run object — only the two
@@ -546,6 +583,7 @@ mod tests {
     fn snapshot_round_trips_through_toml() {
         let snap = GhSnapshot {
             open_pr_count: Some(3),
+            open_issue_count: Some(2),
             ci_status: Some(CiStatus::Failure),
             weekly_commits: Some(vec![0, 1, 4, 2, 7]),
         };
@@ -558,6 +596,7 @@ mod tests {
     fn snapshot_skips_none_fields_on_serialize() {
         let empty = GhSnapshot {
             open_pr_count: None,
+            open_issue_count: None,
             ci_status: None,
             weekly_commits: None,
         };
@@ -567,6 +606,10 @@ mod tests {
         assert!(
             !s.contains("open_pr_count"),
             "None open_pr_count shouldn't serialise, got: {s}"
+        );
+        assert!(
+            !s.contains("open_issue_count"),
+            "None open_issue_count shouldn't serialise, got: {s}"
         );
         assert!(
             !s.contains("ci_status"),
@@ -627,6 +670,7 @@ mod tests {
     fn ci_status_serialises_snake_case() {
         let s = toml::to_string(&GhSnapshot {
             open_pr_count: None,
+            open_issue_count: None,
             ci_status: Some(CiStatus::Success),
             weekly_commits: None,
         })
