@@ -79,7 +79,7 @@ crossterm = "0.29"
 nucleo = "0.5"
 octocrab = "0.54.1"
 kaishin = "0.6.4"
-open = "5.4.1"
+open = "5.4.2"
 
 # Clipboard for `y` (yank slug). `arboard` is the cross-platform
 # pick the ecosystem has converged on — works on Windows / macOS /
