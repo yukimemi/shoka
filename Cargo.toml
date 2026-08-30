@@ -50,7 +50,7 @@ anyhow = "1.0.104"
 thiserror = "2.0.20"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-owo-colors = "4.3.0"
+owo-colors = "4.4.0"
 regex = "1.13.1"
 
 # In-process git ops. Same feature set as rvpm to avoid the slow
