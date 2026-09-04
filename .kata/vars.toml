@@ -33,4 +33,4 @@ swatinem_rust_cache = "v2"
 claude_code_action = "v1.0.195"
 
 # renovate: datasource=github-tags depName=editorconfig-checker/action-editorconfig-checker
-editorconfig_checker = "v2"
+editorconfig_checker = "v3.0.0"
