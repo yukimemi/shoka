@@ -1,5 +1,5 @@
 preset = "github.com/yukimemi/pj-presets:rust-cli"
-applied_at = "2026-09-04T03:31:20.723401783Z"
+applied_at = "2026-09-05T03:30:11.096921509Z"
 
 [[templates]]
 source = "github.com/yukimemi/pj-base"
@@ -39,7 +39,7 @@ content_hash = "0ac5ed2847ab6e1041e34209dcc2396a582722ea9537d03bd950e1db1851a4b7
 content_hash = "4e2735f40c2ae61014810159a2458da2edc1646589f5f65d9f2f3d099366c9a8"
 
 [files.".github/workflows/ci.yml"]
-content_hash = "20364f1638365fea76484f555989dd939043a7e2609f3eb926ae665d07666490"
+content_hash = "8789f269176b20852e44374e81124713b7146f3effd8d01d52045d01a1e6efdc"
 
 [files.".github/workflows/claude-review.yml"]
 content_hash = "4a8e47aabb3cdf2a59030d5194467022f0efb53bb1819d4495752020d10be773"
