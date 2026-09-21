@@ -137,6 +137,7 @@ mod tests {
             },
             routes: vec![],
             profiles: BTreeMap::new(),
+            pinned: vec![],
         }
         .resolve(None)
         .expect("resolve")
@@ -172,6 +173,7 @@ mod tests {
                 default_protocol: None,
             }],
             profiles: BTreeMap::new(),
+            pinned: vec![],
         };
         let resolved = cfg.resolve(None).expect("resolve");
         let p = resolved
@@ -278,6 +280,7 @@ mod tests {
             },
             routes: vec![],
             profiles: BTreeMap::new(),
+            pinned: vec![],
         };
         let resolved = cfg.resolve(None).unwrap();
 

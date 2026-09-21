@@ -107,6 +107,129 @@ fn import_nonexistent_path_errors_cleanly() {
 }
 
 #[test]
+fn import_with_no_path_adopts_config_pinned_entries() {
+    // `[[pinned]]` entries are how a repo that doesn't fit the
+    // <root>/<host>/<owner>/<name> clone layout (e.g. ~/dotfiles)
+    // gets declared once in config.toml and then adopted with a bare
+    // `shoka import` on any machine — no --path needed.
+    let (mut cmd, tmp) = cmd_with_isolated_config();
+    let dotfiles = tmp.path().join("dotfiles");
+    init_git_repo_with_remote(&dotfiles, "https://github.com/yukimemi/dotfiles.git");
+    // Not yet cloned on this machine — must be skipped, not error out
+    // the whole run.
+    let not_yet_cloned = tmp.path().join("not-yet-cloned");
+
+    let cfg = tmp.path().join("config.toml");
+    let mut body = std::fs::read_to_string(&cfg).expect("read config.toml");
+    body.push_str(&format!(
+        "\n[[pinned]]\npath = \"{}\"\n\n[[pinned]]\npath = \"{}\"\n",
+        dotfiles.display().to_string().replace('\\', "\\\\"),
+        not_yet_cloned.display().to_string().replace('\\', "\\\\"),
+    ));
+    std::fs::write(&cfg, body).expect("write config.toml");
+
+    let assertion = cmd.args(["import"]).assert().success();
+    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).to_string();
+    assert!(
+        stdout.contains("1 imported"),
+        "expected '1 imported' in stdout, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("not found, skipping"),
+        "expected the missing pinned path to be noted as skipped, got: {stdout}"
+    );
+
+    let state = tmp.path().join("state").join("state.toml");
+    let state_body = std::fs::read_to_string(&state).expect("state.toml exists");
+    assert!(
+        state_body.contains("\"dotfiles\""),
+        "pinned repo missing from shelf: {state_body}"
+    );
+}
+
+#[test]
+fn import_pinned_bad_entry_does_not_discard_earlier_pinned_imports() {
+    // Regression: a pinned entry that exists but isn't a directory is
+    // a hard error (unlike a not-yet-cloned entry, which is merely
+    // skipped) — but that error must not discard imports from earlier
+    // pinned entries already folded into the shelf in this same run.
+    let (mut cmd, tmp) = cmd_with_isolated_config();
+    let dotfiles = tmp.path().join("dotfiles");
+    init_git_repo_with_remote(&dotfiles, "https://github.com/yukimemi/dotfiles.git");
+    // Exists, but is a file rather than a directory.
+    let bad_entry = tmp.path().join("not-a-dir.txt");
+    std::fs::write(&bad_entry, "not a repo\n").unwrap();
+
+    let cfg = tmp.path().join("config.toml");
+    let mut body = std::fs::read_to_string(&cfg).expect("read config.toml");
+    body.push_str(&format!(
+        "\n[[pinned]]\npath = \"{}\"\n\n[[pinned]]\npath = \"{}\"\n",
+        dotfiles.display().to_string().replace('\\', "\\\\"),
+        bad_entry.display().to_string().replace('\\', "\\\\"),
+    ));
+    std::fs::write(&cfg, body).expect("write config.toml");
+
+    let assertion = cmd.args(["import"]).assert().failure();
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("not a directory"),
+        "expected 'not a directory' in stderr, got: {stderr}"
+    );
+
+    // The dotfiles entry, processed before the bad one, must still
+    // have been persisted rather than lost when the run bailed.
+    let state = tmp.path().join("state").join("state.toml");
+    let state_body = std::fs::read_to_string(&state).expect("state.toml exists");
+    assert!(
+        state_body.contains("\"dotfiles\""),
+        "earlier pinned import lost when a later pinned entry errored: {state_body}"
+    );
+}
+
+#[test]
+fn import_explicit_path_ignores_config_pinned_entries() {
+    // An explicit --path stays authoritative: pinned entries are only
+    // consulted when no --path is given.
+    let (mut cmd, tmp) = cmd_with_isolated_config();
+    let pinned_repo = tmp.path().join("dotfiles");
+    init_git_repo_with_remote(&pinned_repo, "https://github.com/yukimemi/dotfiles.git");
+    let explicit_source = tmp.path().join("explicit");
+    init_git_repo_with_remote(
+        &explicit_source.join("proj"),
+        "https://github.com/yukimemi/proj.git",
+    );
+
+    let cfg = tmp.path().join("config.toml");
+    let mut body = std::fs::read_to_string(&cfg).expect("read config.toml");
+    body.push_str(&format!(
+        "\n[[pinned]]\npath = \"{}\"\n",
+        pinned_repo.display().to_string().replace('\\', "\\\\"),
+    ));
+    std::fs::write(&cfg, body).expect("write config.toml");
+
+    let assertion = cmd
+        .args(["import", explicit_source.to_str().unwrap()])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).to_string();
+    assert!(
+        stdout.contains("1 imported"),
+        "expected '1 imported' in stdout, got: {stdout}"
+    );
+
+    let state = tmp.path().join("state").join("state.toml");
+    let state_body = std::fs::read_to_string(&state).expect("state.toml exists");
+    assert!(
+        state_body.contains("\"proj\""),
+        "explicit-path repo missing from shelf: {state_body}"
+    );
+    assert!(
+        !state_body.contains("\"dotfiles\""),
+        "pinned entry should not have been adopted when --path was given: {state_body}"
+    );
+}
+
+#[test]
 fn import_regular_file_path_errors_cleanly() {
     let (mut cmd, tmp) = cmd_with_isolated_config();
     let file = tmp.path().join("not-a-dir.txt");
