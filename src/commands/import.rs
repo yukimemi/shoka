@@ -120,6 +120,12 @@ pub async fn run(ctx: &ShokaContext, args: ImportArgs) -> Result<()> {
             continue;
         }
         if !source.is_dir() {
+            // Persist whatever earlier sources in this run already
+            // folded into `shelf` before bailing — otherwise a bad
+            // entry later in `[[pinned]]` would silently discard
+            // imports that already succeeded (the loop's `shelf.save`
+            // below never runs once `bail!` unwinds `run`).
+            shelf.save(&ctx.paths)?;
             bail!("import source {} is not a directory", source.display());
         }
         println!(
