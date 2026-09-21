@@ -196,6 +196,7 @@ mod tests {
             },
             routes: vec![],
             profiles: BTreeMap::new(),
+            pinned: vec![],
         }
         .resolve(None)
         .expect("resolve")

@@ -40,10 +40,15 @@
 //! That matters most on Windows, where `CreateProcess` is slow enough
 //! to dominate the import for any non-trivial tree.
 //!
-//! When the source path is omitted, the command falls back to an
-//! [`inquire`] picker over common candidate dirs (`~/ghq`, `~/src`,
-//! `~/dev`, …) that actually exist on disk. If none exist, the
-//! command errors out asking for an explicit path.
+//! When the source path is omitted, `shoka import` first checks
+//! `[[pinned]]` entries in `config.toml` (see [`crate::config::PinnedRepo`]):
+//! if any are configured, every one of them is walked in turn (each
+//! path missing on this machine — not yet cloned — is skipped with a
+//! notice rather than erroring the whole run, unlike an explicit
+//! `--path`). Only when `pinned` is empty does the command fall back
+//! to an [`inquire`] picker over common candidate dirs (`~/ghq`,
+//! `~/src`, `~/dev`, …) that actually exist on disk. If none exist,
+//! the command errors out asking for an explicit path.
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -56,6 +61,7 @@ use walkdir::WalkDir;
 
 use crate::cli::ImportArgs;
 use crate::commands::ShokaContext;
+use crate::config::{ShokaConfig, expand_home};
 use crate::remote::parse_remote_url;
 use crate::state::{Repo, Shelf};
 
@@ -65,21 +71,100 @@ use crate::state::{Repo, Shelf};
 /// can short-circuit on it without firing a doomed gh API call.
 const LOCAL_HOST: &str = "local";
 
-pub async fn run(ctx: &ShokaContext, args: ImportArgs) -> Result<()> {
-    let source = match args.path {
-        Some(p) => p,
-        None => prompt_for_source()?,
-    };
-    if !source.is_dir() {
-        bail!("import source {} is not a directory", source.display());
+/// Accumulated counts across one or more [`walk_source`] calls.
+#[derive(Debug, Default)]
+struct WalkStats {
+    imported: usize,
+    updated: usize,
+    skipped_already: usize,
+    errors: usize,
+}
+
+impl std::ops::AddAssign for WalkStats {
+    fn add_assign(&mut self, rhs: Self) {
+        self.imported += rhs.imported;
+        self.updated += rhs.updated;
+        self.skipped_already += rhs.skipped_already;
+        self.errors += rhs.errors;
     }
+}
+
+pub async fn run(ctx: &ShokaContext, args: ImportArgs) -> Result<()> {
+    let cfg = ShokaConfig::load(&ctx.paths)?;
+
+    // `pinned`-derived sources tolerate a missing path (not yet
+    // cloned on this machine) — skip with a notice rather than
+    // erroring the whole run. An explicit `--path` (or a source
+    // picked interactively) stays a hard error on a bad path: the
+    // user pointed at it directly.
+    let (sources, tolerate_missing): (Vec<PathBuf>, bool) = match args.path {
+        Some(p) => (vec![p], false),
+        None if !cfg.pinned.is_empty() => (
+            cfg.pinned.iter().map(|p| expand_home(&p.path)).collect(),
+            true,
+        ),
+        None => (vec![prompt_for_source()?], false),
+    };
 
     let mut shelf = Shelf::load(&ctx.paths)?;
+    let mut totals = WalkStats::default();
 
-    let mut imported = 0usize;
-    let mut updated = 0usize;
-    let mut skipped_already = 0usize;
-    let mut errors = 0usize;
+    for source in &sources {
+        if tolerate_missing && !source.exists() {
+            println!(
+                "{} {} {} (not found, skipping)",
+                "import:".bold(),
+                "↩".dimmed(),
+                source.display()
+            );
+            continue;
+        }
+        if !source.is_dir() {
+            bail!("import source {} is not a directory", source.display());
+        }
+        println!(
+            "{} scanning {} for git / jj repos…",
+            "import:".bold(),
+            source.display()
+        );
+        totals += walk_source(source, &mut shelf);
+    }
+
+    shelf.save(&ctx.paths)?;
+
+    println!();
+    println!(
+        "{} {} imported, {} on shelf total",
+        "import:".bold(),
+        totals.imported,
+        shelf.len()
+    );
+    if totals.updated > 0 {
+        println!("  {} {} path refreshed", "↻".cyan(), totals.updated);
+    }
+    if totals.skipped_already > 0 {
+        println!(
+            "  {} {} already on shelf",
+            "↩".dimmed(),
+            totals.skipped_already
+        );
+    }
+    if totals.errors > 0 {
+        println!(
+            "  {} {} read errors (see SHOKA_LOG=warn for details)",
+            "!".red(),
+            totals.errors
+        );
+    }
+    Ok(())
+}
+
+/// Walk `source` for `.git`/`.jj` markers, folding whatever is found
+/// into `shelf` and printing a `+`/`↻` line per repo. Returns the
+/// per-source counts; the caller accumulates across every source and
+/// prints one combined summary.
+fn walk_source(source: &Path, shelf: &mut Shelf) -> WalkStats {
+    let mut stats = WalkStats::default();
     // Repo roots already imported in this run, keyed by the parent
     // directory of the marker (`.git` / `.jj`). Used to dedupe
     // colocated checkouts: the first marker yielded (`.git`, guaranteed
@@ -89,12 +174,6 @@ pub async fn run(ctx: &ShokaContext, args: ImportArgs) -> Result<()> {
     // — so an explicit set is the only reliable way to avoid
     // double-importing the same repo.
     let mut imported_roots: HashSet<PathBuf> = HashSet::new();
-
-    println!(
-        "{} scanning {} for git / jj repos…",
-        "import:".bold(),
-        source.display()
-    );
 
     // Explicit iterator so we can call `skip_current_dir()` to keep
     // the walk from descending into `.git/objects` / `.jj/op_store`
@@ -108,7 +187,7 @@ pub async fn run(ctx: &ShokaContext, args: ImportArgs) -> Result<()> {
     // default — on some filesystems `.jj` arrives first, which would
     // cause a colocated checkout to be imported as local rather than
     // having its remote URL read from `.git/config`.
-    let mut it = WalkDir::new(&source)
+    let mut it = WalkDir::new(source)
         .follow_links(false)
         .sort_by_file_name()
         .into_iter();
@@ -117,7 +196,7 @@ pub async fn run(ctx: &ShokaContext, args: ImportArgs) -> Result<()> {
             Ok(e) => e,
             Err(e) => {
                 tracing::warn!(target: "shoka", "walkdir error: {e}");
-                errors += 1;
+                stats.errors += 1;
                 continue;
             }
         };
@@ -160,25 +239,25 @@ pub async fn run(ctx: &ShokaContext, args: ImportArgs) -> Result<()> {
         match result {
             Ok(repo) => {
                 let slug = repo.slug();
-                let outcome = upsert_into_shelf(&mut shelf, repo);
+                let outcome = upsert_into_shelf(shelf, repo);
                 match outcome {
                     Outcome::Imported => {
                         println!("  {} {slug}", "+".green());
-                        imported += 1;
+                        stats.imported += 1;
                     }
                     Outcome::PathFilled => {
                         println!("  {} {slug}", "↻".cyan());
-                        updated += 1;
+                        stats.updated += 1;
                     }
                     Outcome::AlreadyOnShelf => {
-                        skipped_already += 1;
+                        stats.skipped_already += 1;
                     }
                     Outcome::AddFailed(e) => {
                         tracing::warn!(
                             target: "shoka",
                             "failed to add {slug} to shelf: {e:#}"
                         );
-                        errors += 1;
+                        stats.errors += 1;
                     }
                 }
             }
@@ -188,34 +267,12 @@ pub async fn run(ctx: &ShokaContext, args: ImportArgs) -> Result<()> {
                     "failed to read {}: {e:#}",
                     repo_root.display()
                 );
-                errors += 1;
+                stats.errors += 1;
             }
         }
     }
 
-    shelf.save(&ctx.paths)?;
-
-    println!();
-    println!(
-        "{} {} imported, {} on shelf total",
-        "import:".bold(),
-        imported,
-        shelf.len()
-    );
-    if updated > 0 {
-        println!("  {} {} path refreshed", "↻".cyan(), updated);
-    }
-    if skipped_already > 0 {
-        println!("  {} {} already on shelf", "↩".dimmed(), skipped_already);
-    }
-    if errors > 0 {
-        println!(
-            "  {} {} read errors (see SHOKA_LOG=warn for details)",
-            "!".red(),
-            errors
-        );
-    }
-    Ok(())
+    stats
 }
 
 /// What happened when the importer tried to fold one repo into the

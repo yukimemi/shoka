@@ -51,6 +51,34 @@ pub struct ShokaConfig {
     pub routes: Vec<Route>,
     #[serde(default)]
     pub profiles: BTreeMap<String, ProfileConfig>,
+    /// Repos to auto-adopt via `shoka import` without an explicit
+    /// `--path`. Each entry names a local directory (e.g.
+    /// `~/dotfiles`) that doesn't fit the `<root>/<host>/<owner>/<name>`
+    /// clone layout — a single-repo checkout the user wants on every
+    /// machine's shelf without re-typing `shoka import --path ...`
+    /// after every fresh `config.toml`. See [`PinnedRepo`].
+    #[serde(default)]
+    pub pinned: Vec<PinnedRepo>,
+}
+
+/// A `[[pinned]]` entry — a local directory `shoka import` (run with
+/// no `--path`) adopts automatically, in addition to falling back to
+/// the interactive source picker when `pinned` is empty.
+///
+/// Unlike `[[routes]]` (which only affects *where new clones land*),
+/// `pinned` entries are read at `shoka import` time and walked the
+/// same way an explicit `--path` argument would be: shoka looks for
+/// `.git`/`.jj` markers under `path` and records whatever it finds
+/// on the shelf with its on-disk location pinned (see the `import`
+/// module docs). A missing `path` (not yet cloned on this machine)
+/// is skipped with a notice rather than erroring the whole run —
+/// unlike an explicit `--path`, which is a hard error when absent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PinnedRepo {
+    /// Local path to a repo checkout (e.g. `~/dotfiles`). `~` is
+    /// expanded to the home dir; relative paths resolve against the
+    /// process cwd.
+    pub path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -881,6 +909,16 @@ root = "~/src"
 #
 # [profiles.work.git_config]
 # "user.email" = "work@example.com"
+
+# Pinned repos — local checkouts that don't fit the
+# <root>/<host>/<owner>/<name> clone layout (e.g. a dotfiles repo
+# kept at ~/dotfiles). `shoka import` run with no --path adopts every
+# entry here instead of prompting for a source dir, so a fresh
+# machine just needs `shoka import` once this file is in place. A
+# path missing on this machine (not yet cloned) is skipped with a
+# notice, not an error.
+# [[pinned]]
+# path = "~/dotfiles"
 "#;
 
 /// Write [`STARTER_CONFIG`] to `paths.config_file()`, creating the
@@ -921,7 +959,7 @@ pub fn write_starter(paths: &ShokaPaths) -> Result<()> {
 /// before `root` has been mkdir'd). On the rare failure case (e.g.
 /// no current directory), the tilde-expanded path is returned
 /// as-is.
-fn expand_home(s: &str) -> PathBuf {
+pub(crate) fn expand_home(s: &str) -> PathBuf {
     let expanded = expand_tilde(s);
     std::path::absolute(&expanded).unwrap_or(expanded)
 }
@@ -1223,6 +1261,7 @@ root = "{{ vars.repo_root }}"
                     ..Default::default()
                 },
             )]),
+            pinned: Vec::new(),
         };
         let r = cfg.resolve(Some("work")).expect("resolve");
         assert!(r.profile_provided_root);
@@ -1251,6 +1290,7 @@ root = "{{ vars.repo_root }}"
                     ..Default::default()
                 },
             )]),
+            pinned: Vec::new(),
         };
         let r = cfg.resolve(Some("vcs-only")).expect("resolve");
         assert!(!r.profile_provided_root);
@@ -1287,6 +1327,7 @@ root = "{{ vars.repo_root }}"
                     ..Default::default()
                 },
             )]),
+            pinned: Vec::new(),
         };
         let r = cfg.resolve(Some("vcs-only")).expect("resolve");
         let t = r.resolve_target("github.com/foo/bar");
