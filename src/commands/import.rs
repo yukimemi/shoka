@@ -91,7 +91,6 @@ impl std::ops::AddAssign for WalkStats {
 
 pub async fn run(ctx: &ShokaContext, args: ImportArgs) -> Result<()> {
     let cfg = ShokaConfig::load(&ctx.paths)?;
-    let resolved = cfg.resolve(ctx.profile_override.as_deref())?;
 
     // `pinned`-derived sources tolerate a missing path (not yet
     // cloned on this machine) — skip with a notice rather than
@@ -108,7 +107,11 @@ pub async fn run(ctx: &ShokaContext, args: ImportArgs) -> Result<()> {
     // to equal `root` isn't walked twice.
     let (sources, tolerate_missing): (Vec<PathBuf>, bool) = match args.path {
         Some(p) => (vec![p], false),
-        None if !resolved.raw.pinned.is_empty() => {
+        None if !cfg.pinned.is_empty() => {
+            // Resolve only here: `--path` and the interactive prompt
+            // never need `root`, so unrelated config errors (bad
+            // profile, invalid route) must not abort them.
+            let resolved = cfg.resolve(ctx.profile_override.as_deref())?;
             let mut seen = HashSet::new();
             let mut list = Vec::new();
             for p in std::iter::once(resolved.root.clone())
