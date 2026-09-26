@@ -148,6 +148,48 @@ fn import_with_no_path_adopts_config_pinned_entries() {
 }
 
 #[test]
+fn import_with_no_path_also_scans_global_root_alongside_pinned() {
+    // Regression: before this fix, configuring any `[[pinned]]` entry
+    // caused `shoka import` (no --path) to scan *only* the pinned
+    // dirs, silently dropping `[global].root` from the scan even
+    // though it's exactly where a pre-existing ghq/rhq tree or
+    // manually-placed checkout would live.
+    let (mut cmd, tmp) = cmd_with_isolated_config();
+    let root = tmp.path().join("root");
+    let under_root = root.join("github.com").join("someone").join("in-root");
+    init_git_repo_with_remote(&under_root, "https://github.com/someone/in-root.git");
+
+    let dotfiles = tmp.path().join("dotfiles");
+    init_git_repo_with_remote(&dotfiles, "https://github.com/yukimemi/dotfiles.git");
+
+    let cfg = tmp.path().join("config.toml");
+    let mut body = std::fs::read_to_string(&cfg).expect("read config.toml");
+    body.push_str(&format!(
+        "\n[[pinned]]\npath = \"{}\"\n",
+        dotfiles.display().to_string().replace('\\', "\\\\"),
+    ));
+    std::fs::write(&cfg, body).expect("write config.toml");
+
+    let assertion = cmd.args(["import"]).assert().success();
+    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).to_string();
+    assert!(
+        stdout.contains("2 imported"),
+        "expected both the root-resident repo and the pinned dotfiles repo to be imported, got: {stdout}"
+    );
+
+    let state = tmp.path().join("state").join("state.toml");
+    let state_body = std::fs::read_to_string(&state).expect("state.toml exists");
+    assert!(
+        state_body.contains("\"in-root\""),
+        "repo living directly under [global].root missing from shelf: {state_body}"
+    );
+    assert!(
+        state_body.contains("\"dotfiles\""),
+        "pinned repo missing from shelf: {state_body}"
+    );
+}
+
+#[test]
 fn import_pinned_bad_entry_does_not_discard_earlier_pinned_imports() {
     // Regression: a pinned entry that exists but isn't a directory is
     // a hard error (unlike a not-yet-cloned entry, which is merely

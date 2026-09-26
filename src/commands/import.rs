@@ -91,18 +91,35 @@ impl std::ops::AddAssign for WalkStats {
 
 pub async fn run(ctx: &ShokaContext, args: ImportArgs) -> Result<()> {
     let cfg = ShokaConfig::load(&ctx.paths)?;
+    let resolved = cfg.resolve(ctx.profile_override.as_deref())?;
 
     // `pinned`-derived sources tolerate a missing path (not yet
     // cloned on this machine) — skip with a notice rather than
     // erroring the whole run. An explicit `--path` (or a source
     // picked interactively) stays a hard error on a bad path: the
     // user pointed at it directly.
+    //
+    // `[global].root` (the `<root>/<host>/<owner>/<name>` clone
+    // layout home) is always folded in alongside `[[pinned]]` when
+    // no `--path` is given — it's exactly where a pre-existing
+    // ghq/rhq tree or manually-placed checkouts would sit, and a
+    // `shoka clone`-managed repo re-scans as a cheap no-op (already
+    // on shelf). Deduped against `pinned` so an entry that happens
+    // to equal `root` isn't walked twice.
     let (sources, tolerate_missing): (Vec<PathBuf>, bool) = match args.path {
         Some(p) => (vec![p], false),
-        None if !cfg.pinned.is_empty() => (
-            cfg.pinned.iter().map(|p| expand_home(&p.path)).collect(),
-            true,
-        ),
+        None if !resolved.raw.pinned.is_empty() => {
+            let mut seen = HashSet::new();
+            let mut list = Vec::new();
+            for p in std::iter::once(resolved.root.clone())
+                .chain(resolved.raw.pinned.iter().map(|p| expand_home(&p.path)))
+            {
+                if seen.insert(p.clone()) {
+                    list.push(p);
+                }
+            }
+            (list, true)
+        }
         None => (vec![prompt_for_source()?], false),
     };
 
