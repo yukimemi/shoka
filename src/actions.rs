@@ -25,7 +25,7 @@ use tokio::process::Command;
 /// handshake / hanging credential helper can't freeze the TUI
 /// indefinitely. On expiry the child is killed (via `kill_on_drop`)
 /// and the popup renders a `timed out` line.
-const ACTION_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const ACTION_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VcsKind {

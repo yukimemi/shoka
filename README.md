@@ -107,6 +107,16 @@ Output from each repo is captured and printed as a banner-headed
 block when the process exits, so parallel runs don't interleave
 into nonsense.
 
+TUI file pane (`l` on a repo row opens a one-directory browser of that
+repo; `?` lists every key):
+
+| Key | Action |
+|-----|--------|
+| `j` / `k` | Move down / up. |
+| `⏎` / `h` | Enter the selected directory / go up one level. |
+| `u` | Stop version-controlling the selected file or directory: after a `y` / `n` confirmation, append its repo-root-relative path to `.gitignore` (created if missing, skipped if already listed), then run `jj file untrack`. Needs a jj repo; failures (including a `.gitignore` that was updated before jj failed) show in the status line. |
+| `q` / `Esc` | Close the pane. |
+
 ## Shell integration
 
 A child process can't chdir its parent shell — kernel rule, no
