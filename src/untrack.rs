@@ -66,14 +66,24 @@ fn escape_literal(s: &str) -> String {
     out
 }
 
-/// Comparison key for dedupe: trimmed, leading / trailing `/`
-/// removed. Negations (`!`) and comments (`#`) never match.
+/// Comparison key for dedupe: trailing spaces and the leading `/`
+/// dropped. A trailing `/` is kept — it makes a pattern
+/// directory-only — and leading whitespace is literal in gitignore,
+/// so it is kept too. Negations (`!`) and comments (`#`) never match.
 fn dedupe_key(line: &str) -> Option<&str> {
-    let t = line.trim();
+    let t = line.trim_end_matches([' ', '\t', '\r']);
     if t.is_empty() || t.starts_with('!') || t.starts_with('#') {
         return None;
     }
-    Some(t.trim_start_matches('/').trim_end_matches('/'))
+    Some(t.trim_start_matches('/'))
+}
+
+/// Whether an existing `.gitignore` line `have` already covers `want`
+/// (both from [`dedupe_key`]). Equal keys match; a directory-only
+/// `want` (`foo/`) is also covered by the bare `foo`, but a bare
+/// `want` is never covered by the directory-only `foo/`.
+fn covers(have: &str, want: &str) -> bool {
+    have == want || want.strip_suffix('/') == Some(have)
 }
 
 /// Pure `.gitignore` edit. Returns the new file content, or `None`
@@ -84,7 +94,11 @@ fn dedupe_key(line: &str) -> Option<&str> {
 pub fn add_ignore_entry(existing: Option<&str>, line: &str) -> Option<String> {
     let existing = existing.unwrap_or("");
     let want = dedupe_key(line);
-    if want.is_some() && existing.lines().any(|l| dedupe_key(l) == want) {
+    if want.is_some()
+        && existing
+            .lines()
+            .any(|l| dedupe_key(l).zip(want).is_some_and(|(h, w)| covers(h, w)))
+    {
         return None;
     }
     let mut out = String::from(existing);
@@ -179,13 +193,21 @@ mod tests {
     fn skips_equivalent_entry() {
         assert_eq!(add_ignore_entry(Some("/foo\n"), "/foo"), None);
         assert_eq!(add_ignore_entry(Some("foo\n"), "/foo"), None);
-        assert_eq!(add_ignore_entry(Some("  /foo/  \n"), "/foo/"), None);
+        assert_eq!(add_ignore_entry(Some("/foo/  \n"), "/foo/"), None);
     }
 
     #[test]
-    fn dir_trailing_slash_is_normalized() {
+    fn trailing_slash_keeps_dir_only_semantics() {
+        // Bare / same-form entries cover a directory target.
         assert_eq!(add_ignore_entry(Some("/build\n"), "/build/"), None);
-        assert_eq!(add_ignore_entry(Some("/build/\n"), "/build"), None);
+        assert_eq!(add_ignore_entry(Some("/build/\n"), "/build/"), None);
+        // `/foo/` is directory-only, so it must not cover a file `foo`.
+        assert_eq!(
+            add_ignore_entry(Some("/foo/\n"), "/foo").unwrap(),
+            "/foo/\n/foo\n"
+        );
+        // Leading whitespace is literal, not the same pattern.
+        assert!(add_ignore_entry(Some("  /foo\n"), "/foo").is_some());
     }
 
     #[test]
