@@ -10,7 +10,6 @@ pub mod git_status;
 pub mod paths;
 pub mod remote;
 pub mod state;
-pub(crate) mod untrack;
 pub mod updater;
 pub mod vcs;
 

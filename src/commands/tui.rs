@@ -434,10 +434,6 @@ struct App {
     /// input ahead of normal navigation so a stray `j` doesn't move
     /// the cursor while the user is still reading the result.
     action_popup: Option<ActionPopup>,
-    /// Minimal file pane opened with `l`: lists one directory of the
-    /// selected repo so a file / dir can be untracked with `u`.
-    /// Intercepts input while open.
-    file_pane: Option<FilePane>,
     /// Transient status banner shown in the footer after `y` / `o`
     /// (and other light, non-popup actions). Cleared on the next
     /// non-status-producing keystroke so the user always sees the
@@ -469,58 +465,6 @@ struct ActionPopup {
     outcome: Option<ActionOutcome>,
     /// Error message when [`outcome`] is `None`. Empty otherwise.
     error: String,
-}
-
-/// One-directory file browser over a repo, with a confirm step for
-/// `u` (ignore + untrack). `dir` is absolute and always inside `root`.
-#[derive(Debug, Clone)]
-struct FilePane {
-    repo_label: String,
-    root: PathBuf,
-    dir: PathBuf,
-    /// `(name, is_dir)`, dirs first, `.git` / `.jj` omitted.
-    entries: Vec<(String, bool)>,
-    cursor: usize,
-    /// Target awaiting `y` / `n` confirmation: `(path, is_dir)`.
-    confirm: Option<(PathBuf, bool)>,
-}
-
-impl FilePane {
-    fn open(repo_label: String, root: PathBuf) -> Self {
-        let mut pane = Self {
-            repo_label,
-            dir: root.clone(),
-            root,
-            entries: Vec::new(),
-            cursor: 0,
-            confirm: None,
-        };
-        pane.reload();
-        pane
-    }
-
-    fn reload(&mut self) {
-        let mut entries: Vec<(String, bool)> = std::fs::read_dir(&self.dir)
-            .map(|rd| {
-                rd.filter_map(|e| e.ok())
-                    .map(|e| {
-                        let is_dir = e.path().is_dir();
-                        (e.file_name().to_string_lossy().into_owned(), is_dir)
-                    })
-                    .filter(|(n, _)| n != ".git" && n != ".jj")
-                    .collect()
-            })
-            .unwrap_or_default();
-        entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        self.entries = entries;
-        self.cursor = self.cursor.min(self.entries.len().saturating_sub(1));
-    }
-
-    fn selected(&self) -> Option<(PathBuf, bool)> {
-        self.entries
-            .get(self.cursor)
-            .map(|(n, d)| (self.dir.join(n), *d))
-    }
 }
 
 /// What the picker is showing — drives the title + the fetcher
@@ -814,7 +758,6 @@ impl App {
             show_help: false,
             picker: None,
             action_popup: None,
-            file_pane: None,
             status_message: None,
             table_state,
             matcher: Matcher::default(),
@@ -1061,19 +1004,6 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<O
             continue;
         }
 
-        // File pane (opened with `l`) is modal too.
-        if app.file_pane.is_some() {
-            if key.code == KeyCode::Char('c')
-                && key
-                    .modifiers
-                    .contains(crossterm::event::KeyModifiers::CONTROL)
-            {
-                return Ok(None);
-            }
-            handle_file_pane_key(app, key.code);
-            continue;
-        }
-
         // Picker overlay intercepts input first — it's the most
         // recently opened modal, so dismissal there takes priority
         // over the help popup or normal navigation.
@@ -1142,7 +1072,6 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<O
                     KeyCode::Char('p') => open_picker(app, PickerKind::Prs),
                     KeyCode::Char('f') => run_action_for_selected(app, ActionKind::Fetch),
                     KeyCode::Char('P') => run_action_for_selected(app, ActionKind::Push),
-                    KeyCode::Char('l') => open_file_pane(app),
                     KeyCode::Char('y') => yank_selected_slug(app),
                     KeyCode::Char('o') => open_selected_repo_home(app),
                     KeyCode::Char('m') => app.toggle_mine_only(),
@@ -1217,9 +1146,6 @@ fn ui(f: &mut Frame, app: &mut App) {
     }
     if let Some(picker) = &app.picker {
         render_picker(f, f.area(), picker);
-    }
-    if let Some(pane) = &app.file_pane {
-        render_file_pane(f, f.area(), pane);
     }
     if let Some(popup) = &app.action_popup {
         render_action_popup(f, f.area(), popup);
@@ -1789,7 +1715,6 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
                 ("P", "push"),
                 ("y", "yank"),
                 ("o", "open"),
-                ("l", "files"),
                 ("?", "help"),
                 ("q", "quit"),
             ]);
@@ -1899,7 +1824,6 @@ fn render_help(f: &mut Frame, area: Rect) {
                 ("p", "open Pull Requests for this repo in a fuzzy picker"),
                 ("o", "open repo home in browser"),
                 ("y", "yank slug to clipboard"),
-                ("l", "browse files (u there: ignore + jj untrack)"),
             ],
         ),
         (
@@ -2192,136 +2116,6 @@ fn run_action_for_selected(app: &mut App, kind: ActionKind) {
             error: format!("{e:#}"),
         },
     });
-}
-
-fn open_file_pane(app: &mut App) {
-    let Some(row_idx) = app.selected_row() else {
-        return;
-    };
-    let row = &app.rows[row_idx];
-    app.file_pane = Some(FilePane::open(row.slug.clone(), row.path.clone()));
-}
-
-fn handle_file_pane_key(app: &mut App, code: KeyCode) {
-    let Some(pane) = app.file_pane.as_mut() else {
-        return;
-    };
-    if let Some((target, _)) = pane.confirm.clone() {
-        match code {
-            KeyCode::Char('y') => {
-                pane.confirm = None;
-                let root = pane.root.clone();
-                let result = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current()
-                        .block_on(crate::untrack::untrack(&root, &target))
-                });
-                app.status_message = Some(match result {
-                    Ok(msg) => msg,
-                    Err(e) => format!("untrack failed: {e:#}"),
-                });
-                if let Some(pane) = app.file_pane.as_mut() {
-                    pane.reload();
-                }
-                if let Some(idx) = app.selected_row() {
-                    refresh_row_status_after_action(app, idx);
-                }
-            }
-            KeyCode::Char('n') | KeyCode::Esc => pane.confirm = None,
-            _ => {}
-        }
-        return;
-    }
-    match code {
-        KeyCode::Esc | KeyCode::Char('q') => app.file_pane = None,
-        KeyCode::Char('j') | KeyCode::Down => {
-            if pane.cursor + 1 < pane.entries.len() {
-                pane.cursor += 1;
-            }
-        }
-        KeyCode::Char('k') | KeyCode::Up => pane.cursor = pane.cursor.saturating_sub(1),
-        KeyCode::Enter | KeyCode::Char('l') => {
-            if let Some((path, true)) = pane.selected() {
-                pane.dir = path;
-                pane.cursor = 0;
-                pane.reload();
-            }
-        }
-        KeyCode::Backspace | KeyCode::Char('h') => {
-            if pane.dir != pane.root
-                && let Some(parent) = pane.dir.parent()
-            {
-                pane.dir = parent.to_path_buf();
-                pane.cursor = 0;
-                pane.reload();
-            }
-        }
-        KeyCode::Char('u') => pane.confirm = pane.selected(),
-        _ => {}
-    }
-}
-
-fn render_file_pane(f: &mut Frame, area: Rect, pane: &FilePane) {
-    use ratatui::text::Span;
-
-    let rect = centered_rect(70, 70, area);
-    f.render_widget(Clear, rect);
-    let rel = pane
-        .dir
-        .strip_prefix(&pane.root)
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::MAUVE))
-        .title(Span::styled(
-            format!(" 📁 {} /{rel} ", pane.repo_label),
-            Style::default()
-                .fg(theme::LAVENDER)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .style(Style::default().bg(theme::BASE));
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
-
-    let mut lines: Vec<Line> = Vec::new();
-    if let Some((target, _)) = &pane.confirm {
-        let shown = target.strip_prefix(&pane.root).unwrap_or(target);
-        lines.push(Line::from(Span::styled(
-            format!(
-                "  Add {} to .gitignore and run `jj file untrack`? [y/n]",
-                shown.display()
-            ),
-            Style::default()
-                .fg(theme::PINK)
-                .add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(""));
-    }
-    let height = usize::from(inner.height)
-        .saturating_sub(lines.len() + 1)
-        .max(1);
-    let start = pane.cursor.saturating_sub(height - 1);
-    for (i, (name, is_dir)) in pane.entries.iter().enumerate().skip(start).take(height) {
-        let marker = if i == pane.cursor { "▶ " } else { "  " };
-        let label = if *is_dir {
-            format!("{marker}{name}/")
-        } else {
-            format!("{marker}{name}")
-        };
-        let style = if i == pane.cursor {
-            Style::default()
-                .fg(theme::TEXT)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme::SUBTEXT)
-        };
-        lines.push(Line::from(Span::styled(label, style)));
-    }
-    lines.push(Line::from(Span::styled(
-        " j/k move · ⏎ open · h up · u untrack · q close",
-        Style::default().fg(theme::OVERLAY),
-    )));
-    f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Re-capture the git status of the row at `row_idx` after a fetch /
