@@ -95,12 +95,15 @@ shoka list --sort name              # alphabetical by host/owner/name
   `shoka cache refresh`; `list` itself never makes network calls.
   Repos with no cached count sort last, and `--sort stars` prints a
   hint on stderr telling you to run `shoka cache refresh`.
-- A repo with cached data is shown as one line: the repo (blue), then
+- With `--sort`, a repo with cached data is shown as one line: the repo (blue), then
   `★ <count>` (yellow) and the language (dimmed). The star is the
   plain `★` character, not the emoji, so columns stay aligned.
   Such rows do **not** show path / tags / vcs / note, and there is no
   switch to get the multi-line form back; repos without cached data
-  keep that multi-line form.
+  keep that multi-line form. Plain `shoka list` (no `--sort`) always
+  uses the multi-line form, whatever is cached.
+- `list --sort` never triggers the background cache refresh or
+  auto-update check; run `shoka cache refresh` yourself.
 - Colour is used only when stdout is a terminal and `NO_COLOR` is
   unset or empty, so `| head` and redirected output are plain text.
   This also strips the bold / dim styling the previous `list` output

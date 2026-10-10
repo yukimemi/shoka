@@ -4,7 +4,7 @@
 //! (`--tag` AND-semantics, `--has-agents`), optionally sorts
 //! (`--sort name|stars`) and prints the result.
 //!
-//! Repos with a cached GitHub snapshot (`shoka cache refresh`) are
+//! With `--sort`, repos with a cached GitHub snapshot (`shoka cache refresh`) are
 //! rendered as one aligned line — `host/owner/name  ★ 24  Rust` — so
 //! `shoka list --sort stars | head -5` yields five repos. Repos
 //! without cached star data keep the multi-line format with indented
@@ -79,14 +79,21 @@ pub async fn run(ctx: &ShokaContext, args: ListArgs) -> Result<()> {
         return Ok(());
     }
 
-    // Cache read is best-effort: a broken cache.toml must not take
-    // `list` down, it just means no stars / language.
-    let cache = match Cache::load(&ctx.paths) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!("list: ignoring unreadable cache: {e:#}");
-            Cache::default()
+    // Without `--sort` the listing is exactly the classic multi-line
+    // form (a background refresh may populate stars at any time, and
+    // that must not change plain `list` output), so the cache is only
+    // consulted when sorting. The read is best-effort: a broken
+    // cache.toml must not take `list` down, it just means no stars.
+    let cache = if args.sort.is_some() {
+        match Cache::load(&ctx.paths) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("list: ignoring unreadable cache: {e:#}");
+                Cache::default()
+            }
         }
+    } else {
+        Cache::default()
     };
     let mut rows: Vec<ListRow> = filtered
         .iter()

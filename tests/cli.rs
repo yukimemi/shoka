@@ -1309,3 +1309,15 @@ fn list_without_sort_keeps_legacy_format_when_cache_empty() {
     assert_eq!(heads, ["github.com/u/zed", "github.com/u/abc"]);
     assert!(stdout.contains("path :"));
 }
+
+/// Plain `list` must not change shape just because the cache holds stars.
+#[test]
+fn list_without_sort_ignores_cached_stars() {
+    let (mut cmd, tmp) = cmd_with_isolated_config();
+    seed_shelf(&tmp.path().join("state"), &[("github.com", "u", "only")]);
+    seed_cache(&tmp.path().join("cache"), &[("only", 9, "Rust")]);
+    let out = cmd.arg("list").assert().success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    assert!(!stdout.contains('★'), "{stdout:?}");
+    assert!(stdout.contains("path :"));
+}

@@ -175,6 +175,11 @@ fn maybe_spawn_auto_update(ctx: &ShokaContext) -> Option<crate::updater::AutoUpd
 /// natural "are things OK" checkpoint, and freshening the cache
 /// after a doctor run benefits the next subcommand.
 fn bg_refresh_eligible(cmd: &Command) -> bool {
+    // `list --sort` is documented as cache-only: it must not spawn
+    // network activity of its own.
+    if matches!(cmd, Command::List(a) if a.sort.is_some()) {
+        return false;
+    }
     !matches!(
         cmd,
         Command::Cache(_)
@@ -208,6 +213,9 @@ fn bg_refresh_eligible(cmd: &Command) -> bool {
 /// auto-update notice goes only to stderr, so the shell wrapper is
 /// never corrupted.
 fn auto_update_eligible(cmd: &Command) -> bool {
+    if matches!(cmd, Command::List(a) if a.sort.is_some()) {
+        return false;
+    }
     !matches!(
         cmd,
         Command::SelfUpdate(_) | Command::Completion(_) | Command::InitShell(_) | Command::Tui(_)
@@ -252,6 +260,17 @@ mod tests {
             yes: false,
             check: false,
         })));
+    }
+
+    #[test]
+    fn sorted_list_triggers_no_background_network_work() {
+        let sorted = Command::List(ListArgs {
+            tags: vec![],
+            has_agents: false,
+            sort: Some(crate::cli::ListSort::Stars),
+        });
+        assert!(!bg_refresh_eligible(&sorted));
+        assert!(!auto_update_eligible(&sorted));
     }
 
     #[test]
