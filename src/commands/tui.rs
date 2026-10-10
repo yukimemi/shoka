@@ -2684,6 +2684,8 @@ mod tests {
             open_issue_count: Some(2),
             ci_status: Some(CiStatus::Success),
             weekly_commits: Some(vec![1, 0, 3, 2]),
+            stargazer_count: None,
+            primary_language: None,
         };
 
         let mut cache = Cache::default();
@@ -3043,6 +3045,8 @@ mod tests {
             open_issue_count: None,
             ci_status: Some(CiStatus::Success),
             weekly_commits: None,
+            stargazer_count: None,
+            primary_language: None,
         };
         let (pr, ci) = gh_cells(Some(&snap));
         assert_eq!(pr, "5");
@@ -3056,6 +3060,8 @@ mod tests {
             open_issue_count: None,
             ci_status: None,
             weekly_commits: None,
+            stargazer_count: None,
+            primary_language: None,
         };
         let (pr, _) = gh_cells(Some(&snap));
         assert_eq!(pr, "99+");
@@ -3070,6 +3076,8 @@ mod tests {
             open_issue_count: None,
             ci_status: None,
             weekly_commits: None,
+            stargazer_count: None,
+            primary_language: None,
         };
         let (pr_zero, _) = gh_cells(Some(&zero));
         let (pr_none, _) = gh_cells(None);
@@ -3092,6 +3100,8 @@ mod tests {
                 open_issue_count: None,
                 ci_status: Some(status),
                 weekly_commits: None,
+                stargazer_count: None,
+                primary_language: None,
             };
             let (_, ci) = gh_cells(Some(&snap));
             assert_eq!(ci, expected, "ci glyph for {status:?}");
@@ -3197,6 +3207,8 @@ mod tests {
             open_issue_count: None,
             ci_status: None,
             weekly_commits: Some(vec![1, 2]),
+            stargazer_count: None,
+            primary_language: None,
         }); // 3
         app.rows[1].gh = None; // unknown — must sink below every measured row
         app.rows[2].gh = Some(GhSnapshot {
@@ -3204,12 +3216,16 @@ mod tests {
             open_issue_count: None,
             ci_status: None,
             weekly_commits: Some(vec![10, 20]),
+            stargazer_count: None,
+            primary_language: None,
         }); // 30
         app.rows[3].gh = Some(GhSnapshot {
             open_pr_count: None,
             open_issue_count: None,
             ci_status: None,
             weekly_commits: Some(vec![0, 0]),
+            stargazer_count: None,
+            primary_language: None,
         }); // 0 — measured-but-dormant still beats unknown
         app.sort = SortMode::Activity;
         app.refilter();
@@ -3255,6 +3271,8 @@ mod tests {
             open_issue_count: None,
             ci_status: None,
             weekly_commits: None,
+            stargazer_count: None,
+            primary_language: None,
         };
         let mut app = app(rows(&["a", "b", "c", "d"]));
         app.rows[0].gh = Some(snap(Some(5)));
@@ -3306,6 +3324,8 @@ mod tests {
             open_issue_count: n,
             ci_status: None,
             weekly_commits: None,
+            stargazer_count: None,
+            primary_language: None,
         };
         let mut app = app(rows(&["a", "b", "c", "d"]));
         app.rows[0].gh = Some(snap(Some(5)));

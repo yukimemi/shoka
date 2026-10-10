@@ -74,6 +74,17 @@ pub struct GhSnapshot {
     /// can default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weekly_commits: Option<Vec<u32>>,
+
+    /// Stargazer count, for `shoka list --sort stars`. `None` means
+    /// "not captured" (older cache, API error) — distinct from a
+    /// genuine zero. Additive `Option` field: no `CACHE_VERSION` bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stargazer_count: Option<u32>,
+
+    /// Primary language as GitHub reports it. `None` covers both
+    /// "not captured" and "repo has no detected language".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_language: Option<String>,
 }
 
 /// How many trailing weeks of commit activity [`capture_snapshot`]
@@ -185,12 +196,30 @@ pub async fn capture_snapshot(client: &Octocrab, owner: &str, name: &str) -> Res
         .await
         .ok()
         .flatten();
+    // Best-effort too: a failed repo-metadata call must not block the
+    // PR / CI refresh; stars just stay unknown until the next refresh.
+    let meta = repo_meta(client, owner, name).await.ok();
     Ok(GhSnapshot {
         open_pr_count: Some(open_pr_count),
         open_issue_count,
         ci_status,
         weekly_commits,
+        stargazer_count: meta.as_ref().map(|m| m.stargazers_count),
+        primary_language: meta.and_then(|m| m.language),
     })
+}
+
+/// The slice of `GET /repos/{owner}/{name}` shoka reads.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct RepoMeta {
+    stargazers_count: u32,
+    #[serde(default)]
+    language: Option<String>,
+}
+
+async fn repo_meta(client: &Octocrab, owner: &str, name: &str) -> Result<RepoMeta> {
+    let route = format!("/repos/{owner}/{name}");
+    Ok(client.get(route, None::<&()>).await?)
 }
 
 /// One element of `/stats/commit_activity` — a single week. Only
@@ -586,10 +615,35 @@ mod tests {
             open_issue_count: Some(2),
             ci_status: Some(CiStatus::Failure),
             weekly_commits: Some(vec![0, 1, 4, 2, 7]),
+            stargazer_count: None,
+            primary_language: None,
         };
         let s = toml::to_string(&snap).unwrap();
         let parsed: GhSnapshot = toml::from_str(&s).unwrap();
         assert_eq!(parsed, snap);
+    }
+
+    #[test]
+    fn snapshot_round_trips_stars_and_language() {
+        let snap = GhSnapshot {
+            open_pr_count: None,
+            open_issue_count: None,
+            ci_status: None,
+            weekly_commits: None,
+            stargazer_count: Some(24),
+            primary_language: Some("Rust".into()),
+        };
+        let parsed: GhSnapshot = toml::from_str(&toml::to_string(&snap).unwrap()).unwrap();
+        assert_eq!(parsed, snap);
+    }
+
+    #[test]
+    fn snapshot_without_new_fields_still_loads() {
+        // A cache written before stars / language existed.
+        let parsed: GhSnapshot = toml::from_str("open_pr_count = 2\n").unwrap();
+        assert_eq!(parsed.open_pr_count, Some(2));
+        assert_eq!(parsed.stargazer_count, None);
+        assert_eq!(parsed.primary_language, None);
     }
 
     #[test]
@@ -599,6 +653,8 @@ mod tests {
             open_issue_count: None,
             ci_status: None,
             weekly_commits: None,
+            stargazer_count: None,
+            primary_language: None,
         };
         let s = toml::to_string(&empty).unwrap();
         let parsed: GhSnapshot = toml::from_str(&s).unwrap();
@@ -673,6 +729,8 @@ mod tests {
             open_issue_count: None,
             ci_status: Some(CiStatus::Success),
             weekly_commits: None,
+            stargazer_count: None,
+            primary_language: None,
         })
         .unwrap();
         assert!(s.contains("\"success\""), "wire format = lowercase: {s}");

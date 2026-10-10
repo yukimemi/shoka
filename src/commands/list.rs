@@ -1,25 +1,56 @@
 //! `shoka list` — show what's on the shelf.
 //!
 //! Reads [`Shelf`] from state.toml, applies the requested filters
-//! (`--tag` AND-semantics, `--has-agents`), and prints one line per
-//! matching repo. Optional indented metadata follows: tags / vcs
-//! override / note / clone path.
+//! (`--tag` AND-semantics, `--has-agents`), optionally sorts
+//! (`--sort name|stars`) and prints the result.
 //!
-//! Phase 1 implementation: state-only. The next iteration will fold
-//! in `cache.toml`'s git-status snapshot so the listing can show
-//! `ahead` / `behind` / `dirty` glyphs without paying a fresh
-//! `git status` per repo.
+//! With `--sort`, repos with a cached GitHub snapshot (`shoka cache refresh`) are
+//! rendered as one aligned line — `host/owner/name  ★ 24  Rust` — so
+//! `shoka list --sort stars | head -5` yields five repos. Repos
+//! without cached star data keep the multi-line format with indented
+//! path / tags / vcs / note. `list` never touches the network: all
+//! GitHub data comes from `cache.toml`.
+
+use std::cmp::Ordering;
+use std::io::IsTerminal;
 
 use anyhow::Result;
 use owo_colors::OwoColorize;
 use teravars::Engine;
+use unicode_width::UnicodeWidthStr;
 
-use crate::cli::ListArgs;
+use crate::cache::Cache;
+use crate::cli::{ListArgs, ListSort};
 use crate::commands::ShokaContext;
 use crate::config::{ResolvedConfig, ShokaConfig};
 use crate::state::{Repo, Shelf};
 
+/// One shown repo plus whatever the cache knows about it.
+#[derive(Debug)]
+struct ListRow<'s> {
+    repo: &'s Repo,
+    /// `Some` ⇔ the repo counts as "cached" (a definite zero is
+    /// distinct from "not fetched").
+    stars: Option<u32>,
+    language: Option<String>,
+}
+
+/// Colour only when stdout is a terminal and `NO_COLOR` is unset or
+/// empty (<https://no-color.org>), so pipes and redirects get plain text.
+fn use_color() -> bool {
+    std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
+}
+
+fn dim(color: bool, s: &str) -> String {
+    if color {
+        s.dimmed().to_string()
+    } else {
+        s.to_string()
+    }
+}
+
 pub async fn run(ctx: &ShokaContext, args: ListArgs) -> Result<()> {
+    let color = use_color();
     let cfg = ShokaConfig::load(&ctx.paths)?;
     let resolved = cfg.resolve(ctx.profile_override.as_deref())?;
     let shelf = Shelf::load(&ctx.paths)?;
@@ -28,7 +59,7 @@ pub async fn run(ctx: &ShokaContext, args: ListArgs) -> Result<()> {
         // Empty shelf: friendly hint instead of just silence.
         println!(
             "{} (no repos yet — `shoka clone <url>` to add one)",
-            "0 repos".dimmed()
+            dim(color, "0 repos")
         );
         return Ok(());
     }
@@ -42,26 +73,121 @@ pub async fn run(ctx: &ShokaContext, args: ListArgs) -> Result<()> {
     if filtered.is_empty() {
         println!(
             "{} matched the filters ({} on the shelf total)",
-            "0 repos".dimmed(),
+            dim(color, "0 repos"),
             shelf.len()
         );
         return Ok(());
     }
 
-    for repo in &filtered {
-        print_repo(repo, &resolved, &mut engine)?;
+    // Without `--sort` the listing is exactly the classic multi-line
+    // form (a background refresh may populate stars at any time, and
+    // that must not change plain `list` output), so the cache is only
+    // consulted when sorting. The read is best-effort: a broken
+    // cache.toml must not take `list` down, it just means no stars.
+    let cache = if args.sort.is_some() {
+        match Cache::load(&ctx.paths) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("list: ignoring unreadable cache: {e:#}");
+                Cache::default()
+            }
+        }
+    } else {
+        Cache::default()
+    };
+    let mut rows: Vec<ListRow> = filtered
+        .iter()
+        .map(|&repo| {
+            let snap = cache.find_gh_by_triple(&repo.host, &repo.owner, &repo.name);
+            ListRow {
+                repo,
+                stars: snap.and_then(|g| g.stargazer_count),
+                language: snap.and_then(|g| g.primary_language.clone()),
+            }
+        })
+        .collect();
+    sort_rows(&mut rows, args.sort);
+
+    if args.sort == Some(ListSort::Stars) && rows.iter().any(|r| r.stars.is_none()) {
+        eprintln!(
+            "hint: some repos have no cached star count; run `shoka cache refresh` to fetch it"
+        );
+    }
+
+    let widths = column_widths(&rows);
+    for row in &rows {
+        match format_cached_line(row, widths, color) {
+            Some(line) => println!("{line}"),
+            None => print_repo(row.repo, &resolved, &mut engine, color)?,
+        }
     }
     if filtered.len() < shelf.len() {
         println!();
         println!(
             "{} {} of {} repos matched",
-            "→".dimmed(),
+            dim(color, "→"),
             filtered.len(),
             shelf.len()
         );
     }
 
     Ok(())
+}
+
+/// Reorder `rows` in place. `None` keeps shelf order; sorts are
+/// stable. Stars sort descending with ties by slug, and rows with no
+/// cached count (distinct from a cached 0) go last, also by slug.
+fn sort_rows(rows: &mut [ListRow], sort: Option<ListSort>) {
+    match sort {
+        None => {}
+        Some(ListSort::Name) => rows.sort_by_key(|a| a.repo.slug()),
+        Some(ListSort::Stars) => rows.sort_by(|a, b| {
+            let by_stars = match (a.stars, b.stars) {
+                (Some(x), Some(y)) => y.cmp(&x),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            };
+            by_stars.then_with(|| a.repo.slug().cmp(&b.repo.slug()))
+        }),
+    }
+}
+
+/// `(slug width, star-count digits)` measured over cached rows only.
+fn column_widths(rows: &[ListRow]) -> (usize, usize) {
+    rows.iter()
+        .filter_map(|r| {
+            r.stars
+                .map(|n| (r.repo.slug().width(), n.to_string().len()))
+        })
+        .fold((0, 0), |(a, b), (w, d)| (a.max(w), b.max(d)))
+}
+
+/// One-line rendering for a row with cached stars, `None` otherwise.
+///
+/// Columns are padded on the *plain* text by display width and only
+/// then coloured, so ANSI codes never skew alignment. The star is the
+/// plain U+2605 (width 1), not the emoji, whose width varies by terminal.
+fn format_cached_line(
+    row: &ListRow,
+    (slug_w, digits): (usize, usize),
+    color: bool,
+) -> Option<String> {
+    let stars = row.stars?;
+    let slug = row.repo.slug();
+    let pad = " ".repeat(slug_w.saturating_sub(slug.width()));
+    let star = format!("★ {stars:>digits$}");
+    let (slug_c, star_c) = if color {
+        (slug.blue().to_string(), star.yellow().to_string())
+    } else {
+        (slug, star)
+    };
+    let mut line = format!("{slug_c}{pad}  {star_c}");
+    if let Some(lang) = row.language.as_deref().filter(|l| !l.is_empty()) {
+        line.push_str("  ");
+        line.push_str(&dim(color, lang));
+    }
+    Some(line)
 }
 
 /// Apply `--tag` (AND) and `--has-agents` filters to the shelf.
@@ -107,18 +233,24 @@ fn has_all_tags(repo: &Repo, wanted: &[String]) -> bool {
 /// Render one repo as a slug headline + indented metadata lines.
 /// Quiet by design: only metadata that's set gets a line — we don't
 /// pad empty fields with placeholders.
-fn print_repo(repo: &Repo, resolved: &ResolvedConfig, engine: &mut Engine) -> Result<()> {
-    println!("{}", repo.slug().bold());
+fn print_repo(
+    repo: &Repo,
+    resolved: &ResolvedConfig,
+    engine: &mut Engine,
+    color: bool,
+) -> Result<()> {
+    let slug = repo.slug();
+    println!("{}", if color { slug.bold().to_string() } else { slug });
     let path = resolved.clone_path_for(repo, engine)?;
-    println!("  {} {}", "path :".dimmed(), path.display());
+    println!("  {} {}", dim(color, "path :"), path.display());
     if !repo.tags.is_empty() {
-        println!("  {} {}", "tags :".dimmed(), repo.tags.join(" "));
+        println!("  {} {}", dim(color, "tags :"), repo.tags.join(" "));
     }
     if let Some(vcs) = repo.vcs {
-        println!("  {} {vcs:?}", "vcs  :".dimmed());
+        println!("  {} {vcs:?}", dim(color, "vcs  :"));
     }
     if let Some(note) = &repo.note {
-        println!("  {} {}", "note :".dimmed(), note);
+        println!("  {} {}", dim(color, "note :"), note);
     }
     Ok(())
 }
@@ -128,6 +260,134 @@ mod tests {
     use super::*;
     use crate::config::{GlobalConfig, ShokaConfig, VcsDefault};
     use std::collections::BTreeMap;
+
+    fn row<'a>(repo: &'a Repo, stars: Option<u32>, lang: Option<&str>) -> ListRow<'a> {
+        ListRow {
+            repo,
+            stars,
+            language: lang.map(String::from),
+        }
+    }
+
+    fn names<'a>(rows: &'a [ListRow<'a>]) -> Vec<&'a str> {
+        rows.iter().map(|r| r.repo.name.as_str()).collect()
+    }
+
+    #[test]
+    fn sort_none_keeps_shelf_order() {
+        let (a, b, c) = (
+            Repo::new("github.com", "u", "zeta"),
+            Repo::new("github.com", "u", "alpha"),
+            Repo::new("github.com", "u", "mid"),
+        );
+        let mut rows = vec![
+            row(&a, Some(1), None),
+            row(&b, Some(9), None),
+            row(&c, None, None),
+        ];
+        sort_rows(&mut rows, None);
+        assert_eq!(names(&rows), ["zeta", "alpha", "mid"]);
+    }
+
+    #[test]
+    fn sort_name_is_ascending() {
+        let (a, b, c) = (
+            Repo::new("github.com", "u", "zeta"),
+            Repo::new("github.com", "u", "alpha"),
+            Repo::new("github.com", "u", "mid"),
+        );
+        let mut rows = vec![
+            row(&a, Some(9), None),
+            row(&b, None, None),
+            row(&c, Some(1), None),
+        ];
+        sort_rows(&mut rows, Some(ListSort::Name));
+        assert_eq!(names(&rows), ["alpha", "mid", "zeta"]);
+    }
+
+    #[test]
+    fn sort_stars_desc_ties_by_name_missing_last() {
+        let (a, b, c, d, e) = (
+            Repo::new("github.com", "u", "b-tie"),
+            Repo::new("github.com", "u", "a-tie"),
+            Repo::new("github.com", "u", "top"),
+            Repo::new("github.com", "u", "zero"),
+            Repo::new("github.com", "u", "a-missing"),
+        );
+        let mut rows = vec![
+            row(&a, Some(5), None),
+            row(&b, Some(5), None),
+            row(&c, Some(24), None),
+            row(&d, Some(0), None),
+            row(&e, None, None),
+        ];
+        sort_rows(&mut rows, Some(ListSort::Stars));
+        // A cached 0 outranks "not fetched".
+        assert_eq!(names(&rows), ["top", "a-tie", "b-tie", "zero", "a-missing"]);
+    }
+
+    #[test]
+    fn uncached_row_has_no_one_line_form() {
+        let r = Repo::new("github.com", "u", "n");
+        assert!(format_cached_line(&row(&r, None, Some("Rust")), (10, 2), false).is_none());
+    }
+
+    #[test]
+    fn cached_line_is_plain_when_color_off() {
+        let r = Repo::new("github.com", "u", "n");
+        let line = format_cached_line(&row(&r, Some(24), Some("Rust")), (15, 2), false).unwrap();
+        assert!(!line.contains('\u{1b}'), "no ANSI expected: {line:?}");
+        assert_eq!(line, "github.com/u/n   ★ 24  Rust");
+        assert!(line.starts_with("github.com/u/n"));
+    }
+
+    #[test]
+    fn cached_line_without_language_has_no_trailing_space() {
+        let r = Repo::new("github.com", "u", "n");
+        let line = format_cached_line(&row(&r, Some(3), None), (14, 1), false).unwrap();
+        assert_eq!(line, "github.com/u/n  ★ 3");
+    }
+
+    #[test]
+    fn cached_line_color_wraps_columns() {
+        let r = Repo::new("github.com", "u", "n");
+        let line = format_cached_line(&row(&r, Some(24), Some("Rust")), (14, 2), true).unwrap();
+        assert!(line.contains("\u{1b}[34m"), "blue slug: {line:?}");
+        assert!(line.contains("\u{1b}[33m"), "yellow stars: {line:?}");
+        assert!(line.contains("\u{1b}[2m"), "dim language: {line:?}");
+        assert!(!line.contains('\u{1f31f}') && line.contains('\u{2605}'));
+    }
+
+    #[test]
+    fn columns_align_by_display_width() {
+        let a = Repo::new("github.com", "u", "short");
+        let b = Repo::new("github.com", "u", "much-longer-name");
+        let c = Repo::new("github.com", "日本", "語");
+        let rows = vec![
+            row(&a, Some(7), Some("Go")),
+            row(&b, Some(1234), Some("Rust")),
+            row(&c, Some(55), Some("TS")),
+        ];
+        let w = column_widths(&rows);
+        let lines: Vec<String> = rows
+            .iter()
+            .map(|r| format_cached_line(r, w, false).unwrap())
+            .collect();
+        // The ★ sits at the same display column on every row, and the
+        // star glyph itself counts as one cell.
+        let cols: Vec<usize> = lines
+            .iter()
+            .map(|l| l.split('★').next().unwrap().width())
+            .collect();
+        assert!(cols.windows(2).all(|p| p[0] == p[1]), "{lines:?}");
+        assert_eq!("★".width(), 1);
+        // The language column starts at one display column too.
+        let langs: Vec<usize> = lines
+            .iter()
+            .map(|l| l.rsplit_once("  ").unwrap().0.width())
+            .collect();
+        assert!(langs.windows(2).all(|p| p[0] == p[1]), "{lines:?}");
+    }
 
     fn resolved_default_layout() -> ResolvedConfig {
         ShokaConfig {
@@ -240,6 +500,7 @@ mod tests {
             &ListArgs {
                 tags: vec!["rust".into()],
                 has_agents: false,
+                sort: None,
             },
             &mut engine,
         )
@@ -254,6 +515,7 @@ mod tests {
             &ListArgs {
                 tags: vec!["rust".into(), "cli".into()],
                 has_agents: false,
+                sort: None,
             },
             &mut engine,
         )
@@ -302,6 +564,7 @@ mod tests {
             &ListArgs {
                 tags: vec![],
                 has_agents: true,
+                sort: None,
             },
             &mut engine,
         )

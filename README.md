@@ -82,6 +82,33 @@ s shoka
 shoka exec --tag rust -- cargo check
 ```
 
+## Listing and sorting
+
+```sh
+shoka list --sort stars | head -5   # most-starred first
+shoka list --sort name              # alphabetical by host/owner/name
+```
+
+- `--sort name` is ascending; `--sort stars` is descending with ties
+  broken by name. Without `--sort` the shelf order is kept.
+- Stars and primary language come from the GitHub snapshot written by
+  `shoka cache refresh`; `list` itself never makes network calls.
+  Repos with no cached count sort last, and `--sort stars` prints a
+  hint on stderr telling you to run `shoka cache refresh`.
+- With `--sort`, a repo with cached data is shown as one line: the repo (blue), then
+  `★ <count>` (yellow) and the language (dimmed). The star is the
+  plain `★` character, not the emoji, so columns stay aligned.
+  Such rows do **not** show path / tags / vcs / note, and there is no
+  switch to get the multi-line form back; repos without cached data
+  keep that multi-line form. Plain `shoka list` (no `--sort`) always
+  uses the multi-line form, whatever is cached.
+- `shoka list` never triggers the background cache refresh or
+  auto-update check; run `shoka cache refresh` yourself.
+- Colour is used only when stdout is a terminal and `NO_COLOR` is
+  unset or empty, so `| head` and redirected output are plain text.
+  This also strips the bold / dim styling the previous `list` output
+  emitted when piped.
+
 ## Commands
 
 | Command | What it does |
@@ -89,7 +116,7 @@ shoka exec --tag rust -- cargo check
 | `shoka clone <spec>` | Clone a repo via `gix` (or `jj git clone` when `vcs = jj`). Accepts full URLs, `owner/name`, or `host/owner/name`. |
 | `shoka new [owner/name]` | Scaffold a new repo: `gh repo create` (public by default; `--private` to opt out) + clone onto the shelf + optional `kata init` (preset from `--preset` or `[global.new].preset`; `--no-kata` to skip). |
 | `shoka import <dir>` | Walk a directory, find existing `.git/` repos, and adopt them onto the shelf. |
-| `shoka list` | Print the shelf with optional `--tag` / `--has-agents` filters. |
+| `shoka list` | Print the shelf with optional `--tag` / `--has-agents` filters and `--sort name\|stars`. See [Listing and sorting](#listing-and-sorting). |
 | `shoka cd [hint]` | Resolve a repo to its on-disk path (use the shell wrapper to actually `cd`). |
 | `shoka exec -- <cmd>` | Run `<cmd>` in each matching repo in parallel; output is captured + banner-headed per repo. |
 | `shoka prune` | Drop shelf entries whose clone path is missing on disk. `--dry-run` to rehearse; `--yes` to skip the prompt. |

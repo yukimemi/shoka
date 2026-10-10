@@ -630,6 +630,8 @@ mod tests {
             open_issue_count: None,
             ci_status: Some(CiStatus::Success),
             weekly_commits: None,
+            stargazer_count: None,
+            primary_language: None,
         };
 
         let mut c = Cache::default();
