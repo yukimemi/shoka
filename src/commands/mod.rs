@@ -175,14 +175,12 @@ fn maybe_spawn_auto_update(ctx: &ShokaContext) -> Option<crate::updater::AutoUpd
 /// natural "are things OK" checkpoint, and freshening the cache
 /// after a doctor run benefits the next subcommand.
 fn bg_refresh_eligible(cmd: &Command) -> bool {
-    // `list --sort` is documented as cache-only: it must not spawn
-    // network activity of its own.
-    if matches!(cmd, Command::List(a) if a.sort.is_some()) {
-        return false;
-    }
+    // `list` is documented as cache-only: it must not spawn network
+    // activity of its own, sorted or not.
     !matches!(
         cmd,
-        Command::Cache(_)
+        Command::List(_)
+            | Command::Cache(_)
             | Command::Completion(_)
             | Command::InitShell(_)
             | Command::Tui(_)
@@ -213,12 +211,13 @@ fn bg_refresh_eligible(cmd: &Command) -> bool {
 /// auto-update notice goes only to stderr, so the shell wrapper is
 /// never corrupted.
 fn auto_update_eligible(cmd: &Command) -> bool {
-    if matches!(cmd, Command::List(a) if a.sort.is_some()) {
-        return false;
-    }
     !matches!(
         cmd,
-        Command::SelfUpdate(_) | Command::Completion(_) | Command::InitShell(_) | Command::Tui(_)
+        Command::List(_)
+            | Command::SelfUpdate(_)
+            | Command::Completion(_)
+            | Command::InitShell(_)
+            | Command::Tui(_)
     )
 }
 
@@ -263,25 +262,22 @@ mod tests {
     }
 
     #[test]
-    fn sorted_list_triggers_no_background_network_work() {
-        let sorted = Command::List(ListArgs {
-            tags: vec![],
-            has_agents: false,
-            sort: Some(crate::cli::ListSort::Stars),
-        });
-        assert!(!bg_refresh_eligible(&sorted));
-        assert!(!auto_update_eligible(&sorted));
+    fn list_triggers_no_background_network_work() {
+        for sort in [None, Some(crate::cli::ListSort::Stars)] {
+            let list = Command::List(ListArgs {
+                tags: vec![],
+                has_agents: false,
+                sort,
+            });
+            assert!(!bg_refresh_eligible(&list));
+            assert!(!auto_update_eligible(&list));
+        }
     }
 
     #[test]
     fn bg_refresh_eligible_includes_user_facing_commands() {
         assert!(bg_refresh_eligible(&Command::Clone(CloneArgs {
             url: None
-        })));
-        assert!(bg_refresh_eligible(&Command::List(ListArgs {
-            tags: vec![],
-            has_agents: false,
-            sort: None,
         })));
         assert!(bg_refresh_eligible(&Command::Cd(CdArgs {
             repo: None,
@@ -329,11 +325,6 @@ mod tests {
         // cap is really protecting.
         assert!(auto_update_eligible(&Command::Clone(CloneArgs {
             url: None
-        })));
-        assert!(auto_update_eligible(&Command::List(ListArgs {
-            tags: vec![],
-            has_agents: false,
-            sort: None,
         })));
         // cache refresh is excluded from bg-refresh but not from
         // auto-update — they're independent concerns.

@@ -102,7 +102,7 @@ shoka list --sort name              # alphabetical by host/owner/name
   switch to get the multi-line form back; repos without cached data
   keep that multi-line form. Plain `shoka list` (no `--sort`) always
   uses the multi-line form, whatever is cached.
-- `list --sort` never triggers the background cache refresh or
+- `shoka list` never triggers the background cache refresh or
   auto-update check; run `shoka cache refresh` yourself.
 - Colour is used only when stdout is a terminal and `NO_COLOR` is
   unset or empty, so `| head` and redirected output are plain text.
