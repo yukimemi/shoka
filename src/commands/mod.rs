@@ -262,6 +262,7 @@ mod tests {
         assert!(bg_refresh_eligible(&Command::List(ListArgs {
             tags: vec![],
             has_agents: false,
+            sort: None,
         })));
         assert!(bg_refresh_eligible(&Command::Cd(CdArgs {
             repo: None,
@@ -313,6 +314,7 @@ mod tests {
         assert!(auto_update_eligible(&Command::List(ListArgs {
             tags: vec![],
             has_agents: false,
+            sort: None,
         })));
         // cache refresh is excluded from bg-refresh but not from
         // auto-update — they're independent concerns.

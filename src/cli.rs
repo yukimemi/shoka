@@ -175,6 +175,22 @@ pub struct ListArgs {
     /// Show only repos that carry an AGENTS.md.
     #[arg(long)]
     pub has_agents: bool,
+
+    /// Sort the listing: `name` (ascending) or `stars` (descending,
+    /// ties by name; needs `shoka cache refresh` data). Omitted ⇒
+    /// shelf order.
+    #[arg(long, value_enum, value_name = "KEY")]
+    pub sort: Option<ListSort>,
+}
+
+/// Sort keys for `shoka list --sort`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ListSort {
+    /// Ascending by `host/owner/name`.
+    Name,
+    /// Descending by cached stargazer count; repos without cached
+    /// data come last.
+    Stars,
 }
 
 #[derive(Debug, Args)]

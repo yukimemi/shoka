@@ -1217,3 +1217,95 @@ fn help_prints_subcommands_and_exits_zero() {
         );
     }
 }
+
+/// Write a `cache.toml` with `(name, stars, language)` snapshots for
+/// `github.com/u/<name>` into the test's cache dir.
+fn seed_cache(cache_dir: &Path, entries: &[(&str, u32, &str)]) {
+    std::fs::create_dir_all(cache_dir).unwrap();
+    let mut body = String::from("version = 4\n");
+    for (name, stars, lang) in entries {
+        body.push_str(&format!(
+            "\n[[repos]]\nhost = \"github.com\"\nowner = \"u\"\nname = \"{name}\"\n\n[repos.gh]\nstargazer_count = {stars}\nprimary_language = \"{lang}\"\n"
+        ));
+    }
+    std::fs::write(cache_dir.join("cache.toml"), body).expect("write cache.toml");
+}
+
+/// `list --sort stars` orders by cached stars (desc, ties by name),
+/// puts uncached repos last, prints plain text when piped, and hints
+/// about `cache refresh` on stderr only when data is missing.
+#[test]
+fn list_sort_stars_uses_cache_and_prints_plain_text() {
+    let (mut cmd, tmp) = cmd_with_isolated_config();
+    seed_shelf(
+        &tmp.path().join("state"),
+        &[
+            ("github.com", "u", "uncached"),
+            ("github.com", "u", "b-tie"),
+            ("github.com", "u", "a-tie"),
+            ("github.com", "u", "top"),
+        ],
+    );
+    seed_cache(
+        &tmp.path().join("cache"),
+        &[
+            ("b-tie", 5, "Go"),
+            ("a-tie", 5, "Rust"),
+            ("top", 24, "Rust"),
+        ],
+    );
+    let out = cmd.args(["list", "--sort", "stars"]).assert().success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "piped output must be plain: {stdout:?}"
+    );
+    let firsts: Vec<&str> = stdout
+        .lines()
+        .filter(|l| !l.starts_with(' '))
+        .map(|l| l.split_whitespace().next().unwrap())
+        .collect();
+    assert_eq!(
+        firsts,
+        [
+            "github.com/u/top",
+            "github.com/u/a-tie",
+            "github.com/u/b-tie",
+            "github.com/u/uncached"
+        ]
+    );
+    assert!(stdout.lines().next().unwrap().contains("★ 24"));
+    assert!(stdout.lines().next().unwrap().ends_with("Rust"));
+    assert!(
+        stderr.contains("shoka cache refresh"),
+        "hint expected: {stderr:?}"
+    );
+}
+
+#[test]
+fn list_sort_stars_without_missing_data_prints_no_hint() {
+    let (mut cmd, tmp) = cmd_with_isolated_config();
+    seed_shelf(&tmp.path().join("state"), &[("github.com", "u", "only")]);
+    seed_cache(&tmp.path().join("cache"), &[("only", 1, "Rust")]);
+    let out = cmd.args(["list", "--sort", "stars"]).assert().success();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(
+        !stderr.contains("cache refresh"),
+        "no hint expected: {stderr:?}"
+    );
+}
+
+#[test]
+fn list_without_sort_keeps_legacy_format_when_cache_empty() {
+    let (mut cmd, tmp) = cmd_with_isolated_config();
+    seed_shelf(
+        &tmp.path().join("state"),
+        &[("github.com", "u", "zed"), ("github.com", "u", "abc")],
+    );
+    let out = cmd.arg("list").assert().success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    let heads: Vec<&str> = stdout.lines().filter(|l| !l.starts_with(' ')).collect();
+    assert_eq!(heads, ["github.com/u/zed", "github.com/u/abc"]);
+    assert!(stdout.contains("path :"));
+}
