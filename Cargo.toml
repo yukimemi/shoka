@@ -117,7 +117,7 @@ libc = "0.2.190"
 [dev-dependencies]
 assert_cmd = "2.2.2"
 predicates = "3.1.4"
-serde_json = "1.0.152"
+serde_json = "1.0.153"
 tempfile = "3.27.0"
 
 # Embed an icon and metadata (FileDescription / ProductName / …)
