@@ -52,7 +52,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 owo-colors = "4.4.0"
 unicode-width = "0.2.3"
-regex = "1.13.1"
+regex = "1.13.2"
 
 # In-process git ops. Same feature set as rvpm to avoid the slow
 # `git` CLI subprocess on Windows (process spawn is the dominant
