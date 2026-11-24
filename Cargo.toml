@@ -70,7 +70,7 @@ gix = { version = "0.85.0", default-features = false, features = [
 
 # Recursive directory walking for `shoka import` (find `.git`
 # subdirs in a ghq-style tree).
-walkdir = "2.5.0"
+walkdir = "2.5.1"
 
 # TUI (Phase 2 dashboard). nucleo carries the fuzzy-match algorithm
 # only — inquire still handles the CLI single-shot pickers (`cd` no-arg
