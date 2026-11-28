@@ -30,13 +30,11 @@ use crate::actions::{VcsKind, detect_vcs};
 use crate::cli::RmArgs;
 use crate::commands::ShokaContext;
 use crate::commands::cd::{choose_by_hint, fuzzy_pick};
-use crate::config::ShokaConfig;
 use crate::git_status;
 use crate::state::{Repo, Shelf};
 
 pub async fn run(ctx: &ShokaContext, args: RmArgs) -> Result<()> {
-    let cfg = ShokaConfig::load(&ctx.paths)?;
-    let resolved = cfg.resolve(ctx.profile_override.as_deref())?;
+    let resolved = ctx.resolved_config()?;
     let mut shelf = Shelf::load(&ctx.paths)?;
 
     if shelf.is_empty() {

@@ -1,5 +1,7 @@
+use std::sync::OnceLock;
+
 use crate::cli::{Cli, Command, TagCommand, TuiArgs};
-use crate::config::{AutoUpdateMode, ShokaConfig};
+use crate::config::{AutoUpdateMode, ResolvedConfig, ShokaConfig};
 use crate::paths::ShokaPaths;
 
 pub mod cache;
@@ -34,13 +36,29 @@ pub struct ShokaContext {
     /// Profile name from `--profile` / `$SHOKA_PROFILE`. Subcommands
     /// pass this through to [`crate::config::ShokaConfig::resolve`].
     pub profile_override: Option<String>,
+    resolved: OnceLock<ResolvedConfig>,
+}
+
+impl ShokaContext {
+    pub fn new(paths: ShokaPaths, profile_override: Option<String>) -> Self {
+        Self {
+            paths,
+            profile_override,
+            resolved: OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn resolved_config(&self) -> anyhow::Result<&ResolvedConfig> {
+        if let Some(resolved) = self.resolved.get() {
+            return Ok(resolved);
+        }
+        let resolved = ShokaConfig::load(&self.paths)?.resolve(self.profile_override.as_deref())?;
+        Ok(self.resolved.get_or_init(|| resolved))
+    }
 }
 
 pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
-    let ctx = ShokaContext {
-        paths: ShokaPaths::resolve(cli.config.as_deref())?,
-        profile_override: cli.profile,
-    };
+    let ctx = ShokaContext::new(ShokaPaths::resolve(cli.config.as_deref())?, cli.profile);
     let cmd = cli
         .cmd
         .unwrap_or(Command::Tui(TuiArgs { tags: Vec::new() }));
@@ -134,10 +152,7 @@ fn maybe_spawn_auto_update(ctx: &ShokaContext) -> Option<crate::updater::AutoUpd
 
     // Best-effort config load: a missing/broken config must not break
     // auto-update (it just disables it for this run).
-    let resolved = ShokaConfig::load(&ctx.paths)
-        .ok()?
-        .resolve(ctx.profile_override.as_deref())
-        .ok()?;
+    let resolved = ctx.resolved_config().ok()?;
 
     if matches!(resolved.auto_update, AutoUpdateMode::Off) {
         return None;
@@ -205,15 +220,13 @@ fn bg_refresh_eligible(cmd: &Command) -> bool {
 ///   the 5s finalize wait) racing the TUI teardown would corrupt the
 ///   display, so skip it; the next non-TUI command will run the check.
 ///
-/// In particular `cd` is *not* excluded: it's fast, but it's also one
-/// of the most frequently run commands, so it's a good carrier for the
-/// throttled check. Its PATH output goes to stdout while the
-/// auto-update notice goes only to stderr, so the shell wrapper is
-/// never corrupted.
+/// - `cd` / `list` — latency-sensitive shelf reads. In particular,
+///   a shell wrapper cannot change directory until the process exits.
 fn auto_update_eligible(cmd: &Command) -> bool {
     !matches!(
         cmd,
         Command::List(_)
+            | Command::Cd(_)
             | Command::SelfUpdate(_)
             | Command::Completion(_)
             | Command::InitShell(_)
@@ -314,15 +327,12 @@ mod tests {
     }
 
     #[test]
-    fn auto_update_eligible_includes_fast_and_long_commands() {
-        // `cd` is fast but a fine throttled carrier; its PATH goes to
-        // stdout while the notice goes to stderr, so no corruption.
-        assert!(auto_update_eligible(&Command::Cd(CdArgs {
+    fn auto_update_eligible_excludes_cd_and_includes_long_commands() {
+        assert!(!auto_update_eligible(&Command::Cd(CdArgs {
             repo: None,
             tags: vec![],
         })));
-        // clone / list / exec are the slow commands the 5s finalize
-        // cap is really protecting.
+        // Longer commands can overlap their work with the update check.
         assert!(auto_update_eligible(&Command::Clone(CloneArgs {
             url: None
         })));

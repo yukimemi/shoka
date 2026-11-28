@@ -55,7 +55,6 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{Terminal, prelude::Backend};
-use teravars::Engine;
 
 use crate::actions::{ActionKind, ActionOutcome, run_action};
 use crate::cache::{Cache, current_unix_secs};
@@ -95,15 +94,14 @@ mod theme {
 }
 use crate::commands::ShokaContext;
 use crate::commands::cd::emit_path;
-use crate::config::{ResolvedConfig, ShokaConfig};
+use crate::config::ResolvedConfig;
 use crate::gh::{CiStatus, GhSnapshot};
 use crate::git_status::{self, GitStatusSnapshot};
 use crate::paths::ShokaPaths;
 use crate::state::{Repo, Shelf};
 
 pub async fn run(ctx: &ShokaContext, args: TuiArgs) -> Result<()> {
-    let cfg = ShokaConfig::load(&ctx.paths)?;
-    let resolved = cfg.resolve(ctx.profile_override.as_deref())?;
+    let resolved = ctx.resolved_config()?;
     let shelf = Shelf::load(&ctx.paths)?;
 
     if shelf.is_empty() {
@@ -129,7 +127,7 @@ pub async fn run(ctx: &ShokaContext, args: TuiArgs) -> Result<()> {
         }
     };
 
-    let rows = build_rows(&shelf, &resolved, &cache, &args.tags)?;
+    let rows = build_rows(&shelf, resolved, &cache, &args.tags)?;
     if rows.is_empty() {
         anyhow::bail!(
             "no repos matched the tag filter ({} on the shelf total)",
@@ -209,7 +207,7 @@ fn build_rows(
     cache: &Cache,
     tag_filter: &[String],
 ) -> Result<Vec<DashRow>> {
-    let mut engine = Engine::new();
+    let mut engine = None;
     let mut out = Vec::with_capacity(shelf.len());
     for repo in &shelf.repos {
         if !tag_filter.is_empty() && !has_all_tags(repo, tag_filter) {

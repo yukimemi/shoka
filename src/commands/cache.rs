@@ -29,11 +29,9 @@ use owo_colors::OwoColorize;
 use crate::cache::{Cache, current_unix_secs};
 use crate::cli::CacheCommand;
 use crate::commands::ShokaContext;
-use crate::config::ShokaConfig;
 use crate::gh;
 use crate::git_status;
 use crate::state::{Repo, Shelf};
-use teravars::Engine;
 
 pub async fn dispatch(ctx: &ShokaContext, cmd: CacheCommand) -> Result<()> {
     match cmd {
@@ -66,8 +64,7 @@ async fn refresh(
     tags: Vec<String>,
     background: bool,
 ) -> Result<()> {
-    let cfg = ShokaConfig::load(&ctx.paths)?;
-    let resolved = cfg.resolve(ctx.profile_override.as_deref())?;
+    let resolved = ctx.resolved_config()?;
     let shelf = Shelf::load(&ctx.paths)?;
     let mut cache = Cache::load(&ctx.paths)?;
 
@@ -80,10 +77,7 @@ async fn refresh(
     let mut capture_errors = 0;
     let mut gh_errors = 0;
 
-    // One Tera engine for the whole walk — clone_path_for renders
-    // per repo, and the engine setup cost dominates a sub-ms gix
-    // status call on a small repo.
-    let mut engine = Engine::new();
+    let mut engine = None;
 
     // Build a gh client once if a token is reachable. Missing token
     // just means gh fields stay None — non-gh capture (gix status)
@@ -285,8 +279,7 @@ fn has_all_tags(repo: &Repo, wanted: &[String]) -> bool {
 /// `false`, this function is an opt-out: it loads enough config to
 /// see the flag, then returns `Ok(())` without spawning anything.
 pub fn try_spawn_bg_refresh(ctx: &ShokaContext) -> Result<()> {
-    let cfg = ShokaConfig::load(&ctx.paths)?;
-    let resolved = cfg.resolve(ctx.profile_override.as_deref())?;
+    let resolved = ctx.resolved_config()?;
     if !resolved.cache.background_refresh {
         tracing::debug!(target: "shoka", "background refresh disabled by config");
         return Ok(());
@@ -491,10 +484,7 @@ background_refresh = false
         )
         .unwrap();
         let paths = paths_at(tmp.path());
-        let ctx = ShokaContext {
-            paths,
-            profile_override: None,
-        };
+        let ctx = ShokaContext::new(paths, None);
         // Just asserts the function returns Ok in the opt-out case.
         // Actually spawning is a side effect we don't want to
         // exercise under `cargo test`, so we don't construct the

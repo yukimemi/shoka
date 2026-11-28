@@ -41,7 +41,6 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use owo_colors::OwoColorize;
-use teravars::Engine;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
@@ -49,7 +48,9 @@ use tokio::task::JoinSet;
 
 use crate::cli::ExecArgs;
 use crate::commands::ShokaContext;
-use crate::config::{ResolvedConfig, ShokaConfig};
+use crate::config::ResolvedConfig;
+#[cfg(test)]
+use crate::config::ShokaConfig;
 use crate::state::{Repo, Shelf};
 
 pub async fn run(ctx: &ShokaContext, args: ExecArgs) -> Result<()> {
@@ -63,8 +64,7 @@ pub async fn run(ctx: &ShokaContext, args: ExecArgs) -> Result<()> {
         );
     }
 
-    let cfg = ShokaConfig::load(&ctx.paths)?;
-    let resolved = cfg.resolve(ctx.profile_override.as_deref())?;
+    let resolved = ctx.resolved_config()?;
     let shelf = Shelf::load(&ctx.paths)?;
 
     if shelf.is_empty() {
@@ -77,7 +77,7 @@ pub async fn run(ctx: &ShokaContext, args: ExecArgs) -> Result<()> {
     // Build the matched-repo set once, plus their resolved paths, so
     // the spawn loop doesn't re-touch the Tera engine or re-render
     // layouts per repo (cheap, but avoidable).
-    let targets = resolve_targets(&shelf, &resolved, &args)?;
+    let targets = resolve_targets(&shelf, resolved, &args)?;
     if targets.is_empty() {
         bail!(
             "no repos matched the tag filter ({} on the shelf total)",
@@ -158,7 +158,7 @@ fn resolve_targets(
     resolved: &ResolvedConfig,
     args: &ExecArgs,
 ) -> Result<Vec<Target>> {
-    let mut engine = Engine::new();
+    let mut engine = None;
     let mut out = Vec::new();
     for repo in &shelf.repos {
         if !args.tags.is_empty() && !has_all_tags(repo, &args.tags) {

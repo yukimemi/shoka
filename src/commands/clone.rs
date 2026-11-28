@@ -51,19 +51,19 @@ use owo_colors::OwoColorize;
 
 use crate::cli::CloneArgs;
 use crate::commands::ShokaContext;
-use crate::config::{ResolvedConfig, ShokaConfig, VcsDefault};
+use crate::config::{ResolvedConfig, VcsDefault};
 use crate::gh;
 use crate::remote::parse_clone_input;
 use crate::state::{Repo, Shelf};
 
 pub async fn run(ctx: &ShokaContext, args: CloneArgs) -> Result<()> {
-    let cfg = ShokaConfig::load(&ctx.paths)?.resolve(ctx.profile_override.as_deref())?;
+    let cfg = ctx.resolved_config()?;
     let input = match args.url {
         Some(s) => s,
         None => prompt_for_input(&cfg.ui.own_owners).await?,
     };
 
-    clone_and_record(ctx, &cfg, &input).await?;
+    clone_and_record(ctx, cfg, &input).await?;
 
     println!("{} done", "clone:".bold());
     Ok(())

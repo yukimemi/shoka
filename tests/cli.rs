@@ -1297,6 +1297,45 @@ fn list_sort_stars_without_missing_data_prints_no_hint() {
 }
 
 #[test]
+fn list_sort_stars_uses_first_populated_sibling_snapshot() {
+    let (mut cmd, tmp) = cmd_with_isolated_config();
+    seed_shelf(&tmp.path().join("state"), &[("github.com", "u", "only")]);
+    let cache_dir = tmp.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    std::fs::write(
+        cache_dir.join("cache.toml"),
+        r#"version = 4
+[[repos]]
+host = "github.com"
+owner = "u"
+name = "only"
+path = "/first"
+[[repos]]
+host = "github.com"
+owner = "u"
+name = "only"
+path = "/second"
+[repos.gh]
+stargazer_count = 7
+primary_language = "Rust"
+[[repos]]
+host = "github.com"
+owner = "u"
+name = "only"
+path = "/third"
+[repos.gh]
+stargazer_count = 99
+primary_language = "Go"
+"#,
+    )
+    .unwrap();
+    cmd.args(["list", "--sort", "stars"])
+        .assert()
+        .success()
+        .stdout("github.com/u/only  ★ 7  Rust\n");
+}
+
+#[test]
 fn list_without_sort_keeps_legacy_format_when_cache_empty() {
     let (mut cmd, tmp) = cmd_with_isolated_config();
     seed_shelf(

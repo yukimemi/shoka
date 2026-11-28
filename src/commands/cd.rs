@@ -41,6 +41,7 @@ use inquire::Select;
 
 use crate::cli::CdArgs;
 use crate::commands::ShokaContext;
+#[cfg(test)]
 use crate::config::ShokaConfig;
 use crate::state::{Repo, Shelf};
 
@@ -49,8 +50,7 @@ use crate::state::{Repo, Shelf};
 pub const CD_OUT_ENV: &str = "SHOKA_CD_OUT";
 
 pub async fn run(ctx: &ShokaContext, args: CdArgs) -> Result<()> {
-    let cfg = ShokaConfig::load(&ctx.paths)?;
-    let resolved = cfg.resolve(ctx.profile_override.as_deref())?;
+    let resolved = ctx.resolved_config()?;
     let shelf = Shelf::load(&ctx.paths)?;
 
     if shelf.is_empty() {
