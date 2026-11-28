@@ -33,11 +33,10 @@ use owo_colors::OwoColorize;
 use crate::cli::NewArgs;
 use crate::commands::ShokaContext;
 use crate::commands::clone::clone_and_record;
-use crate::config::ShokaConfig;
 use crate::gh;
 
 pub async fn run(ctx: &ShokaContext, args: NewArgs) -> Result<()> {
-    let cfg = ShokaConfig::load(&ctx.paths)?.resolve(ctx.profile_override.as_deref())?;
+    let cfg = ctx.resolved_config()?;
 
     let (owner, name) = resolve_owner_name(args.spec.as_deref(), &cfg.ui.own_owners).await?;
     let slug = format!("{owner}/{name}");
@@ -48,7 +47,7 @@ pub async fn run(ctx: &ShokaContext, args: NewArgs) -> Result<()> {
 
     // 2. Clone + record through the shared core so `new` and `clone`
     //    can never drift on where things land or how they're shelved.
-    let repo = clone_and_record(ctx, &cfg, &slug).await?;
+    let repo = clone_and_record(ctx, cfg, &slug).await?;
     let dest = cfg.clone_path_for_one(&repo)?;
 
     // 3. kata scaffolding — `--preset` wins over the configured

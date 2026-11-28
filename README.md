@@ -104,6 +104,8 @@ shoka list --sort name              # alphabetical by host/owner/name
   uses the multi-line form, whatever is cached.
 - `shoka list` never triggers the background cache refresh or
   auto-update check; run `shoka cache refresh` yourself.
+- `shoka cd` reads the shelf without waiting for an auto-update check.
+  It still schedules the configured cache refresh after selection.
 - Colour is used only when stdout is a terminal and `NO_COLOR` is
   unset or empty, so `| head` and redirected output are plain text.
   This also strips the bold / dim styling the previous `list` output

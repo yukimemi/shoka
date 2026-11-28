@@ -11,7 +11,8 @@
 //! path / tags / vcs / note. `list` never touches the network: all
 //! GitHub data comes from `cache.toml`.
 
-use std::cmp::Ordering;
+use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::io::IsTerminal;
 
 use anyhow::Result;
@@ -22,7 +23,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::cache::Cache;
 use crate::cli::{ListArgs, ListSort};
 use crate::commands::ShokaContext;
-use crate::config::{ResolvedConfig, ShokaConfig};
+use crate::config::ResolvedConfig;
 use crate::state::{Repo, Shelf};
 
 /// One shown repo plus whatever the cache knows about it.
@@ -32,7 +33,7 @@ struct ListRow<'s> {
     /// `Some` ⇔ the repo counts as "cached" (a definite zero is
     /// distinct from "not fetched").
     stars: Option<u32>,
-    language: Option<String>,
+    language: Option<&'s str>,
 }
 
 /// Colour only when stdout is a terminal and `NO_COLOR` is unset or
@@ -51,8 +52,7 @@ fn dim(color: bool, s: &str) -> String {
 
 pub async fn run(ctx: &ShokaContext, args: ListArgs) -> Result<()> {
     let color = use_color();
-    let cfg = ShokaConfig::load(&ctx.paths)?;
-    let resolved = cfg.resolve(ctx.profile_override.as_deref())?;
+    let resolved = ctx.resolved_config()?;
     let shelf = Shelf::load(&ctx.paths)?;
 
     if shelf.is_empty() {
@@ -64,12 +64,8 @@ pub async fn run(ctx: &ShokaContext, args: ListArgs) -> Result<()> {
         return Ok(());
     }
 
-    // One Engine per `list` invocation — clone_path_for renders the
-    // layout template for every shown repo, and Engine construction
-    // is the heavy bit (Tera setup).
-    let mut engine = Engine::new();
-
-    let filtered = filter_repos(&shelf, &resolved, &args, &mut engine)?;
+    let mut engine = None;
+    let filtered = filter_repos(&shelf, resolved, &args, &mut engine)?;
     if filtered.is_empty() {
         println!(
             "{} matched the filters ({} on the shelf total)",
@@ -79,46 +75,33 @@ pub async fn run(ctx: &ShokaContext, args: ListArgs) -> Result<()> {
         return Ok(());
     }
 
-    // Without `--sort` the listing is exactly the classic multi-line
-    // form (a background refresh may populate stars at any time, and
-    // that must not change plain `list` output), so the cache is only
-    // consulted when sorting. The read is best-effort: a broken
-    // cache.toml must not take `list` down, it just means no stars.
-    let cache = if args.sort.is_some() {
-        match Cache::load(&ctx.paths) {
+    if let Some(sort) = args.sort {
+        let cache = match Cache::load(&ctx.paths) {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!("list: ignoring unreadable cache: {e:#}");
                 Cache::default()
             }
+        };
+        let mut rows = cached_rows(&filtered, &cache);
+        sort_rows(&mut rows, Some(sort));
+
+        if sort == ListSort::Stars && rows.iter().any(|r| r.stars.is_none()) {
+            eprintln!(
+                "hint: some repos have no cached star count; run `shoka cache refresh` to fetch it"
+            );
+        }
+
+        let widths = column_widths(&rows);
+        for row in &rows {
+            match format_cached_line(row, widths, color) {
+                Some(line) => println!("{line}"),
+                None => print_repo(row.repo, resolved, &mut engine, color)?,
+            }
         }
     } else {
-        Cache::default()
-    };
-    let mut rows: Vec<ListRow> = filtered
-        .iter()
-        .map(|&repo| {
-            let snap = cache.find_gh_by_triple(&repo.host, &repo.owner, &repo.name);
-            ListRow {
-                repo,
-                stars: snap.and_then(|g| g.stargazer_count),
-                language: snap.and_then(|g| g.primary_language.clone()),
-            }
-        })
-        .collect();
-    sort_rows(&mut rows, args.sort);
-
-    if args.sort == Some(ListSort::Stars) && rows.iter().any(|r| r.stars.is_none()) {
-        eprintln!(
-            "hint: some repos have no cached star count; run `shoka cache refresh` to fetch it"
-        );
-    }
-
-    let widths = column_widths(&rows);
-    for row in &rows {
-        match format_cached_line(row, widths, color) {
-            Some(line) => println!("{line}"),
-            None => print_repo(row.repo, &resolved, &mut engine, color)?,
+        for repo in &filtered {
+            print_repo(repo, resolved, &mut engine, color)?;
         }
     }
     if filtered.len() < shelf.len() {
@@ -134,22 +117,41 @@ pub async fn run(ctx: &ShokaContext, args: ListArgs) -> Result<()> {
     Ok(())
 }
 
+fn cached_rows<'a>(repos: &[&'a Repo], cache: &'a Cache) -> Vec<ListRow<'a>> {
+    let mut snapshots = HashMap::with_capacity(cache.repos.len());
+    for entry in &cache.repos {
+        if let Some(gh) = &entry.gh {
+            snapshots
+                .entry((
+                    entry.host.as_str(),
+                    entry.owner.as_str(),
+                    entry.name.as_str(),
+                ))
+                .or_insert(gh);
+        }
+    }
+    repos
+        .iter()
+        .map(|&repo| {
+            let snap =
+                snapshots.get(&(repo.host.as_str(), repo.owner.as_str(), repo.name.as_str()));
+            ListRow {
+                repo,
+                stars: snap.and_then(|g| g.stargazer_count),
+                language: snap.and_then(|g| g.primary_language.as_deref()),
+            }
+        })
+        .collect()
+}
+
 /// Reorder `rows` in place. `None` keeps shelf order; sorts are
 /// stable. Stars sort descending with ties by slug, and rows with no
 /// cached count (distinct from a cached 0) go last, also by slug.
 fn sort_rows(rows: &mut [ListRow], sort: Option<ListSort>) {
     match sort {
         None => {}
-        Some(ListSort::Name) => rows.sort_by_key(|a| a.repo.slug()),
-        Some(ListSort::Stars) => rows.sort_by(|a, b| {
-            let by_stars = match (a.stars, b.stars) {
-                (Some(x), Some(y)) => y.cmp(&x),
-                (Some(_), None) => Ordering::Less,
-                (None, Some(_)) => Ordering::Greater,
-                (None, None) => Ordering::Equal,
-            };
-            by_stars.then_with(|| a.repo.slug().cmp(&b.repo.slug()))
-        }),
+        Some(ListSort::Name) => rows.sort_by_cached_key(|a| a.repo.slug()),
+        Some(ListSort::Stars) => rows.sort_by_cached_key(|a| (Reverse(a.stars), a.repo.slug())),
     }
 }
 
@@ -183,7 +185,7 @@ fn format_cached_line(
         (slug, star)
     };
     let mut line = format!("{slug_c}{pad}  {star_c}");
-    if let Some(lang) = row.language.as_deref().filter(|l| !l.is_empty()) {
+    if let Some(lang) = row.language.filter(|l| !l.is_empty()) {
         line.push_str("  ");
         line.push_str(&dim(color, lang));
     }
@@ -200,7 +202,7 @@ fn filter_repos<'s>(
     shelf: &'s Shelf,
     resolved: &ResolvedConfig,
     args: &ListArgs,
-    engine: &mut Engine,
+    engine: &mut Option<Engine>,
 ) -> Result<Vec<&'s Repo>> {
     let mut out = Vec::with_capacity(shelf.len());
 
@@ -236,7 +238,7 @@ fn has_all_tags(repo: &Repo, wanted: &[String]) -> bool {
 fn print_repo(
     repo: &Repo,
     resolved: &ResolvedConfig,
-    engine: &mut Engine,
+    engine: &mut Option<Engine>,
     color: bool,
 ) -> Result<()> {
     let slug = repo.slug();
@@ -261,11 +263,11 @@ mod tests {
     use crate::config::{GlobalConfig, ShokaConfig, VcsDefault};
     use std::collections::BTreeMap;
 
-    fn row<'a>(repo: &'a Repo, stars: Option<u32>, lang: Option<&str>) -> ListRow<'a> {
+    fn row<'a>(repo: &'a Repo, stars: Option<u32>, lang: Option<&'a str>) -> ListRow<'a> {
         ListRow {
             repo,
             stars,
-            language: lang.map(String::from),
+            language: lang,
         }
     }
 
@@ -419,6 +421,22 @@ mod tests {
     }
 
     #[test]
+    fn default_layout_matches_template_rendering() {
+        let resolved = resolved_default_layout();
+        let repo = Repo::new("github.com", "a&b", "a b'日本");
+        let mut context = teravars::Context::new();
+        context.insert("root", &resolved.root.to_string_lossy().to_string());
+        context.insert("host", &repo.host);
+        context.insert("owner", &repo.owner);
+        context.insert("name", &repo.name);
+        let expected = Engine::new().render(&resolved.layout, &context).unwrap();
+        assert_eq!(
+            resolved.clone_path_for_one(&repo).unwrap().to_str(),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
     fn clone_path_for_honors_route_layout() {
         let cfg = ShokaConfig {
             global: GlobalConfig {
@@ -493,7 +511,7 @@ mod tests {
         shelf.add(c).unwrap();
 
         let r = resolved_default_layout();
-        let mut engine = Engine::new();
+        let mut engine = None;
         let filtered = filter_repos(
             &shelf,
             &r,
@@ -557,7 +575,7 @@ mod tests {
             .unwrap();
         shelf.add(Repo::new("github.com", "u", "plain")).unwrap();
 
-        let mut engine = Engine::new();
+        let mut engine = None;
         let filtered = filter_repos(
             &shelf,
             &resolved,

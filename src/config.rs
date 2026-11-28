@@ -35,6 +35,8 @@ use teravars::{Engine, discover_config_files, load_merged, system_context};
 
 use crate::paths::ShokaPaths;
 
+const DEFAULT_LAYOUT: &str = "{{ root }}/{{ host }}/{{ owner }}/{{ name }}";
+
 /// Top-level shoka configuration as written by the user.
 ///
 /// `[vars]` is intentionally absent here: teravars strips it from the
@@ -116,7 +118,7 @@ impl Default for GlobalConfig {
     fn default() -> Self {
         Self {
             root: None,
-            layout: "{{ root }}/{{ host }}/{{ owner }}/{{ name }}".into(),
+            layout: DEFAULT_LAYOUT.into(),
             default_vcs: VcsDefault::Auto,
             default_protocol: Protocol::Https,
             default_host: "github.com".into(),
@@ -530,7 +532,7 @@ impl ShokaConfig {
         // `is_ok_and` keeps the dedup conservative: when canonicalize
         // fails for either side, treat as "not equal" so the explicit
         // path is prepended rather than silently dropped.
-        if explicit.exists() {
+        if !files.iter().any(|p| p == explicit) && explicit.exists() {
             let already_listed = explicit.canonicalize().is_ok_and(|explicit_can| {
                 files
                     .iter()
@@ -738,17 +740,14 @@ impl ResolvedConfig {
     /// paths under different routes / profiles, and the layout
     /// template is itself a config-level concern.
     ///
-    /// The caller owns the [`teravars::Engine`] so multi-repo loops
-    /// (e.g. `shoka list`'s shelf walk) construct it once and reuse
-    /// it across every repo rather than paying the Tera setup cost
-    /// per call. One-off callers can use [`clone_path_for_one`] for
-    /// a single-shot engine.
+    /// The caller shares a lazy template engine across the walk; path
+    /// overrides and the default layout never need to construct one.
     ///
     /// [`clone_path_for_one`]: Self::clone_path_for_one
     pub fn clone_path_for(
         &self,
         repo: &crate::state::Repo,
-        engine: &mut teravars::Engine,
+        engine: &mut Option<Engine>,
     ) -> Result<PathBuf> {
         use teravars::Context;
 
@@ -765,6 +764,15 @@ impl ResolvedConfig {
 
         let spec = repo.slug();
         let target = self.resolve_target(&spec);
+        if target.layout == DEFAULT_LAYOUT {
+            return Ok(PathBuf::from(format!(
+                "{}/{}/{}/{}",
+                target.root.to_string_lossy(),
+                repo.host,
+                repo.owner,
+                repo.name
+            )));
+        }
 
         // Per-repo `vcs` override on the Repo itself wins over the
         // route / global default — that's the contract `set --vcs`
@@ -787,19 +795,16 @@ impl ResolvedConfig {
         ctx.insert("protocol", protocol_str(target.default_protocol));
 
         let rendered = engine
+            .get_or_insert_with(Engine::new)
             .render(&target.layout, &ctx)
             .with_context(|| format!("rendering layout `{}` for {spec}", target.layout))?;
 
         Ok(PathBuf::from(rendered))
     }
 
-    /// Convenience wrapper for callers that resolve exactly one
-    /// repo path — builds a single-use [`Engine`] under the hood.
-    /// Multi-repo callers should use [`clone_path_for`](Self::clone_path_for)
-    /// with their own reusable engine.
+    /// Convenience wrapper for callers that resolve exactly one repo path.
     pub fn clone_path_for_one(&self, repo: &crate::state::Repo) -> Result<PathBuf> {
-        let mut engine = teravars::Engine::new();
-        self.clone_path_for(repo, &mut engine)
+        self.clone_path_for(repo, &mut None)
     }
 }
 

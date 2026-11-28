@@ -1,10 +1,9 @@
 use clap::Parser;
-use shoka::cli::Cli;
+use shoka::cli::{Cli, Command};
 use shoka::commands;
 use tracing_subscriber::EnvFilter;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     // Install the rustls crypto provider before anything that might
     // open an HTTPS connection — see [`shoka::install_default_crypto_provider`]
     // for the full rationale. Must come before the tracing init too
@@ -21,5 +20,13 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    commands::dispatch(cli).await
+    let mut runtime = if matches!(&cli.cmd, Some(Command::List(_) | Command::Cd(_))) {
+        tokio::runtime::Builder::new_current_thread()
+    } else {
+        tokio::runtime::Builder::new_multi_thread()
+    };
+    runtime
+        .enable_all()
+        .build()?
+        .block_on(commands::dispatch(cli))
 }

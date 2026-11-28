@@ -18,16 +18,16 @@
 use anyhow::{Context, Result, bail};
 use inquire::Confirm;
 use owo_colors::OwoColorize;
-use teravars::Engine;
 
 use crate::cli::PruneArgs;
 use crate::commands::ShokaContext;
-use crate::config::{ResolvedConfig, ShokaConfig};
+use crate::config::ResolvedConfig;
+#[cfg(test)]
+use crate::config::ShokaConfig;
 use crate::state::Shelf;
 
 pub async fn run(ctx: &ShokaContext, args: PruneArgs) -> Result<()> {
-    let cfg = ShokaConfig::load(&ctx.paths)?;
-    let resolved = cfg.resolve(ctx.profile_override.as_deref())?;
+    let resolved = ctx.resolved_config()?;
     let mut shelf = Shelf::load(&ctx.paths)?;
 
     if shelf.is_empty() {
@@ -35,7 +35,7 @@ pub async fn run(ctx: &ShokaContext, args: PruneArgs) -> Result<()> {
         return Ok(());
     }
 
-    let candidates = find_stale(&shelf, &resolved)?;
+    let candidates = find_stale(&shelf, resolved)?;
 
     println!(
         "{} {} of {} repo(s) have missing clone paths",
@@ -135,7 +135,7 @@ struct Stale {
 /// drive. Resolution shares one Tera engine across the walk — same
 /// trick as `shoka list`.
 fn find_stale(shelf: &Shelf, resolved: &ResolvedConfig) -> Result<Vec<Stale>> {
-    let mut engine = Engine::new();
+    let mut engine = None;
     let mut out = Vec::new();
     for repo in &shelf.repos {
         let path = resolved
